@@ -1,0 +1,25 @@
+{
+  "name": "check",
+  "displayName": "Check",
+  "description": "Syntax highlighting for the Check language",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [{
+      "id": "check",
+      "aliases": ["Check", "check"],
+      "extensions": [".check"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "check",
+      "scopeName": "source.check",
+      "path": "./syntaxes/check.tmLanguage.json"
+    }]
+  }
+}
