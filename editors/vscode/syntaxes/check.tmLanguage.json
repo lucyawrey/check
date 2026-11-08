@@ -51,7 +51,7 @@
 			"patterns": [
 				{ "name": "keyword.control.check", "match": "\\b(if|else|match|for|in|while|loop|break|return|try)\\b" },
 				{ "name": "keyword.operator.word.check", "match": "\\b(and|or|not|div|mod)\\b" },
-				{ "name": "storage.type.check", "match": "\\b(func|let|var|enum|class|value|interface|implement|static|init|import)\\b" },
+				{ "name": "storage.type.check", "match": "\\b(func|let|var|enum|class|value|interface|implement|static|init|import|namespace)\\b" },
 				{ "name": "constant.language.check", "match": "\\b(true|false)\\b" },
 				{ "name": "variable.language.this.check", "match": "\\bthis\\b" }
 			]
