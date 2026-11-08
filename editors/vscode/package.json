@@ -29,6 +29,10 @@
       "language": "checkd",
       "scopeName": "source.checkd",
       "path": "./syntaxes/checkd.tmLanguage.json"
-    }]
+    }],
+    "configurationDefaults": {
+      "[check]": { "editor.tabSize": 2, "editor.insertSpaces": true, "editor.detectIndentation": false },
+      "[checkd]": { "editor.tabSize": 2, "editor.insertSpaces": true, "editor.detectIndentation": false }
+    }
   }
 }
