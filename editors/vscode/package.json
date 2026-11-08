@@ -15,11 +15,20 @@
       "aliases": ["Check", "check"],
       "extensions": [".check"],
       "configuration": "./language-configuration.json"
+    }, {
+      "id": "checkd",
+      "aliases": ["Check Data", "checkd"],
+      "extensions": [".checkd"],
+      "configuration": "./language-configuration.json"
     }],
     "grammars": [{
       "language": "check",
       "scopeName": "source.check",
       "path": "./syntaxes/check.tmLanguage.json"
+    }, {
+      "language": "checkd",
+      "scopeName": "source.checkd",
+      "path": "./syntaxes/checkd.tmLanguage.json"
     }]
   }
 }
