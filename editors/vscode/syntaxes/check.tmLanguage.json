@@ -23,19 +23,44 @@
 			"match": "//.*$"
 		},
 		"strings": {
-			"name": "string.quoted.double.check",
-			"begin": "\"",
-			"end": "\"",
 			"patterns": [
-				{ "name": "constant.character.escape.check", "match": "\\\\." },
+				{ "name": "string.quoted.triple.raw.check", "begin": "r\"\"\"", "end": "\"\"\"" },
 				{
-					"name": "meta.interpolation.check",
-					"begin": "\\{",
-					"end": "\\}",
-					"beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.check" } },
-					"endCaptures": { "0": { "name": "punctuation.section.interpolation.end.check" } },
-					"contentName": "source.check",
-					"patterns": [{ "include": "#expression" }]
+					"name": "string.quoted.triple.check",
+					"begin": "\"\"\"",
+					"end": "\"\"\"",
+					"patterns": [
+						{ "name": "constant.character.escape.check", "match": "\\\\." },
+						{
+							"name": "meta.interpolation.check",
+							"begin": "\\{",
+							"end": "\\}",
+							"beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.check" } },
+							"endCaptures": { "0": { "name": "punctuation.section.interpolation.end.check" } },
+							"contentName": "source.check",
+							"patterns": [{ "include": "#expression" }]
+						}
+					
+					]
+				},
+				{ "name": "string.quoted.double.raw.check", "begin": "\\br\"", "end": "\"" },
+				{
+					"name": "string.quoted.double.check",
+					"begin": "\"",
+					"end": "\"",
+					"patterns": [
+						{ "name": "constant.character.escape.check", "match": "\\\\." },
+						{
+							"name": "meta.interpolation.check",
+							"begin": "\\{",
+							"end": "\\}",
+							"beginCaptures": { "0": { "name": "punctuation.section.interpolation.begin.check" } },
+							"endCaptures": { "0": { "name": "punctuation.section.interpolation.end.check" } },
+							"contentName": "source.check",
+							"patterns": [{ "include": "#expression" }]
+						}
+					
+					]
 				}
 			]
 		},
