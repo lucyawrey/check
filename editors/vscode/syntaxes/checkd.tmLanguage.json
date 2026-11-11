@@ -7,7 +7,7 @@
 	],
 	"repository": {
 		"fields": {
-			"match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=:)",
+			"match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=:|=(?!=))",
 			"captures": { "1": { "name": "variable.other.property.checkd" } }
 		}
 	},
