@@ -1,6 +1,6 @@
 {
 	"$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
-	"name": "Check Data",
+	"name": "Check Object Notation",
 	"patterns": [
 		{ "include": "#fields" },
 		{ "include": "source.check" }
@@ -8,8 +8,8 @@
 	"repository": {
 		"fields": {
 			"match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=:|=(?!=))",
-			"captures": { "1": { "name": "variable.other.property.checkd" } }
+			"captures": { "1": { "name": "variable.other.property.con" } }
 		}
 	},
-	"scopeName": "source.checkd"
+	"scopeName": "source.con"
 }

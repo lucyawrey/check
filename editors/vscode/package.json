@@ -16,9 +16,9 @@
       "extensions": [".check"],
       "configuration": "./language-configuration.json"
     }, {
-      "id": "checkd",
-      "aliases": ["Check Data", "checkd"],
-      "extensions": [".checkd"],
+      "id": "con",
+      "aliases": ["Check Object Notation", "con"],
+      "extensions": [".con"],
       "configuration": "./language-configuration.json"
     }],
     "grammars": [{
@@ -26,13 +26,13 @@
       "scopeName": "source.check",
       "path": "./syntaxes/check.tmLanguage.json"
     }, {
-      "language": "checkd",
-      "scopeName": "source.checkd",
-      "path": "./syntaxes/checkd.tmLanguage.json"
+      "language": "con",
+      "scopeName": "source.con",
+      "path": "./syntaxes/con.tmLanguage.json"
     }],
     "configurationDefaults": {
       "[check]": { "editor.tabSize": 2, "editor.insertSpaces": true, "editor.detectIndentation": false },
-      "[checkd]": { "editor.tabSize": 2, "editor.insertSpaces": true, "editor.detectIndentation": false }
+      "[con]": { "editor.tabSize": 2, "editor.insertSpaces": true, "editor.detectIndentation": false }
     }
   }
 }
