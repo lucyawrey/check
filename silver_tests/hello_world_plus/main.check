@@ -1,0 +1,25 @@
+let hello = "Hello"
+var output = ""
+
+func helloWorld() {
+    let world = "World"
+    let helloWorldText = "{hello}, {world}!"
+    setOutputIf(helloWorldText, true)
+    for i in 0..3 {
+        if i == 2 {
+            printOutput()
+        }
+    }
+}
+
+func setOutputIf(text: String, set: Bool) {
+    if set {
+        output = text
+    }
+}
+
+func printOutput() {
+    print(output)
+}
+
+helloWorld()
