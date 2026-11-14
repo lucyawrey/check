@@ -225,7 +225,7 @@ impl Interpreter<'_> {
                     (UnOp::Neg, Value::Int(n)) => n
                         .checked_neg()
                         .map(Value::Int)
-                        .map_or_else(|| panic(Code::E0902, expr.span), Ok),
+                        .map_or_else(|| panic(Code::integer_overflow, expr.span), Ok),
                     (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
                     (UnOp::BitNot, Value::Int(n)) => Ok(Value::Int(!n)),
                     (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
@@ -408,7 +408,7 @@ impl Interpreter<'_> {
                         None => None,
                     };
                     return Err(Flow::Panic(Panic {
-                        code: Code::E0901,
+                        code: Code::panic_called,
                         span,
                         reason,
                         stack: Vec::new(),
@@ -517,7 +517,7 @@ impl Interpreter<'_> {
 
     fn enter(&mut self, scopes: Vec<HashMap<String, Value>>, body: &Expr, span: Span) -> Eval {
         if self.depth >= MAX_DEPTH {
-            return panic(Code::E0908, span);
+            return panic(Code::stack_overflow, span);
         }
         self.depth += 1;
         self.frames.push(Frame { scopes });
@@ -635,7 +635,7 @@ impl Interpreter<'_> {
                     _ => f.trunc(),
                 };
                 if !r.is_finite() || r < i64::MIN as f64 || r >= i64::MAX as f64 {
-                    return panic(Code::E0907, span);
+                    return panic(Code::round_out_of_range, span);
                 }
                 Value::Int(r as i64)
             }
@@ -643,7 +643,7 @@ impl Interpreter<'_> {
             (Value::None, "orPanic") => {
                 let reason = args.first().map(Value::display);
                 return Err(Flow::Panic(Panic {
-                    code: Code::E0904,
+                    code: Code::or_panic_on_none,
                     span,
                     reason,
                     stack: Vec::new(),
@@ -675,7 +675,10 @@ fn floor_div(a: i64, b: i64) -> Option<i64> {
 
 fn arith(op: BinOp, l: Value, r: Value, span: Span) -> Eval {
     use Value::{Float as F, Int as I};
-    let overflow = |v: Option<i64>| v.map(I).map_or_else(|| panic(Code::E0902, span), Ok);
+    let overflow = |v: Option<i64>| {
+        v.map(I)
+            .map_or_else(|| panic(Code::integer_overflow, span), Ok)
+    };
     let (l, r) = match (l, r) {
         (I(a), F(b)) => (F(a as f64), F(b)),
         (F(a), I(b)) if op != BinOp::Pow => (F(a), F(b as f64)),
@@ -687,11 +690,11 @@ fn arith(op: BinOp, l: Value, r: Value, span: Span) -> Eval {
         (BinOp::Mul, I(a), I(b)) => return overflow(a.checked_mul(b)),
         (BinOp::Div, I(a), I(b)) => {
             if b == 0 {
-                return panic(Code::E0903, span);
+                return panic(Code::division_by_zero, span);
             }
             F(a as f64 / b as f64)
         }
-        (BinOp::IntDiv | BinOp::Mod, I(_), I(0)) => return panic(Code::E0903, span),
+        (BinOp::IntDiv | BinOp::Mod, I(_), I(0)) => return panic(Code::division_by_zero, span),
         (BinOp::IntDiv, I(a), I(b)) => return overflow(floor_div(a, b)),
         (BinOp::Mod, I(_), I(-1)) => I(0),
         (BinOp::Mod, I(a), I(b)) => {
@@ -703,7 +706,7 @@ fn arith(op: BinOp, l: Value, r: Value, span: Span) -> Eval {
         }
         (BinOp::Pow, I(a), I(b)) => {
             if b < 0 {
-                return panic(Code::E0905, span);
+                return panic(Code::negative_exponent, span);
             }
             let exp = u32::try_from(b).ok();
             return overflow(exp.and_then(|e| a.checked_pow(e)));
@@ -718,7 +721,7 @@ fn arith(op: BinOp, l: Value, r: Value, span: Span) -> Eval {
         (BinOp::BitOr, I(a), I(b)) => I(a | b),
         (BinOp::BitXor, I(a), I(b)) => I(a ^ b),
         (BinOp::Shl | BinOp::Shr, I(_), I(b)) if !(0..64).contains(&b) => {
-            return panic(Code::E0906, span);
+            return panic(Code::shift_out_of_range, span);
         }
         (BinOp::Shl, I(a), I(b)) => I(a.wrapping_shl(b as u32)),
         (BinOp::Shr, I(a), I(b)) => I(a >> b),

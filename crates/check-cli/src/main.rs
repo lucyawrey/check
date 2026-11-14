@@ -118,7 +118,7 @@ fn run_test(dir: &Path) -> Result<(), String> {
         .map(|d| d.code.to_string());
     let error_code = match report.outcome {
         Outcome::Finished => None,
-        Outcome::Stopped => Some("S0001".to_string()),
+        Outcome::Stopped => Some("try_stopped".to_string()),
         Outcome::CheckFailed => first_error,
         Outcome::Panicked(code) => Some(code.to_string()),
     };

@@ -85,16 +85,16 @@ impl Parser<'_> {
         if self.is_sym(sym) {
             Ok(self.advance().span)
         } else if *self.peek() == Tok::Eof && matches!(sym, ")" | "]" | "}") {
-            self.error(Code::E0008, self.span())
+            self.error(Code::unclosed_bracket, self.span())
         } else {
-            self.error(Code::E0007, self.span())
+            self.error(Code::unexpected_token, self.span())
         }
     }
 
     fn ident(&mut self) -> PResult<(String, Span)> {
         match self.peek().clone() {
             Tok::Ident(name) => Ok((name, self.advance().span)),
-            _ => self.error(Code::E0007, self.span()),
+            _ => self.error(Code::unexpected_token, self.span()),
         }
     }
 
@@ -156,7 +156,8 @@ impl Parser<'_> {
         if self.is_sym(";") {
             let span = self.advance().span;
             if matches!(self.peek(), Tok::Newline | Tok::Eof) || self.is_sym("}") {
-                self.diags.push(Diagnostic::error(Code::E0009, span));
+                self.diags
+                    .push(Diagnostic::error(Code::trailing_separator, span));
             }
             return;
         }
@@ -165,7 +166,8 @@ impl Parser<'_> {
             Tok::Sym("}") if in_block => {}
             _ => {
                 let span = self.span();
-                self.diags.push(Diagnostic::error(Code::E0007, span));
+                self.diags
+                    .push(Diagnostic::error(Code::unexpected_token, span));
                 self.recover();
             }
         }
@@ -244,10 +246,10 @@ impl Parser<'_> {
             return self.block();
         }
         if has_arrow {
-            return self.error(Code::E0013, self.span());
+            return self.error(Code::arrow_without_braces, self.span());
         }
         if self.is_kw("let") || self.is_kw("var") {
-            return self.error(Code::E0014, self.span());
+            return self.error(Code::statement_body_without_braces, self.span());
         }
         self.expr()
     }
@@ -296,7 +298,8 @@ impl Parser<'_> {
             if self.is_sym(",") {
                 let comma = self.advance().span;
                 if *self.peek() == Tok::Newline || self.is_sym(close) {
-                    self.diags.push(Diagnostic::error(Code::E0009, comma));
+                    self.diags
+                        .push(Diagnostic::error(Code::trailing_separator, comma));
                 }
             } else if *self.peek() != Tok::Newline && !self.is_sym(close) {
                 return self.expect_sym(close);
@@ -346,10 +349,11 @@ impl Parser<'_> {
                 break;
             }
             if *self.peek() == Tok::Eof {
-                return self.error(Code::E0008, start);
+                return self.error(Code::unclosed_bracket, start);
             }
             if self.is_kw("func") && matches!(self.peek_at(1), Tok::Ident(_)) {
-                self.diags.push(Diagnostic::error(Code::E0106, self.span()));
+                self.diags
+                    .push(Diagnostic::error(Code::nested_named_function, self.span()));
             }
             match self.statement() {
                 Ok(stmt) => stmts.push(stmt),
@@ -452,7 +456,8 @@ impl Parser<'_> {
         let rhs = self.coalesce()?;
         let expr = self.binary(op, lhs, rhs);
         if self.comparison_op().is_some() {
-            self.diags.push(Diagnostic::error(Code::E0208, self.span()));
+            self.diags
+                .push(Diagnostic::error(Code::chained_comparison, self.span()));
             while self.comparison_op().is_some() {
                 self.advance();
                 self.coalesce()?;
@@ -590,7 +595,7 @@ impl Parser<'_> {
             } else if self.eat_sym(".") {
                 let (name, name_span) = self.ident()?;
                 if !self.eat_sym("(") {
-                    return self.error(Code::E0007, name_span);
+                    return self.error(Code::unexpected_token, name_span);
                 }
                 let args = self.args()?;
                 let span = expr.span.to(self.prev_span());
@@ -611,7 +616,7 @@ impl Parser<'_> {
     fn condition(&mut self) -> PResult<Expr> {
         let cond = self.expr()?;
         if self.is_sym("=") {
-            return self.error(Code::E0012, self.span());
+            return self.error(Code::assignment_in_condition, self.span());
         }
         Ok(cond)
     }
@@ -676,7 +681,7 @@ impl Parser<'_> {
             Tok::Kw("for") => {
                 let (name, name_span) = self.ident()?;
                 if !self.eat_kw("in") {
-                    return self.error(Code::E0007, self.span());
+                    return self.error(Code::unexpected_token, self.span());
                 }
                 let iter = self.expr()?;
                 let body = self.block()?;
@@ -689,8 +694,8 @@ impl Parser<'_> {
                 self.pos -= 1;
                 return self.expr();
             }
-            Tok::Eof => return self.error(Code::E0008, span),
-            _ => return self.error(Code::E0007, span),
+            Tok::Eof => return self.error(Code::unclosed_bracket, span),
+            _ => return self.error(Code::unexpected_token, span),
         };
         Ok(self.expr_node(span, kind))
     }
@@ -705,7 +710,8 @@ impl Parser<'_> {
             }
             if matches!(self.peek_at(ahead), Tok::Kw("else")) {
                 let span = self.tokens[self.pos + ahead].span;
-                self.diags.push(Diagnostic::error(Code::E0010, span));
+                self.diags
+                    .push(Diagnostic::error(Code::else_on_new_line, span));
                 self.pos += ahead;
             }
         }
@@ -744,7 +750,7 @@ impl Parser<'_> {
                     let expr = sub.expr()?;
                     if *sub.peek() != Tok::Eof {
                         let span = sub.span();
-                        return sub.error(Code::E0007, span);
+                        return sub.error(Code::unexpected_token, span);
                     }
                     segs.push(StrSeg::Expr(expr));
                 }

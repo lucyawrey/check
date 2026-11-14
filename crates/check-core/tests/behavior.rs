@@ -89,10 +89,10 @@ fn whole_number_division_rounds_down() {
 
 #[test]
 fn integer_overflow_and_division_by_zero_panic() {
-    panics_with("print(9223372036854775807 * 2)", "E0902");
-    panics_with("print(-9223372036854775807 - 2)", "E0902");
-    panics_with("print(1 mod 0)", "E0903");
-    panics_with("print(1 / 0)", "E0903");
+    panics_with("print(9223372036854775807 * 2)", "integer_overflow");
+    panics_with("print(-9223372036854775807 - 2)", "integer_overflow");
+    panics_with("print(1 mod 0)", "division_by_zero");
+    panics_with("print(1 / 0)", "division_by_zero");
     prints("1.0 / 0.0", "Infinity");
 }
 
@@ -167,7 +167,7 @@ fn first_error(src: &str) -> String {
 fn a_lambda_body_must_match_its_written_return_type() {
     assert_eq!(
         first_error("let f = func(x: Int) -> String { x * 2 }"),
-        "E0211"
+        "return_type_mismatch"
     );
 }
 

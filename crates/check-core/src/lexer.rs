@@ -141,7 +141,7 @@ impl Lexer<'_> {
                     Some(sym) => {
                         self.pos += sym.len();
                         if FOREIGN.contains(sym) && !(*sym == "!" && self.peek(0) == b'=') {
-                            self.error(Code::E0011, start);
+                            self.error(Code::foreign_operator, start);
                         }
                         out.push(Token {
                             tok: Tok::Sym(sym),
@@ -154,7 +154,7 @@ impl Lexer<'_> {
                             .next()
                             .map_or(1, char::len_utf8);
                         self.pos += len;
-                        self.error(Code::E0001, start);
+                        self.error(Code::unknown_character, start);
                     }
                 },
             }
@@ -206,14 +206,14 @@ impl Lexer<'_> {
                     span: self.span(start),
                 },
                 Err(e) if matches!(e.kind(), std::num::IntErrorKind::PosOverflow) => {
-                    self.error(Code::E0213, start);
+                    self.error(Code::literal_too_big, start);
                     Token {
                         tok: Tok::Int(0),
                         span: self.span(start),
                     }
                 }
                 _ => {
-                    self.error(Code::E0006, start);
+                    self.error(Code::malformed_number, start);
                     Token {
                         tok: Tok::Int(0),
                         span: self.span(start),
@@ -240,7 +240,7 @@ impl Lexer<'_> {
             while self.peek(0).is_ascii_alphanumeric() || self.peek(0) == b'_' {
                 self.pos += 1;
             }
-            self.error(Code::E0006, start);
+            self.error(Code::malformed_number, start);
             return Token {
                 tok: Tok::Int(0),
                 span: self.span(start),
@@ -251,7 +251,7 @@ impl Lexer<'_> {
             .filter(|c| *c != '_')
             .collect();
         if text.len() > 1 && text.starts_with('0') && text.as_bytes()[1].is_ascii_digit() {
-            self.error(Code::E0005, start);
+            self.error(Code::leading_zero, start);
         }
         let tok = if is_float {
             Tok::Float(text.parse().unwrap_or(0.0))
@@ -259,7 +259,7 @@ impl Lexer<'_> {
             match text.parse() {
                 Ok(n) => Tok::Int(n),
                 Err(_) => {
-                    self.error(Code::E0213, start);
+                    self.error(Code::literal_too_big, start);
                     Tok::Int(0)
                 }
             }
@@ -286,7 +286,7 @@ impl Lexer<'_> {
         let mut text = String::new();
         loop {
             if self.pos >= self.src.len() || (!triple && self.peek(0) == b'\n') {
-                self.error(Code::E0002, start);
+                self.error(Code::unclosed_string, start);
                 break;
             }
             if triple && self.src[self.pos..].starts_with(b"\"\"\"") {
@@ -349,19 +349,19 @@ impl Lexer<'_> {
                         match char::from_u32(n) {
                             Some(ch) => ch,
                             None => {
-                                self.error(Code::E0003, start);
+                                self.error(Code::unknown_escape, start);
                                 return;
                             }
                         }
                     }
                     None => {
-                        self.error(Code::E0003, start);
+                        self.error(Code::unknown_escape, start);
                         return;
                     }
                 }
             }
             _ => {
-                self.error(Code::E0003, start);
+                self.error(Code::unknown_escape, start);
                 return;
             }
         };
@@ -388,7 +388,7 @@ impl Lexer<'_> {
             self.pos += 1;
         }
         if self.peek(0) != b'}' || self.text[inner_start..self.pos].trim().is_empty() {
-            self.error(Code::E0004, start);
+            self.error(Code::unclosed_interpolation, start);
             if self.peek(0) == b'}' {
                 self.pos += 1;
             }

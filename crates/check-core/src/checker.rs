@@ -183,11 +183,11 @@ impl Checker {
 
     fn declare_func(&mut self, decl: &FuncDecl) {
         if self.funcs.contains_key(&decl.name) {
-            self.error(Code::E0102, decl.span);
+            self.error(Code::duplicate_name, decl.span);
             return;
         }
         if RESERVED_NAMES.contains(&decl.name.as_str()) {
-            self.error(Code::E0103, decl.span);
+            self.error(Code::redefined_builtin, decl.span);
         }
         let mut params = Vec::new();
         for p in &decl.params {
@@ -197,7 +197,7 @@ impl Checker {
                     let t = self.expr(default, None);
                     self.resolve(&t)
                 }
-                (None, None) => self.error(Code::E0202, p.span),
+                (None, None) => self.error(Code::type_needed, p.span),
             };
             if let (Some(_), Some(default)) = (&p.ty, &p.default) {
                 let actual = self.expr(default, Some(&ty));
@@ -206,7 +206,7 @@ impl Checker {
             let ty = match (p.is_rest, ty) {
                 (true, Ty::List(elem)) => *elem,
                 (true, Ty::Error) => Ty::Error,
-                (true, _) => self.error(Code::E0201, p.span),
+                (true, _) => self.error(Code::type_mismatch, p.span),
                 (false, ty) => ty,
             };
             params.push(ParamSig {
@@ -234,7 +234,7 @@ impl Checker {
                 "String" => Ty::Str,
                 "Void" => Ty::Void,
                 "Never" => Ty::Never,
-                _ => self.error(Code::E0101, *span),
+                _ => self.error(Code::unknown_name, *span),
             },
             TypeExpr::Generic(name, args, span) => match (name.as_str(), args.as_slice()) {
                 ("List", [elem]) => {
@@ -245,7 +245,7 @@ impl Checker {
                     let inner = self.type_from(inner);
                     Ty::maybe(inner)
                 }
-                _ => self.error(Code::E0101, *span),
+                _ => self.error(Code::unknown_name, *span),
             },
             TypeExpr::Maybe(inner) => {
                 let inner = self.type_from(inner);
@@ -265,7 +265,7 @@ impl Checker {
             FuncState::Done => return Some(entry.sig.clone()),
             FuncState::InProgress => {
                 if entry.sig.ret.is_none() {
-                    self.error(Code::E0212, call_span);
+                    self.error(Code::recursion_without_return_type, call_span);
                     return None;
                 }
                 return Some(entry.sig.clone());
@@ -335,11 +335,11 @@ impl Checker {
             }
         };
         if !self.subsume(body.id, &body_ty, &ret) {
-            self.error(Code::E0211, body.span);
+            self.error(Code::return_type_mismatch, body.span);
         }
         for (id, span, ty) in ctx.returns {
             if !self.subsume(id, &ty, &ret) {
-                self.error(Code::E0211, span);
+                self.error(Code::return_type_mismatch, span);
             }
         }
         ret
@@ -381,9 +381,9 @@ impl Checker {
         }
         let a = self.subst.shallow(actual);
         let code = if matches!(a, Ty::Maybe(_)) {
-            Code::E0215
+            Code::unhandled_maybe
         } else {
-            Code::E0201
+            Code::type_mismatch
         };
         self.error(code, expr.span);
     }
@@ -419,7 +419,7 @@ impl Checker {
             .collect();
         unused.sort_by_key(|s| s.start);
         for span in unused {
-            self.warn(Code::W0001, span);
+            self.warn(Code::unused_var, span);
         }
     }
 
@@ -433,15 +433,15 @@ impl Checker {
 
     fn declare(&mut self, name: &str, span: Span, var: Var) {
         if RESERVED_NAMES.contains(&name) {
-            self.error(Code::E0103, span);
+            self.error(Code::redefined_builtin, span);
         }
         let global = self.scopes.len() == 1;
         if self.scopes.last().is_some_and(|s| s.contains_key(name))
             || (global && self.funcs.contains_key(name))
         {
-            self.error(Code::E0102, span);
+            self.error(Code::duplicate_name, span);
         } else if self.lookup(name).is_some() || self.funcs.contains_key(name) {
-            self.warn(Code::W0002, span);
+            self.warn(Code::shadowed_name, span);
         }
         self.scopes
             .last_mut()
@@ -502,14 +502,14 @@ impl Checker {
 
     fn assign(&mut self, target: &Expr, op: Option<BinOp>, value: &Expr, span: Span) {
         let ExprKind::Name(name) = &target.kind else {
-            self.error(Code::E0007, target.span);
+            self.error(Code::unexpected_token, target.span);
             return;
         };
         let Some(var) = self.lookup(name) else {
             let code = if self.top_level_names.contains(name) {
-                Code::E0105
+                Code::used_before_set
             } else {
-                Code::E0101
+                Code::unknown_name
             };
             self.error(code, target.span);
             return;
@@ -517,9 +517,9 @@ impl Checker {
         let (ty, mutable, kind) = (var.ty.clone(), var.mutable, var.kind);
         if !mutable {
             let code = if kind == VarKind::Param {
-                Code::E0302
+                Code::assign_to_parameter
             } else {
-                Code::E0301
+                Code::assign_to_let
             };
             self.error(code, target.span);
         }
@@ -533,7 +533,7 @@ impl Checker {
                 let rhs = self.expr(value, None);
                 let result = self.binary_type(op, target, &ty, value, &rhs, span);
                 if op == BinOp::Div && self.subst.shallow(&ty) == Ty::Int {
-                    self.error(Code::E0209, span);
+                    self.error(Code::slash_for_int, span);
                     return;
                 }
                 result
@@ -576,7 +576,7 @@ impl Checker {
                     if let StrSeg::Expr(e) = seg {
                         let t = self.expr(e, None);
                         if matches!(self.subst.shallow(&t), Ty::Maybe(_)) {
-                            self.warn(Code::W0003, e.span);
+                            self.warn(Code::interpolated_maybe, e.span);
                         }
                     }
                 }
@@ -629,7 +629,7 @@ impl Checker {
                     None => Ty::Void,
                 };
                 let Some(ctx) = self.loops.last() else {
-                    return self.error(Code::E0304, expr.span);
+                    return self.error(Code::break_outside_loop, expr.span);
                 };
                 match ctx.break_ty.clone() {
                     None => self.loops.last_mut().expect("loop").break_ty = Some(ty),
@@ -639,7 +639,7 @@ impl Checker {
                             None => self.subst.unify(&prev, &Ty::Void),
                         };
                         if !ok {
-                            self.error(Code::E0307, expr.span);
+                            self.error(Code::break_type_mismatch, expr.span);
                         }
                     }
                 }
@@ -647,14 +647,14 @@ impl Checker {
             }
             ExprKind::Continue => {
                 if self.loops.is_empty() {
-                    return self.error(Code::E0304, expr.span);
+                    return self.error(Code::break_outside_loop, expr.span);
                 }
                 Ty::Never
             }
             ExprKind::Return(value) => {
                 let declared = self.fns.last().map(|f| f.declared.clone());
                 let Some(declared) = declared else {
-                    return self.error(Code::E0305, expr.span);
+                    return self.error(Code::return_outside_function, expr.span);
                 };
                 let (id, span, ty) = match value {
                     Some(v) => (v.id, v.span, self.expr(v, declared.as_ref())),
@@ -685,11 +685,11 @@ impl Checker {
             return Ty::maybe(self.subst.fresh());
         }
         let code = if self.top_level_names.contains(name) && !self.fns.is_empty() {
-            Code::E0105
+            Code::used_before_set
         } else if self.top_level_names.contains(name) {
-            Code::E0104
+            Code::used_before_declared
         } else {
-            Code::E0101
+            Code::unknown_name
         };
         self.error(code, span)
     }
@@ -718,15 +718,15 @@ impl Checker {
                         | Ty::List(_)
                         | Ty::Func(..)
                         | Ty::Range,
-                    )) => self.error(Code::E0219, span),
+                    )) => self.error(Code::try_outside_maybe, span),
                     _ => {
                         self.fns.last_mut().expect("fn").uses_try = true;
                         (**inner).clone()
                     }
                 }
             }
-            (_, Ty::Var(_)) => self.error(Code::E0202, operand.span),
-            _ => self.error(Code::E0206, span),
+            (_, Ty::Var(_)) => self.error(Code::type_needed, operand.span),
+            _ => self.error(Code::invalid_operand_types, span),
         }
     }
 
@@ -736,7 +736,7 @@ impl Checker {
                 for side in [lhs, rhs] {
                     let t = self.expr(side, Some(&Ty::Bool));
                     if !self.subst.unify(&t, &Ty::Bool) {
-                        self.error(Code::E0206, side.span);
+                        self.error(Code::invalid_operand_types, side.span);
                     }
                 }
                 Ty::Bool
@@ -749,9 +749,9 @@ impl Checker {
                         self.expect(rhs, &rt, &inner);
                         *inner
                     }
-                    Ty::Var(_) => self.error(Code::E0202, lhs.span),
+                    Ty::Var(_) => self.error(Code::type_needed, lhs.span),
                     Ty::Error => Ty::Error,
-                    _ => self.error(Code::E0201, lhs.span),
+                    _ => self.error(Code::type_mismatch, lhs.span),
                 }
             }
             _ => {
@@ -762,7 +762,7 @@ impl Checker {
                     && let ExprKind::Unary(UnOp::Neg, inner) = &rhs.kind
                     && matches!(inner.kind, ExprKind::Int(_))
                 {
-                    return self.error(Code::E0214, rhs.span);
+                    return self.error(Code::negative_literal_exponent, rhs.span);
                 }
                 self.binary_type(op, lhs, &lt, rhs, &rt, span)
             }
@@ -790,7 +790,7 @@ impl Checker {
             return Ty::Error;
         }
         if matches!(a, Ty::Var(_)) {
-            return self.error(Code::E0202, lhs.span);
+            return self.error(Code::type_needed, lhs.span);
         }
         let numeric = a.is_numeric() && b.is_numeric();
         let widen = |c: &mut Self| {
@@ -818,16 +818,16 @@ impl Checker {
                 if a == Ty::Int && b == Ty::Int {
                     Ty::Int
                 } else if a == Ty::Bool || b == Ty::Bool {
-                    self.error(Code::E0207, span)
+                    self.error(Code::bitwise_on_bool, span)
                 } else {
-                    self.error(Code::E0206, span)
+                    self.error(Code::invalid_operand_types, span)
                 }
             }
             BinOp::Eq | BinOp::Ne => {
                 if numeric {
                     widen(self);
                 } else if !self.subst.unify(&a, &b) {
-                    return self.error(Code::E0206, span);
+                    return self.error(Code::invalid_operand_types, span);
                 }
                 Ty::Bool
             }
@@ -838,18 +838,18 @@ impl Checker {
                 } else if a == Ty::Str && b == Ty::Str {
                     Ty::Bool
                 } else {
-                    self.error(Code::E0206, span)
+                    self.error(Code::invalid_operand_types, span)
                 }
             }
             BinOp::Range | BinOp::RangeIncl if a == Ty::Int && b == Ty::Int => {
                 if let (ExprKind::Int(x), ExprKind::Int(y)) = (&lhs.kind, &rhs.kind)
                     && x > y
                 {
-                    self.error(Code::E0308, span);
+                    self.error(Code::constant_backwards_range, span);
                 }
                 Ty::Range
             }
-            _ => self.error(Code::E0206, span),
+            _ => self.error(Code::invalid_operand_types, span),
         }
     }
 
@@ -858,7 +858,7 @@ impl Checker {
             for a in args {
                 self.expr(&a.value, None);
             }
-            self.error(Code::E0203, span);
+            self.error(Code::wrong_arguments, span);
             return false;
         }
         for (arg, param) in args.iter().zip(params) {
@@ -878,7 +878,7 @@ impl Checker {
             match name.as_str() {
                 "print" => {
                     if args.len() != 1 {
-                        return self.error(Code::E0203, span);
+                        return self.error(Code::wrong_arguments, span);
                     }
                     self.expr(&args[0].value, None);
                     return Ty::Void;
@@ -897,7 +897,7 @@ impl Checker {
                 }
                 "Some" => {
                     if args.len() != 1 {
-                        return self.error(Code::E0203, span);
+                        return self.error(Code::wrong_arguments, span);
                     }
                     let t = self.expr(&args[0].value, None);
                     return Ty::maybe(t);
@@ -920,7 +920,7 @@ impl Checker {
                 ret
             }
             Ty::Error => Ty::Error,
-            _ => self.error(Code::E0205, callee.span),
+            _ => self.error(Code::not_callable, callee.span),
         }
     }
 
@@ -975,7 +975,7 @@ impl Checker {
             }
         }
         if !ok {
-            self.error(Code::E0203, span);
+            self.error(Code::wrong_arguments, span);
         }
         match self.ensure_checked(name, span) {
             Some(sig) => sig.ret.unwrap_or(Ty::Void),
@@ -989,7 +989,7 @@ impl Checker {
             && (type_name == "Int" || type_name == "Float")
         {
             if name != "parse" {
-                return self.error(Code::E0204, span);
+                return self.error(Code::unknown_method, span);
             }
             self.args_of(args, span, &[Ty::Str]);
             return Ty::maybe(if type_name == "Int" {
@@ -1008,7 +1008,7 @@ impl Checker {
                 var.reassigned = true;
                 var.list_len = None;
             } else if matches!(recv_ty, Ty::List(_)) {
-                self.error(Code::E0303, recv.span);
+                self.error(Code::change_let_list, recv.span);
             }
         }
         match recv_ty {
@@ -1018,7 +1018,7 @@ impl Checker {
                 }
                 Ty::Error
             }
-            Ty::Var(_) => self.error(Code::E0202, recv.span),
+            Ty::Var(_) => self.error(Code::type_needed, recv.span),
             Ty::Str => self.string_method(name, args, span),
             Ty::List(elem) => self.list_method(*elem, name, args, span),
             Ty::Int if name == "toFloat" => {
@@ -1040,16 +1040,16 @@ impl Checker {
                     self.args_of(args, span, &[]);
                     let mut t = self.subst.shallow(&inner);
                     if !matches!(t, Ty::Maybe(_)) {
-                        return self.error(Code::E0217, span);
+                        return self.error(Code::flatten_without_nesting, span);
                     }
                     while let Ty::Maybe(i) = t {
                         t = self.subst.shallow(&i);
                     }
                     Ty::maybe(t)
                 }
-                _ => self.error(Code::E0204, span),
+                _ => self.error(Code::unknown_method, span),
             },
-            _ => self.error(Code::E0204, span),
+            _ => self.error(Code::unknown_method, span),
         }
     }
 
@@ -1073,7 +1073,7 @@ impl Checker {
                 }
                 Ty::list(Ty::Str)
             }
-            _ => self.error(Code::E0204, span),
+            _ => self.error(Code::unknown_method, span),
         }
     }
 
@@ -1109,7 +1109,7 @@ impl Checker {
             }
             "join" => {
                 if !self.subst.unify(&elem, &Ty::Str) {
-                    return self.error(Code::E0204, span);
+                    return self.error(Code::unknown_method, span);
                 }
                 self.args_of(args, span, &[Ty::Str]);
                 Ty::Str
@@ -1127,7 +1127,7 @@ impl Checker {
                 );
                 Ty::list(elem)
             }
-            _ => self.error(Code::E0204, span),
+            _ => self.error(Code::unknown_method, span),
         }
     }
 
@@ -1138,8 +1138,8 @@ impl Checker {
         let elem = match self.subst.shallow(&lt) {
             Ty::List(e) => *e,
             Ty::Error => return Ty::Error,
-            Ty::Var(_) => return self.error(Code::E0202, list.span),
-            _ => return self.error(Code::E0206, span),
+            Ty::Var(_) => return self.error(Code::type_needed, list.span),
+            _ => return self.error(Code::invalid_operand_types, span),
         };
         if let ExprKind::Name(list_name) = &list.kind {
             if let ExprKind::Int(k) = index.kind
@@ -1224,7 +1224,7 @@ impl Checker {
                 let ot = self.expr(other, expected);
                 match self.join((then, tt), (other, ot)) {
                     Some(t) => t,
-                    None => self.error(Code::E0210, expr.span),
+                    None => self.error(Code::branch_type_mismatch, expr.span),
                 }
             }
             None => self.optional_value(expr, tt),
@@ -1236,7 +1236,7 @@ impl Checker {
             Ty::Void | Ty::Never | Ty::Error => Ty::Void,
             t => {
                 if matches!(t, Ty::Maybe(_)) {
-                    self.warn(Code::W0004, expr.span);
+                    self.warn(Code::nested_maybe, expr.span);
                 }
                 self.info.wrapping.insert(expr.id);
                 Ty::maybe(t)
@@ -1267,7 +1267,7 @@ impl Checker {
             Ty::Range => Ty::Int,
             Ty::List(e) => *e,
             Ty::Error => Ty::Error,
-            _ => self.error(Code::E0218, iter.span),
+            _ => self.error(Code::not_iterable, iter.span),
         };
         let narrowed_list = narrowing_list(iter).filter(|list| !mutates(body, list));
         if let Some(list) = &narrowed_list {
