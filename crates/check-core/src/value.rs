@@ -23,7 +23,7 @@ pub enum Value {
     List(Rc<Vec<Value>>),
     Some(Rc<Value>),
     None,
-    Range(i64, i64),
+    Range(i64, i64, bool),
     Func(Rc<Callable>),
     Void,
 }
@@ -41,7 +41,7 @@ impl PartialEq for Value {
             (Value::List(a), Value::List(b)) => a == b,
             (Value::Some(a), Value::Some(b)) => a == b,
             (Value::None, Value::None) | (Value::Void, Value::Void) => true,
-            (Value::Range(a, b), Value::Range(c, d)) => a == c && b == d,
+            (Value::Range(a, b, x), Value::Range(c, d, y)) => a == c && b == d && x == y,
             (Value::Func(a), Value::Func(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
@@ -53,12 +53,12 @@ impl Value {
         matches!(self, Value::Bool(true))
     }
 
-    pub fn compare(&self, other: &Value) -> Ordering {
+    pub fn compare(&self, other: &Value) -> Option<Ordering> {
         match (self, other) {
-            (Value::Int(a), Value::Int(b)) => a.cmp(b),
-            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
-            (Value::Str(a), Value::Str(b)) => a.cmp(b),
-            _ => Ordering::Equal,
+            (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
+            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
+            (Value::Str(a), Value::Str(b)) => Some(a.cmp(b)),
+            _ => None,
         }
     }
 
@@ -84,7 +84,9 @@ impl Value {
                 inner => format!("Some({})", inner.code()),
             },
             Value::None => "None".to_string(),
-            Value::Range(a, b) => format!("{a}..{b}"),
+            Value::Range(a, b, inclusive) => {
+                format!("{a}..{}{b}", if *inclusive { "=" } else { "" })
+            }
             Value::Func(f) => match &**f {
                 Callable::Named(_, sig) | Callable::Lambda { sig, .. } => sig.clone(),
             },

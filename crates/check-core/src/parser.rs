@@ -452,7 +452,11 @@ impl Parser<'_> {
         let rhs = self.coalesce()?;
         let expr = self.binary(op, lhs, rhs);
         if self.comparison_op().is_some() {
-            return self.error(Code::E0208, self.span());
+            self.diags.push(Diagnostic::error(Code::E0208, self.span()));
+            while self.comparison_op().is_some() {
+                self.advance();
+                self.coalesce()?;
+            }
         }
         Ok(expr)
     }
@@ -651,9 +655,10 @@ impl Parser<'_> {
                     None
                 };
                 let body = self.func_body(ret.is_some())?;
-                return Ok(
-                    self.expr_node(span.to(body.span), ExprKind::Lambda(params, Box::new(body)))
-                );
+                return Ok(self.expr_node(
+                    span.to(body.span),
+                    ExprKind::Lambda(params, ret, Box::new(body)),
+                ));
             }
             Tok::Kw("if") => return self.if_expr(span),
             Tok::Kw("while") => {

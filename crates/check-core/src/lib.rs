@@ -59,7 +59,7 @@ pub fn run_source(
         },
         Ok(Some(span)) => {
             let (line, col, _) = diag::locate(src, span.start);
-            let text = format!("{}\n --> {path}:{line}:{col}\n", Code::S0001.message());
+            let text = format!("{} at {path}:{line}:{col}\n", Code::S0001.message());
             Report {
                 outcome: Outcome::Stopped,
                 diagnostics,
@@ -69,11 +69,15 @@ pub fn run_source(
         Err(p) => {
             let (line, col, _) = diag::locate(src, p.span.start);
             let reason = p.reason.map(|r| format!(": {r}")).unwrap_or_default();
-            let text = format!(
+            let mut text = format!(
                 "panic[{}]: {}{reason}\n --> {path}:{line}:{col}\n",
                 p.code,
                 p.code.message()
             );
+            for call in &p.stack {
+                let (line, col, _) = diag::locate(src, call.start);
+                text.push_str(&format!("    at {path}:{line}:{col}\n"));
+            }
             Report {
                 outcome: Outcome::Panicked(p.code),
                 diagnostics,

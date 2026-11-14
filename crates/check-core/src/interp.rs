@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::rc::Rc;
@@ -11,6 +12,7 @@ pub struct Panic {
     pub code: Code,
     pub span: Span,
     pub reason: Option<String>,
+    pub stack: Vec<Span>,
 }
 
 pub enum Flow {
@@ -77,6 +79,7 @@ fn panic<T>(code: Code, span: Span) -> Result<T, Flow> {
         code,
         span,
         reason: None,
+        stack: Vec::new(),
     }))
 }
 
@@ -248,7 +251,7 @@ impl Interpreter<'_> {
                     None => Value::None,
                 })
             }
-            ExprKind::Lambda(params, body) => {
+            ExprKind::Lambda(params, _, body) => {
                 let mut captured = self.globals.clone();
                 for scope in &self.frames.last().expect("frame").scopes {
                     captured.extend(scope.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -311,7 +314,8 @@ impl Interpreter<'_> {
             ExprKind::For(name, _, iter, body) => {
                 let wraps = self.info.wrapping.contains(&expr.id);
                 let items: Box<dyn Iterator<Item = Value>> = match self.expr(iter)? {
-                    Value::Range(lo, hi) => Box::new((lo..hi).map(Value::Int)),
+                    Value::Range(lo, hi, false) => Box::new((lo..hi).map(Value::Int)),
+                    Value::Range(lo, hi, true) => Box::new((lo..=hi).map(Value::Int)),
                     Value::List(items) => Box::new((*items).clone().into_iter()),
                     _ => Box::new(std::iter::empty()),
                 };
@@ -407,12 +411,14 @@ impl Interpreter<'_> {
                         code: Code::E0901,
                         span,
                         reason,
+                        stack: Vec::new(),
                     }));
                 }
                 "input" => {
                     if let Some(a) = args.first() {
                         let prompt = self.expr(&a.value)?.display();
                         write!(self.output, "{prompt}").ok();
+                        self.output.flush().ok();
                     }
                     let mut line = String::new();
                     return Ok(match self.input.read_line(&mut line) {
@@ -494,7 +500,7 @@ impl Interpreter<'_> {
                     .map(|p| p.name.clone())
                     .zip(values)
                     .collect();
-                self.enter(vec![scope], &decl.body.clone(), span)
+                self.enter(vec![scope], &decl.body, span)
             }
             Callable::Lambda {
                 params,
@@ -521,6 +527,10 @@ impl Interpreter<'_> {
         match result {
             Ok(v) => Ok(v),
             Err(Flow::Return(v)) => Ok(v),
+            Err(Flow::Panic(mut p)) => {
+                p.stack.push(span);
+                Err(Flow::Panic(p))
+            }
             Err(other) => Err(other),
         }
     }
@@ -593,7 +603,7 @@ impl Interpreter<'_> {
             (Value::List(items), "last") => items
                 .last()
                 .map_or(Value::None, |v| Value::Some(Rc::new(v.clone()))),
-            (Value::List(items), "indices") => Value::Range(0, items.len() as i64),
+            (Value::List(items), "indices") => Value::Range(0, items.len() as i64, false),
             (Value::List(items), "join") => {
                 let parts: Vec<String> = items.iter().map(Value::display).collect();
                 Value::Str(parts.join(&arg_str(0)).into())
@@ -636,6 +646,7 @@ impl Interpreter<'_> {
                     code: Code::E0904,
                     span,
                     reason,
+                    stack: Vec::new(),
                 }));
             }
             (v @ (Value::Some(_) | Value::None), "flatten") => {
@@ -682,6 +693,7 @@ fn arith(op: BinOp, l: Value, r: Value, span: Span) -> Eval {
         }
         (BinOp::IntDiv | BinOp::Mod, I(_), I(0)) => return panic(Code::E0903, span),
         (BinOp::IntDiv, I(a), I(b)) => return overflow(floor_div(a, b)),
+        (BinOp::Mod, I(_), I(-1)) => I(0),
         (BinOp::Mod, I(a), I(b)) => {
             return overflow(
                 floor_div(a, b)
@@ -710,18 +722,15 @@ fn arith(op: BinOp, l: Value, r: Value, span: Span) -> Eval {
         }
         (BinOp::Shl, I(a), I(b)) => I(a.wrapping_shl(b as u32)),
         (BinOp::Shr, I(a), I(b)) => I(a >> b),
-        (BinOp::Range, I(a), I(b)) => Value::Range(a, b),
-        (BinOp::RangeIncl, I(a), I(b)) => match b.checked_add(1) {
-            Some(end) => Value::Range(a, end),
-            None => return panic(Code::E0902, span),
-        },
+        (BinOp::Range, I(a), I(b)) => Value::Range(a, b, false),
+        (BinOp::RangeIncl, I(a), I(b)) => Value::Range(a, b, true),
         (BinOp::Add, Value::Str(a), Value::Str(b)) => Value::Str(format!("{a}{b}").into()),
         (BinOp::Eq, a, b) => Value::Bool(a == b),
         (BinOp::Ne, a, b) => Value::Bool(a != b),
-        (BinOp::Lt, a, b) => Value::Bool(a.compare(&b).is_lt()),
-        (BinOp::Gt, a, b) => Value::Bool(a.compare(&b).is_gt()),
-        (BinOp::Le, a, b) => Value::Bool(a.compare(&b).is_le()),
-        (BinOp::Ge, a, b) => Value::Bool(a.compare(&b).is_ge()),
+        (BinOp::Lt, a, b) => Value::Bool(a.compare(&b).is_some_and(Ordering::is_lt)),
+        (BinOp::Gt, a, b) => Value::Bool(a.compare(&b).is_some_and(Ordering::is_gt)),
+        (BinOp::Le, a, b) => Value::Bool(a.compare(&b).is_some_and(Ordering::is_le)),
+        (BinOp::Ge, a, b) => Value::Bool(a.compare(&b).is_some_and(Ordering::is_ge)),
         _ => Value::Void,
     })
 }

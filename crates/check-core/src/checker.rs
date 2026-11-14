@@ -599,7 +599,9 @@ impl Checker {
             ExprKind::Call(callee, args) => self.call(callee, args, expr.span),
             ExprKind::Method(recv, name, args) => self.method(recv, name, args, expr.span),
             ExprKind::Index(list, index) => self.index(expr.id, list, index, expr.span),
-            ExprKind::Lambda(params, body) => self.lambda(expr.id, params, body, expected),
+            ExprKind::Lambda(params, ret, body) => {
+                self.lambda(expr.id, params, ret.as_ref(), body, expected)
+            }
             ExprKind::Block(stmts) => self.block(stmts, expected),
             ExprKind::If(cond, then, otherwise) => {
                 self.if_expr(expr, cond, then, otherwise.as_deref(), expected)
@@ -1162,7 +1164,14 @@ impl Checker {
         Ty::maybe(elem)
     }
 
-    fn lambda(&mut self, id: NodeId, params: &[Param], body: &Expr, expected: Option<&Ty>) -> Ty {
+    fn lambda(
+        &mut self,
+        id: NodeId,
+        params: &[Param],
+        ret: Option<&TypeExpr>,
+        body: &Expr,
+        expected: Option<&Ty>,
+    ) -> Ty {
         let expected_params = match expected.map(|e| self.subst.shallow(e)) {
             Some(Ty::Func(ps, _)) if ps.len() == params.len() => Some(ps),
             _ => None,
@@ -1188,9 +1197,10 @@ impl Checker {
                 },
             );
         }
+        let declared = ret.map(|t| self.type_from(t));
         let saved_loops = std::mem::take(&mut self.loops);
         self.scopes.push(scope);
-        let ret = self.function_body(body, None);
+        let ret = self.function_body(body, declared);
         self.finish_scope();
         self.loops = saved_loops;
         let ty = Ty::Func(param_tys, Box::new(ret));
@@ -1323,7 +1333,7 @@ fn mutates(expr: &Expr, list: &str) -> bool {
             .iter()
             .any(|s| matches!(s, StrSeg::Expr(e) if mutates(e, list))),
         ExprKind::List(items) => items.iter().any(|e| mutates(e, list)),
-        ExprKind::Unary(_, e) | ExprKind::Loop(e) | ExprKind::Lambda(_, e) => mutates(e, list),
+        ExprKind::Unary(_, e) | ExprKind::Loop(e) | ExprKind::Lambda(_, _, e) => mutates(e, list),
         ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
         | ExprKind::While(a, b)

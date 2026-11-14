@@ -117,7 +117,8 @@ fn run_test(dir: &Path) -> Result<(), String> {
         .find(|d| d.severity == Severity::Error)
         .map(|d| d.code.to_string());
     let error_code = match report.outcome {
-        Outcome::Finished | Outcome::Stopped => None,
+        Outcome::Finished => None,
+        Outcome::Stopped => Some("S0001".to_string()),
         Outcome::CheckFailed => first_error,
         Outcome::Panicked(code) => Some(code.to_string()),
     };
@@ -133,7 +134,7 @@ fn run_test(dir: &Path) -> Result<(), String> {
         };
     }
     let mut problems = String::new();
-    if error_code.is_some() {
+    if error_code.is_some() && !matches!(report.outcome, Outcome::Stopped) {
         problems.push_str(&render(&path, &src, &report, true));
     }
     let expected =

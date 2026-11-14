@@ -117,7 +117,7 @@ pub enum ExprKind {
     Call(Box<Expr>, Vec<Arg>),
     Method(Box<Expr>, String, Vec<Arg>),
     Index(Box<Expr>, Box<Expr>),
-    Lambda(Vec<Param>, Box<Expr>),
+    Lambda(Vec<Param>, Option<TypeExpr>, Box<Expr>),
     Block(Vec<Stmt>),
     If(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
     While(Box<Expr>, Box<Expr>),
