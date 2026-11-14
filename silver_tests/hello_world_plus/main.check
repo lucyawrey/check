@@ -1,10 +1,149 @@
+// this file is not done
 let hello = "Hello"
 var output = ""
+var failures = 0
+
+func expect(ok: Bool) {
+  if not ok { failures += 1 }
+}
+
+expect(1_000 == 1000 and 0xFF == 255 and 0xff == 255 and 0b1010 == 10 and 0o17 == 15)
+expect(1.5e-3 == 0.0015 and 1e3 == 1000.0)
+expect(7 / 2 == 3.5 and 7 div 2 == 3 and -7 div 2 == -4 and -7 mod 3 == 2)
+expect(2 ** 10 == 1024 and -2 ** 2 == -4 and 2.0 ** -1 == 0.5)
+expect(6 & 3 == 2 and 6 | 1 == 7 and 6 ^ 3 == 5 and ~0 == -1)
+expect(1 << 4 == 16 and -8 >> 1 == -4)
+expect((7 / 2).round() == 4 and (7 / 2).floor() == 3 and (-3.5).ceil() == -3 and (-3.5).truncate() == -3)
+
+let count = 3
+expect(count * 1.5 == 4.5 and count.toFloat() == 3.0)
+
+var score = 10
+score += 5; score -= 3; score *= 2
+var ratio: Float = 3
+ratio /= 2
+expect(score == 24 and ratio == 1.5)
+
+let done = false
+expect(not done and score > 10 or false)
+expect(not score == 0)
+
+expect("\u{48}ello" == hello and r"{hello}" == "\{hello}")
+expect("Hel" + "lo" == hello and "apple" < "banana")
+expect("{hello}, {2 * 3}" == "Hello, 6")
+expect("  hello ".trim().upper() == "HELLO" and "HeLLo".lower() == "hello")
+expect(hello.contains("ell") and not hello.isEmpty() and "".isEmpty())
+expect("a,b".split(",").join("-") == "a-b" and "  add  buy milk ".split().length() == 3)
+let banner = """
+    Hello
+    """
+expect(banner.trim() == hello)
+
+let longSum = 1 +
+    2
+let shout = hello
+    .upper()
+expect(longSum == 3 and shout == "HELLO")
+
+let parsed: Int? = Int.parse("42")
+let maybeWord: String? = "World"
+expect(parsed ?? 0 == 42 and Int.parse("x") ?? -1 == -1 and maybeWord ?? "" == "World")
+expect(Float.parse("2.5") ?? 0.0 == 2.5 and Int.parse("7").orPanic("7 is a number") == 7)
+expect(input() ?? "" == "World")
+
+let words = ["Hello", "decoy", "World"]
+var copy = words
+copy.push("extra")
+expect(words.length() == 3 and copy.length() == 4)
+expect(copy.pop() ?? "" == "extra" and copy.removeAt(1) ?? "" == "decoy" and copy[5] ?? "none" == "none")
+expect(copy.join(" ") == "Hello World" and words[0] == "Hello")
+expect(words.contains("World") and words.first() ?? "" == "Hello" and words.last() ?? "" == "World")
+expect([1, 2, 3].map(func(x) x * 2).length() == 3 and words.filter(func(w) w != "decoy").join(", ") == "Hello, World")
+var names = []
+names.push("Bo")
+expect(names.length() == 1 and not names.isEmpty())
+
+var steps = 0
+while steps < 5 { steps += 1 }
+var inclusive = 0
+for i in 0..=3 { inclusive += i }
+expect(steps == 5 and inclusive == 6)
+
+var kept = ""
+for word in words {
+    if word == "decoy" { continue }
+    kept = "{kept}{word}"
+}
+var everyOther = ""
+for i in words.indices() {
+    if i mod 2 == 0 { everyOther = "{everyOther}{words[i]}" }
+}
+expect(kept == "HelloWorld" and everyOther == "HelloWorld")
+
+var index = 0
+let found = loop {
+    if index >= words.length() { break "" }
+    let word = words[index] ?? ""
+    if word.upper() == "WORLD" { break word }
+    index += 1
+}
+let decoy = for word in words { if word.contains("coy") { break word } } ?? ""
+let missing = for word in words { if word == "Bye" { break word } } ?? "none"
+expect(found == "World" and decoy == "decoy" and missing == "none")
+
+let grade = if score >= 90 { "A" } else if score >= 20 { "B" } else { "C" }
+let bonus = if score > 50 { 10 } ?? 0
+let five = if score > 0 { Int.parse("5") }.flatten() ?? 0
+expect(grade == "B" and bonus == 0 and five == 5)
+
+func double(x: Int) x * 2
+func half(x: Int) -> Float { x / 2 }
+func fact(n: Int) -> Int {
+    if n <= 1 { 1 } else { n * fact(n - 1) }
+}
+func total(...nums: List<Int>) -> Int {
+    var sum = 0
+    for n in nums { sum += n }
+    sum
+}
+func greet(name: String, greeting = "Hi") "{greeting}, {name}"
+func countdown(var n: Int) -> Int {
+    var ticks = 0
+    while n > 0 { n -= 1; ticks += 1 }
+    ticks
+}
+func findWord(list: List<String>, target: String) -> String {
+    for word in list {
+        if word.lower() == target { return word }
+    }
+    ""
+}
+let start = 4
+expect(double(21) == 42 and half(3) == 1.5 and fact(5) == 120)
+expect(total(1, 2, 3) == 6 and total() == 0)
+expect(greet("Bo") == "Hi, Bo" and greet("Bo", "Yo") == "Yo, Bo")
+expect(countdown(start) == 4 and start == 4)
+expect(findWord(words, "world") == "World" and findWord(words, "bye") == "")
+
+var mark = "!"
+let exclaim = func(s) "{s}{mark}"
+mark = "?"
+let triple = func(x) x * 3
+func apply(f: func(String) -> String, s: String) f(s)
+expect(exclaim("Hi") == "Hi!" and apply(exclaim, "Yo") == "Yo!" and triple(4) == 12)
+expect(apply(func(s) s.upper(), "hi") == "HI")
+
+func makeGreeting() -> String {
+    var who = found
+    let say = func "{hello}, {who}"
+    who = "nobody"
+    say()
+}
 
 func helloWorld() {
-    let world = "World"
-    let helloWorldText = "{hello}, {world}!"
-    setOutputIf(helloWorldText, true)
+    let bang = exclaim("")
+    let helloWorldText = "{makeGreeting()}{bang}"
+    setOutputIf(helloWorldText, failures == 0)
     for i in 0..3 {
         if i == 2 {
             printOutput()
@@ -15,6 +154,8 @@ func helloWorld() {
 func setOutputIf(text: String, set: Bool) {
     if set {
         output = text
+    } else {
+        output = "{failures} checks failed"
     }
 }
 

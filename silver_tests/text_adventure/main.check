@@ -1,0 +1,17 @@
+func main() {
+  print("Welcome to Awakening Quest! Check's premier for-testing-purposes only text adventure.")
+  print("Have fun!\n")
+  try input()
+  print("You awaken on soft grass, the sound of rushing water filling your ears.")
+  try input()
+  print("Your eyes are too heavy to open, but you hear footsteps approach. Someone, probably a young woman, speaks:")
+  print("Ah, so you're awake? Good.")
+  print("Can you tell me your name?")
+  let name = loop {
+    let line = try input()
+    if not line.isBlank() { break line }
+  }
+  print("{name}? A strange name, but it will do.")
+}
+
+main().orPanic()
