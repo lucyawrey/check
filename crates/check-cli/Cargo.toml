@@ -1,0 +1,11 @@
+[package]
+name = "check-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+check-core = { path = "../check-core" }
+
+[[bin]]
+name = "check"
+path = "src/main.rs"
