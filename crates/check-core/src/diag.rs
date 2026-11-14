@@ -84,6 +84,7 @@ codes! {
     E0306 => "[a loop used as a value with no break value]",
     E0307 => "[break values of different types in one loop]",
     E0308 => "[a backwards range with constant ends]",
+    S0001 => "[a top-level try found no value, so the program stopped]",
     E0901 => "[panic was called]",
     E0902 => "[integer overflow]",
     E0903 => "[integer division by zero]",

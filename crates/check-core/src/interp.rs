@@ -17,6 +17,7 @@ pub enum Flow {
     Break(Value),
     Continue,
     Return(Value),
+    Stop(Span),
     Panic(Panic),
 }
 
@@ -43,7 +44,7 @@ pub fn run(
     info: &Info,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
-) -> Result<(), Panic> {
+) -> Result<Option<Span>, Panic> {
     let mut interp = Interpreter {
         info,
         funcs: HashMap::new(),
@@ -64,10 +65,11 @@ pub fn run(
         match interp.stmt(stmt) {
             Ok(_) => {}
             Err(Flow::Panic(p)) => return Err(p),
+            Err(Flow::Stop(span)) => return Ok(Some(span)),
             Err(_) => {}
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn panic<T>(code: Code, span: Span) -> Result<T, Flow> {
@@ -225,6 +227,7 @@ impl Interpreter<'_> {
                     (UnOp::BitNot, Value::Int(n)) => Ok(Value::Int(!n)),
                     (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                     (UnOp::Try, Value::Some(v)) => Ok((*v).clone()),
+                    (UnOp::Try, _) if self.frames.len() == 1 => Err(Flow::Stop(expr.span)),
                     (UnOp::Try, _) => Err(Flow::Return(Value::None)),
                     (_, v) => Ok(v),
                 }

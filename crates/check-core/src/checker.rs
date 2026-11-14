@@ -706,8 +706,8 @@ impl Checker {
                     .last()
                     .map(|f| f.declared.as_ref().map(|d| self.subst.shallow(d)));
                 match declared {
-                    None
-                    | Some(Some(
+                    None => (**inner).clone(),
+                    Some(Some(
                         Ty::Int
                         | Ty::Float
                         | Ty::Bool

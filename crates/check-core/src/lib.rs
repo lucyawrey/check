@@ -13,6 +13,7 @@ use diag::{Code, Diagnostic, Severity};
 
 pub enum Outcome {
     Finished,
+    Stopped,
     CheckFailed,
     Panicked(Code),
 }
@@ -51,11 +52,20 @@ pub fn run_source(
         };
     }
     match interp::run(&program, &info, input, output) {
-        Ok(()) => Report {
+        Ok(None) => Report {
             outcome: Outcome::Finished,
             diagnostics,
             panic_text: None,
         },
+        Ok(Some(span)) => {
+            let (line, col, _) = diag::locate(src, span.start);
+            let text = format!("{}\n --> {path}:{line}:{col}\n", Code::S0001.message());
+            Report {
+                outcome: Outcome::Stopped,
+                diagnostics,
+                panic_text: Some(text),
+            }
+        }
         Err(p) => {
             let (line, col, _) = diag::locate(src, p.span.start);
             let reason = p.reason.map(|r| format!(": {r}")).unwrap_or_default();
