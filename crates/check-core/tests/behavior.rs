@@ -138,3 +138,12 @@ fn try_makes_an_inferred_return_type_a_maybe() {
         "None"
     );
 }
+
+#[test]
+fn a_top_level_try_on_none_stops_without_a_panic() {
+    let mut out = Vec::new();
+    let src = "print(\"before\")\nlet line = try input()\nprint(\"after\")";
+    let report = run_source("test.check", src, &mut Cursor::new(Vec::new()), &mut out);
+    assert!(matches!(report.outcome, Outcome::Stopped));
+    assert_eq!(String::from_utf8(out).expect("utf-8"), "before\n");
+}
