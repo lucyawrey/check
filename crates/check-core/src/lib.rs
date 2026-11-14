@@ -59,7 +59,7 @@ pub fn run_source(
         },
         Ok(Some(span)) => {
             let (line, col, _) = diag::locate(src, span.start);
-            let text = format!("{} at {path}:{line}:{col}\n", Code::S0001.message());
+            let text = format!("{} at {path}:{line}:{col}\n", Code::try_stopped.message());
             Report {
                 outcome: Outcome::Stopped,
                 diagnostics,
