@@ -30,7 +30,7 @@
 					"begin": "\"\"\"",
 					"end": "\"\"\"",
 					"patterns": [
-						{ "name": "constant.character.escape.check", "match": "\\\\." },
+						{ "name": "constant.character.escape.check", "match": "\\\\(u\\{[0-9A-Fa-f]*\\}|.)" },
 						{
 							"name": "meta.interpolation.check",
 							"begin": "\\{",
@@ -49,7 +49,7 @@
 					"begin": "\"",
 					"end": "\"",
 					"patterns": [
-						{ "name": "constant.character.escape.check", "match": "\\\\." },
+						{ "name": "constant.character.escape.check", "match": "\\\\(u\\{[0-9A-Fa-f]*\\}|.)" },
 						{
 							"name": "meta.interpolation.check",
 							"begin": "\\{",
@@ -70,14 +70,14 @@
 		},
 		"numbers": {
 			"name": "constant.numeric.check",
-			"match": "\\b(0x[0-9A-Fa-f_]+|0b[01_]+|0o[0-7_]+|[0-9][0-9_]*(\\.[0-9][0-9_]*)?([eE][+-]?[0-9]+)?d?)\\b"
+			"match": "\\b(0x[0-9A-Fa-f_]+|0b[01_]+|0o[0-7_]+|(0|[1-9][0-9_]*)(\\.[0-9][0-9_]*)?(e[+-]?[0-9]+)?d?)\\b"
 		},
 		"keywords": {
 			"patterns": [
 				{ "name": "keyword.operator.arrow.check", "match": "->" },
 				{ "name": "keyword.control.check", "match": "\\b(if|else|match|for|in|while|loop|break|continue|return|try)\\b" },
-				{ "name": "keyword.operator.word.check", "match": "\\b(and|or|not|div|mod)\\b" },
-				{ "name": "storage.type.check", "match": "\\b(func|let|var|const|ref|effect|private|readonly|enum|class|value|attribute|interface|implement|static|init|import|namespace)\\b" },
+				{ "name": "keyword.operator.word.check", "match": "\\b(and|or|not|div|mod|as)\\b" },
+				{ "name": "storage.type.check", "match": "\\b(func|let|var|const|ref|effect|private|readonly|enum|class|attribute|interface|implement|static|init|import|namespace)\\b" },
 				{ "name": "constant.language.check", "match": "\\b(true|false)\\b" },
 				{ "name": "variable.language.this.check", "match": "\\bthis\\b" }
 			]
