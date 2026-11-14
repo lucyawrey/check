@@ -147,3 +147,63 @@ fn a_top_level_try_on_none_stops_without_a_panic() {
     assert!(matches!(report.outcome, Outcome::Stopped));
     assert_eq!(String::from_utf8(out).expect("utf-8"), "before\n");
 }
+
+fn first_error(src: &str) -> String {
+    let report = run_source(
+        "test.check",
+        src,
+        &mut Cursor::new(Vec::new()),
+        &mut Vec::new(),
+    );
+    report
+        .diagnostics
+        .iter()
+        .find(|d| d.severity == Severity::Error)
+        .map(|d| d.code.to_string())
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_lambda_body_must_match_its_written_return_type() {
+    assert_eq!(
+        first_error("let f = func(x: Int) -> String { x * 2 }"),
+        "E0211"
+    );
+}
+
+#[test]
+fn comparisons_with_nan_are_false() {
+    prints("0.0 / 0.0 <= 1.0", "false");
+    prints("0.0 / 0.0 >= 1.0", "false");
+    prints("0.0 / 0.0 == 0.0 / 0.0", "false");
+}
+
+#[test]
+fn edge_values_that_have_an_answer_dont_overflow() {
+    assert_eq!(
+        output("let m = -9223372036854775807 - 1\nprint(m mod -1)"),
+        "0"
+    );
+    assert_eq!(
+        output(
+            "var n = 0\nfor i in 9223372036854775806..=9223372036854775807 { n += 1 }\nprint(n)"
+        ),
+        "2"
+    );
+    prints("0..=3", "0..=3");
+}
+
+#[test]
+fn a_panic_lists_the_calls_it_came_through() {
+    let src = "func a() { panic(\"boom\") }\nfunc b() { a() }\nb()";
+    let report = run_source(
+        "test.check",
+        src,
+        &mut Cursor::new(Vec::new()),
+        &mut Vec::new(),
+    );
+    let text = report.panic_text.unwrap_or_default();
+    assert!(text.contains("test.check:1:12"), "{text}");
+    assert!(text.contains("at test.check:2:12"), "{text}");
+    assert!(text.contains("at test.check:3:1"), "{text}");
+}
