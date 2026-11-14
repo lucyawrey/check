@@ -1,6 +1,6 @@
 func main() {
   print("Welcome to Awakening Quest! Check's premier for-testing-purposes only text adventure.")
-  print("Have fun!\n")
+  print("Have fun!")
   try input()
   print("You awaken on soft grass, the sound of rushing water filling your ears.")
   try input()
@@ -14,4 +14,4 @@ func main() {
   print("{name}? A strange name, but it will do.")
 }
 
-main().orPanic()
+try main()
