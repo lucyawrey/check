@@ -135,7 +135,7 @@ expect(apply(func(s) s.upper(), "hi") == "HI")
 
 func makeGreeting() -> String {
     var who = found
-    let say = func "{hello}, {who}"
+    let say = func() "{hello}, {who}"
     who = "nobody"
     say()
 }
