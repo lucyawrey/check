@@ -12,6 +12,7 @@ pub enum Ty {
     List(Box<Ty>),
     Maybe(Box<Ty>),
     Func(Vec<Ty>, Box<Ty>),
+    Named(String),
     Var(usize),
     Error,
 }
@@ -110,6 +111,7 @@ impl fmt::Display for Show<'_> {
             Ty::Void => f.write_str("Void"),
             Ty::Never => f.write_str("Never"),
             Ty::Range => f.write_str("Range<Int>"),
+            Ty::Named(name) => f.write_str(name),
             Ty::List(e) => write!(f, "List<{}>", Show(e)),
             Ty::Maybe(e) => write!(f, "{}?", Show(e)),
             Ty::Func(params, ret) => {

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -14,6 +15,38 @@ pub enum Callable {
     },
 }
 
+#[derive(Clone, PartialEq)]
+pub struct Record {
+    pub name: Rc<str>,
+    pub field_names: Option<Rc<[Rc<str>]>>,
+    pub fields: Vec<Value>,
+}
+
+impl Record {
+    pub fn index(&self, field: &str) -> usize {
+        self.field_names
+            .as_ref()
+            .and_then(|names| names.iter().position(|n| &**n == field))
+            .unwrap_or(0)
+    }
+
+    fn code(&self, always_parens: bool) -> String {
+        if self.fields.is_empty() && !always_parens {
+            return self.name.to_string();
+        }
+        let fields: Vec<String> = self
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(i, v)| match &self.field_names {
+                Some(names) => format!("{} = {}", names[i], v.code()),
+                None => v.code(),
+            })
+            .collect();
+        format!("{}({})", self.name, fields.join(", "))
+    }
+}
+
 #[derive(Clone)]
 pub enum Value {
     Int(i64),
@@ -25,6 +58,9 @@ pub enum Value {
     None,
     Range(i64, i64, bool),
     Func(Rc<Callable>),
+    Object(Rc<Record>),
+    Shared(Rc<RefCell<Record>>),
+    Variant(Rc<Record>),
     Void,
 }
 
@@ -43,6 +79,8 @@ impl PartialEq for Value {
             (Value::None, Value::None) | (Value::Void, Value::Void) => true,
             (Value::Range(a, b, x), Value::Range(c, d, y)) => a == c && b == d && x == y,
             (Value::Func(a), Value::Func(b)) => Rc::ptr_eq(a, b),
+            (Value::Object(a), Value::Object(b)) | (Value::Variant(a), Value::Variant(b)) => a == b,
+            (Value::Shared(a), Value::Shared(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -90,6 +128,12 @@ impl Value {
             Value::Func(f) => match &**f {
                 Callable::Named(_, sig) | Callable::Lambda { sig, .. } => sig.clone(),
             },
+            Value::Object(r) => r.code(true),
+            Value::Shared(r) => match r.try_borrow_mut() {
+                Ok(record) => record.code(true),
+                Err(_) => "...".to_string(),
+            },
+            Value::Variant(r) => r.code(false),
             Value::Void => String::new(),
         }
     }

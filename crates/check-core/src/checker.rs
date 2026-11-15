@@ -10,12 +10,23 @@ pub struct Coercion {
     pub wraps: usize,
 }
 
+#[derive(Debug, Clone)]
+pub enum Resolved {
+    Construct(String),
+    Variant(String, String),
+    Const(String),
+    Static(String),
+    Method(String),
+}
+
 #[derive(Default)]
 pub struct Info {
     pub coercions: HashMap<NodeId, Coercion>,
     pub wrapping: HashSet<NodeId>,
     pub signatures: HashMap<NodeId, String>,
     pub unwrapped_index: HashSet<NodeId>,
+    pub resolved: HashMap<NodeId, Resolved>,
+    pub variant_patterns: HashSet<NodeId>,
 }
 
 #[derive(Clone)]
@@ -43,7 +54,40 @@ struct FuncEntry {
     decl: FuncDecl,
     sig: Sig,
     state: FuncState,
+    this: Option<(Ty, bool)>,
+    owner: Option<String>,
 }
+
+struct ClassDef {
+    is_ref: bool,
+    fields: Vec<ParamSig>,
+    mutable: Vec<bool>,
+}
+
+struct VariantDef {
+    name: String,
+    fields: Vec<ParamSig>,
+}
+
+enum TypeDef {
+    Class(ClassDef),
+    Enum(Vec<VariantDef>),
+}
+
+struct ConstEntry {
+    decl: ConstDecl,
+    owner: String,
+    ty: Ty,
+    state: FuncState,
+}
+
+type Binding = (String, Span, Ty);
+
+static WILDCARD: Pattern = Pattern {
+    id: 0,
+    span: Span { start: 0, end: 0 },
+    kind: PatternKind::Wildcard,
+};
 
 #[derive(Clone, Copy, PartialEq)]
 enum VarKind {
@@ -58,6 +102,19 @@ struct Var {
     span: Span,
     reassigned: bool,
     list_len: Option<usize>,
+}
+
+impl Var {
+    fn binding(ty: Ty, span: Span) -> Var {
+        Var {
+            ty,
+            mutable: false,
+            kind: VarKind::Local,
+            span,
+            reassigned: false,
+            list_len: None,
+        }
+    }
 }
 
 struct FnCtx {
@@ -88,6 +145,12 @@ pub struct Checker {
     narrowed: Vec<(String, String)>,
     top_level_names: HashSet<String>,
     lambda_types: Vec<(NodeId, Ty)>,
+    type_names: HashSet<String>,
+    types: HashMap<String, TypeDef>,
+    consts: HashMap<String, ConstEntry>,
+    current_type: Option<String>,
+    is_bindings: HashMap<NodeId, Vec<Binding>>,
+    defaults: Vec<(Expr, Ty, Option<String>)>,
 }
 
 const RESERVED_NAMES: &[&str] = &["Maybe", "Some", "None", "Result", "Ok", "Err"];
@@ -105,6 +168,12 @@ pub fn check(program: &[Stmt]) -> (Info, Vec<Diagnostic>) {
         narrowed: Vec::new(),
         top_level_names: HashSet::new(),
         lambda_types: Vec::new(),
+        type_names: HashSet::new(),
+        types: HashMap::new(),
+        consts: HashMap::new(),
+        current_type: None,
+        is_bindings: HashMap::new(),
+        defaults: Vec::new(),
     };
     checker.program(program);
     (checker.info, checker.diags)
@@ -126,20 +195,54 @@ impl Checker {
 
     fn program(&mut self, program: &[Stmt]) {
         for stmt in program {
+            let (name, span) = match stmt {
+                Stmt::Class(c) => (&c.name, c.span),
+                Stmt::Enum(e) => (&e.name, e.span),
+                _ => continue,
+            };
+            if RESERVED_NAMES.contains(&name.as_str()) {
+                self.error(Code::redefined_builtin, span);
+            } else if !self.type_names.insert(name.clone()) {
+                self.error(Code::duplicate_name, span);
+            }
+        }
+        for stmt in program {
             match stmt {
-                Stmt::Func(decl) => self.declare_func(decl),
+                Stmt::Class(c) => self.declare_class(c),
+                Stmt::Enum(e) => self.declare_enum(e),
+                _ => {}
+            }
+        }
+        for stmt in program {
+            match stmt {
+                Stmt::Func(decl) => {
+                    if self.type_names.contains(&decl.name) {
+                        self.error(Code::duplicate_name, decl.span);
+                    }
+                    self.declare_func(decl, None, None);
+                }
                 Stmt::Let { name, .. } => {
                     self.top_level_names.insert(name.clone());
                 }
                 _ => {}
             }
         }
+        for (default, ty, owner) in std::mem::take(&mut self.defaults) {
+            self.current_type = owner;
+            let actual = self.expr(&default, Some(&ty));
+            self.subsume(default.id, &actual, &ty);
+        }
+        self.current_type = None;
         for stmt in program {
             self.stmt(stmt);
         }
         let names: Vec<String> = self.funcs.keys().cloned().collect();
         for name in names {
             self.ensure_checked(&name, Span::default());
+        }
+        let consts: Vec<String> = self.consts.keys().cloned().collect();
+        for key in consts {
+            self.const_type(&key);
         }
         self.finish_scope();
         self.record_signatures();
@@ -181,7 +284,89 @@ impl Checker {
         }
     }
 
-    fn declare_func(&mut self, decl: &FuncDecl) {
+    fn declare_class(&mut self, c: &ClassDecl) {
+        self.current_type = Some(c.name.clone());
+        let fields = self.param_sigs(&c.fields);
+        self.current_type = None;
+        self.check_unique(c.fields.iter().map(|f| (&f.name, f.span)));
+        let mutable = c.fields.iter().map(|f| f.is_var).collect();
+        self.types.insert(
+            c.name.clone(),
+            TypeDef::Class(ClassDef {
+                is_ref: c.is_ref,
+                fields,
+                mutable,
+            }),
+        );
+        if let Some(init) = &c.init {
+            self.declare_func(init, Some((Ty::Named(c.name.clone()), true)), Some(&c.name));
+        }
+        self.declare_members(&c.name, &c.members);
+    }
+
+    fn declare_enum(&mut self, e: &EnumDecl) {
+        self.check_unique(e.variants.iter().map(|v| (&v.name, v.span)));
+        let variants = e
+            .variants
+            .iter()
+            .map(|v| VariantDef {
+                name: v.name.clone(),
+                fields: v
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| ParamSig {
+                        name: v
+                            .field_names
+                            .as_ref()
+                            .map_or_else(String::new, |n| n[i].clone()),
+                        ty: self.type_from(t),
+                        has_default: false,
+                        is_rest: false,
+                    })
+                    .collect(),
+            })
+            .collect();
+        self.types.insert(e.name.clone(), TypeDef::Enum(variants));
+        self.declare_members(&e.name, &e.members);
+    }
+
+    fn declare_members(&mut self, owner: &str, members: &Members) {
+        let this = Ty::Named(owner.to_string());
+        for m in &members.methods {
+            self.declare_func(m, Some((this.clone(), false)), Some(owner));
+        }
+        for m in &members.statics {
+            self.declare_func(m, None, Some(owner));
+        }
+        for c in &members.consts {
+            let key = format!("{owner}.{}", c.name);
+            if self.consts.contains_key(&key) || self.funcs.contains_key(&key) {
+                self.error(Code::duplicate_name, c.span);
+                continue;
+            }
+            self.consts.insert(
+                key,
+                ConstEntry {
+                    decl: c.clone(),
+                    owner: owner.to_string(),
+                    ty: Ty::Error,
+                    state: FuncState::Unchecked,
+                },
+            );
+        }
+    }
+
+    fn check_unique<'n>(&mut self, names: impl Iterator<Item = (&'n String, Span)>) {
+        let mut seen = HashSet::new();
+        for (name, span) in names {
+            if !seen.insert(name) {
+                self.error(Code::duplicate_name, span);
+            }
+        }
+    }
+
+    fn declare_func(&mut self, decl: &FuncDecl, this: Option<(Ty, bool)>, owner: Option<&str>) {
         if self.funcs.contains_key(&decl.name) {
             self.error(Code::duplicate_name, decl.span);
             return;
@@ -189,19 +374,35 @@ impl Checker {
         if RESERVED_NAMES.contains(&decl.name.as_str()) {
             self.error(Code::redefined_builtin, decl.span);
         }
+        let params = self.param_sigs(&decl.params);
+        let ret = decl.ret.as_ref().map(|t| self.type_from(t));
+        let entry = FuncEntry {
+            decl: decl.clone(),
+            sig: Sig { params, ret },
+            state: FuncState::Unchecked,
+            this,
+            owner: owner.map(str::to_string),
+        };
+        self.funcs.insert(decl.name.clone(), entry);
+    }
+
+    fn param_sigs(&mut self, decl_params: &[Param]) -> Vec<ParamSig> {
         let mut params = Vec::new();
-        for p in &decl.params {
+        for p in decl_params {
             let ty = match (&p.ty, &p.default) {
                 (Some(t), _) => self.type_from(t),
-                (None, Some(default)) => {
+                (None, Some(default)) if p.is_rest => {
                     let t = self.expr(default, None);
                     self.resolve(&t)
                 }
+                (None, Some(_)) => self.subst.fresh(),
                 (None, None) => self.error(Code::type_needed, p.span),
             };
-            if let (Some(_), Some(default)) = (&p.ty, &p.default) {
-                let actual = self.expr(default, Some(&ty));
-                self.subsume(default.id, &actual, &ty);
+            if let Some(default) = &p.default
+                && !(p.is_rest && p.ty.is_none())
+            {
+                self.defaults
+                    .push((default.clone(), ty.clone(), self.current_type.clone()));
             }
             let ty = match (p.is_rest, ty) {
                 (true, Ty::List(elem)) => *elem,
@@ -216,13 +417,63 @@ impl Checker {
                 is_rest: p.is_rest,
             });
         }
-        let ret = decl.ret.as_ref().map(|t| self.type_from(t));
-        let entry = FuncEntry {
-            decl: decl.clone(),
-            sig: Sig { params, ret },
-            state: FuncState::Unchecked,
+        params
+    }
+
+    fn const_type(&mut self, key: &str) -> Ty {
+        let entry = self.consts.get_mut(key).expect("const");
+        match entry.state {
+            FuncState::Done => return entry.ty.clone(),
+            FuncState::InProgress => {
+                let span = entry.decl.span;
+                return self.error(Code::const_cycle, span);
+            }
+            FuncState::Unchecked => entry.state = FuncState::InProgress,
+        }
+        let (decl, owner) = (entry.decl.clone(), entry.owner.clone());
+        if let Some(bad) = self.non_constant(&decl.value, &owner) {
+            self.error(Code::const_not_constant, bad.span);
+        }
+        let saved_scopes = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
+        let saved_type = self.current_type.replace(owner);
+        let declared = decl.ty.as_ref().map(|t| self.type_from(t));
+        let actual = self.expr(&decl.value, declared.as_ref());
+        let ty = match declared {
+            Some(d) => {
+                self.expect(&decl.value, &actual, &d);
+                d
+            }
+            None => actual,
         };
-        self.funcs.insert(decl.name.clone(), entry);
+        self.scopes = saved_scopes;
+        self.current_type = saved_type;
+        let entry = self.consts.get_mut(key).expect("const");
+        entry.ty = ty.clone();
+        entry.state = FuncState::Done;
+        ty
+    }
+
+    fn non_constant<'e>(&self, e: &'e Expr, owner: &str) -> Option<&'e Expr> {
+        match &e.kind {
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => None,
+            ExprKind::Str(segs) => segs.iter().find_map(|s| match s {
+                StrSeg::Expr(x) => self.non_constant(x, owner),
+                StrSeg::Text(_) => None,
+            }),
+            ExprKind::List(items) => items.iter().find_map(|x| self.non_constant(x, owner)),
+            ExprKind::Unary(op, x) if *op != UnOp::Try => self.non_constant(x, owner),
+            ExprKind::Binary(_, a, b) => self
+                .non_constant(a, owner)
+                .or_else(|| self.non_constant(b, owner)),
+            ExprKind::Name(n) if self.consts.contains_key(&format!("{owner}.{n}")) => None,
+            ExprKind::Field(base, n)
+                if matches!(&base.kind, ExprKind::Name(t)
+                    if self.consts.contains_key(&format!("{t}.{n}"))) =>
+            {
+                None
+            }
+            _ => Some(e),
+        }
     }
 
     fn type_from(&mut self, t: &TypeExpr) -> Ty {
@@ -234,6 +485,7 @@ impl Checker {
                 "String" => Ty::Str,
                 "Void" => Ty::Void,
                 "Never" => Ty::Never,
+                _ if self.type_names.contains(name) => Ty::Named(name.clone()),
                 _ => self.error(Code::unknown_name, *span),
             },
             TypeExpr::Generic(name, args, span) => match (name.as_str(), args.as_slice()) {
@@ -274,6 +526,8 @@ impl Checker {
         }
         let decl = entry.decl.clone();
         let sig = entry.sig.clone();
+        let this = entry.this.clone();
+        let saved_type = std::mem::replace(&mut self.current_type, entry.owner.clone());
         let saved_scopes = self.scopes.split_off(1);
         let saved_loops = std::mem::take(&mut self.loops);
         let saved_narrowed = std::mem::take(&mut self.narrowed);
@@ -296,9 +550,23 @@ impl Checker {
                 },
             );
         }
+        if let Some((ty, mutable)) = this {
+            scope.insert(
+                "this".to_string(),
+                Var {
+                    ty,
+                    mutable,
+                    kind: VarKind::Param,
+                    span: decl.span,
+                    reassigned: false,
+                    list_len: None,
+                },
+            );
+        }
         self.scopes.push(scope);
         let ret = self.function_body(&decl.body, sig.ret.clone());
         self.finish_scope();
+        self.current_type = saved_type;
         self.scopes.truncate(1);
         self.scopes.extend(saved_scopes);
         self.loops = saved_loops;
@@ -495,37 +763,185 @@ impl Checker {
                 self.assign(target, *op, value, *span);
                 Ty::Void
             }
-            Stmt::Func(_) => Ty::Void,
+            Stmt::LetElse {
+                pattern,
+                value,
+                otherwise,
+                ..
+            } => {
+                let t = self.expr(value, None);
+                let mut binds = Vec::new();
+                self.pattern(pattern, &t, &mut binds);
+                let ot = self.expr(otherwise, None);
+                if self.subst.shallow(&ot) != Ty::Never {
+                    self.error(Code::let_else_can_finish, otherwise.span);
+                }
+                if let PatternKind::Variant(None, name, args) = &pattern.kind
+                    && name == "Some"
+                    && matches!(args.as_slice(), [p] if matches!(p.kind, PatternKind::Name(_)) && !self.info.variant_patterns.contains(&p.id))
+                {
+                    self.warn(Code::let_else_some, pattern.span);
+                }
+                for (name, span, ty) in binds {
+                    self.declare(&name, span, Var::binding(ty, span));
+                }
+                Ty::Void
+            }
+            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) => Ty::Void,
             Stmt::Expr(e) => self.expr(e, None),
         }
     }
 
-    fn assign(&mut self, target: &Expr, op: Option<BinOp>, value: &Expr, span: Span) {
-        let ExprKind::Name(name) = &target.kind else {
-            self.error(Code::unexpected_token, target.span);
-            return;
-        };
-        let Some(var) = self.lookup(name) else {
-            let code = if self.top_level_names.contains(name) {
+    fn place_name(&mut self, name: &str, span: Span) -> (Ty, Option<Code>) {
+        if self.lookup(name).is_none()
+            && let Some(owner) = &self.current_type
+        {
+            let key = format!("{owner}.{name}");
+            if self.consts.contains_key(&key) {
+                return (self.const_type(&key), Some(Code::assign_to_let));
+            }
+        }
+        let Some(var) = self.lookup_mut(name) else {
+            let code = if name == "this" {
+                Code::this_outside_method
+            } else if self.top_level_names.contains(name) {
                 Code::used_before_set
             } else {
                 Code::unknown_name
             };
-            self.error(code, target.span);
-            return;
+            return (self.error(code, span), None);
         };
-        let (ty, mutable, kind) = (var.ty.clone(), var.mutable, var.kind);
-        if !mutable {
-            let code = if kind == VarKind::Param {
+        if !var.mutable {
+            let code = if var.kind == VarKind::Param && name != "this" {
                 Code::assign_to_parameter
             } else {
                 Code::assign_to_let
             };
-            self.error(code, target.span);
+            return (var.ty.clone(), Some(code));
         }
-        if let Some(v) = self.lookup_mut(name) {
-            v.reassigned = true;
-            v.list_len = None;
+        var.reassigned = true;
+        var.list_len = None;
+        (var.ty.clone(), None)
+    }
+
+    fn place(&mut self, target: &Expr) -> (Ty, Option<Code>) {
+        match &target.kind {
+            ExprKind::Name(name) => self.place_name(name, target.span),
+            ExprKind::This => self.place_name("this", target.span),
+            ExprKind::Field(base, name) if self.type_ref(base).is_none() => {
+                let (bt, base_err) = self.place(base);
+                match self.subst.shallow(&bt) {
+                    Ty::Named(class) => match self.field(&class, name) {
+                        Some((ty, mutable, is_ref)) => {
+                            let err = if !mutable {
+                                Some(Code::assign_to_let)
+                            } else if is_ref {
+                                None
+                            } else {
+                                base_err
+                            };
+                            (ty, err)
+                        }
+                        None => (self.error(Code::unknown_field, target.span), None),
+                    },
+                    Ty::Error => (Ty::Error, None),
+                    Ty::Var(_) => (self.error(Code::type_needed, base.span), None),
+                    _ => (self.error(Code::unknown_field, target.span), None),
+                }
+            }
+            ExprKind::Index(list, index) => {
+                let (lt, base_err) = self.place(list);
+                let it = self.expr(index, Some(&Ty::Int));
+                self.expect(index, &it, &Ty::Int);
+                match self.subst.shallow(&lt) {
+                    Ty::List(elem) => (*elem, base_err),
+                    Ty::Error => (Ty::Error, None),
+                    Ty::Var(_) => (self.error(Code::type_needed, list.span), None),
+                    _ => (self.error(Code::invalid_operand_types, target.span), None),
+                }
+            }
+            _ => (self.expr(target, None), Some(Code::assign_to_let)),
+        }
+    }
+
+    fn field(&self, type_name: &str, field: &str) -> Option<(Ty, bool, bool)> {
+        let Some(TypeDef::Class(c)) = self.types.get(type_name) else {
+            return None;
+        };
+        let i = c.fields.iter().position(|f| f.name == field)?;
+        Some((c.fields[i].ty.clone(), c.mutable[i], c.is_ref))
+    }
+
+    fn type_ref(&self, e: &Expr) -> Option<String> {
+        match &e.kind {
+            ExprKind::Name(n) if self.lookup(n).is_none() && self.type_names.contains(n) => {
+                Some(n.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn holds_ref(&self, ty: &Ty, seen: &mut HashSet<String>) -> bool {
+        match self.subst.shallow(ty) {
+            Ty::List(inner) | Ty::Maybe(inner) => self.holds_ref(&inner, seen),
+            Ty::Named(name) if seen.insert(name.clone()) => match self.types.get(&name) {
+                Some(TypeDef::Class(c)) => {
+                    c.is_ref || c.fields.iter().any(|f| self.holds_ref(&f.ty, seen))
+                }
+                Some(TypeDef::Enum(vs)) => vs
+                    .iter()
+                    .any(|v| v.fields.iter().any(|f| self.holds_ref(&f.ty, seen))),
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn is_ref_class(&self, ty: &Ty) -> bool {
+        matches!(self.subst.shallow(ty), Ty::Named(n)
+            if matches!(self.types.get(&n), Some(TypeDef::Class(c)) if c.is_ref))
+    }
+
+    fn bare_variant(&self, e: &Expr) -> bool {
+        let name = match &e.kind {
+            ExprKind::Name(n) => n,
+            ExprKind::Call(callee, _) => match &callee.kind {
+                ExprKind::Name(n) => n,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        self.lookup(name).is_none()
+            && !self.funcs.contains_key(name)
+            && !self.type_names.contains(name)
+            && self.enum_with_variant(name)
+    }
+
+    fn variant(&self, enum_name: &str, variant: &str) -> Option<&VariantDef> {
+        match self.types.get(enum_name) {
+            Some(TypeDef::Enum(vs)) => vs.iter().find(|v| v.name == variant),
+            _ => None,
+        }
+    }
+
+    fn enum_with_variant(&self, variant: &str) -> bool {
+        self.types
+            .values()
+            .any(|t| matches!(t, TypeDef::Enum(vs) if vs.iter().any(|v| v.name == variant)))
+    }
+
+    fn expected_variant(&self, expected: Option<&Ty>, name: &str) -> Option<String> {
+        match expected.map(|e| self.subst.shallow(e)) {
+            Some(Ty::Named(e)) if self.variant(&e, name).is_some() => Some(e),
+            Some(Ty::Maybe(inner)) => self.expected_variant(Some(&inner), name),
+            _ => None,
+        }
+    }
+
+    fn assign(&mut self, target: &Expr, op: Option<BinOp>, value: &Expr, span: Span) {
+        let (ty, err) = self.place(target);
+        if let Some(code) = err {
+            self.error(code, target.span);
         }
         let actual = match op {
             None => self.expr(value, Some(&ty)),
@@ -582,7 +998,20 @@ impl Checker {
                 }
                 Ty::Str
             }
-            ExprKind::Name(name) => self.name(name, expr.span),
+            ExprKind::Name(name) => self.name(expr.id, name, expr.span, expected),
+            ExprKind::This => match self.lookup("this") {
+                Some(var) => var.ty.clone(),
+                None => self.error(Code::this_outside_method, expr.span),
+            },
+            ExprKind::Field(base, name) => self.field_expr(expr.id, base, name, expr.span),
+            ExprKind::Match(scrutinee, arms) => self.match_expr(expr, scrutinee, arms, expected),
+            ExprKind::Is(lhs, pattern) => {
+                let t = self.expr(lhs, None);
+                let mut binds = Vec::new();
+                self.pattern(pattern, &t, &mut binds);
+                self.is_bindings.insert(expr.id, binds);
+                Ty::Bool
+            }
             ExprKind::List(items) => {
                 let elem = match expected.map(|e| self.subst.shallow(e)) {
                     Some(Ty::List(e)) => *e,
@@ -596,8 +1025,8 @@ impl Checker {
             }
             ExprKind::Unary(op, operand) => self.unary(*op, operand, expr.span),
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expr.span),
-            ExprKind::Call(callee, args) => self.call(callee, args, expr.span),
-            ExprKind::Method(recv, name, args) => self.method(recv, name, args, expr.span),
+            ExprKind::Call(callee, args) => self.call(expr.id, callee, args, expr.span, expected),
+            ExprKind::Method(recv, name, args) => self.method(expr.id, recv, name, args, expr.span),
             ExprKind::Index(list, index) => self.index(expr.id, list, index, expr.span),
             ExprKind::Lambda(params, ret, body) => {
                 self.lambda(expr.id, params, ret.as_ref(), body, expected)
@@ -609,7 +1038,10 @@ impl Checker {
             ExprKind::While(cond, body) => {
                 let c = self.expr(cond, Some(&Ty::Bool));
                 self.expect(cond, &c, &Ty::Bool);
-                self.valued_loop(expr.id, body)
+                self.push_bindings(self.exports(cond));
+                let ty = self.valued_loop(expr.id, body);
+                self.scopes.pop();
+                ty
             }
             ExprKind::For(name, span, iter, body) => {
                 self.for_loop(expr.id, name, *span, iter, body)
@@ -670,7 +1102,85 @@ impl Checker {
         }
     }
 
-    fn name(&mut self, name: &str, span: Span) -> Ty {
+    fn push_bindings(&mut self, binds: Vec<Binding>) {
+        let scope = binds
+            .into_iter()
+            .map(|(name, span, ty)| (name, Var::binding(ty, span)))
+            .collect();
+        self.scopes.push(scope);
+    }
+
+    fn exports(&self, e: &Expr) -> Vec<Binding> {
+        match &e.kind {
+            ExprKind::Is(..) => self.is_bindings.get(&e.id).cloned().unwrap_or_default(),
+            ExprKind::Binary(BinOp::And, l, r) => {
+                let mut binds = self.exports(l);
+                binds.extend(self.exports(r));
+                binds
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn unit_variant(&mut self, id: NodeId, enum_name: &str, name: &str, span: Span) -> Ty {
+        let has_fields = self
+            .variant(enum_name, name)
+            .is_some_and(|v| !v.fields.is_empty());
+        if has_fields {
+            return self.error(Code::wrong_arguments, span);
+        }
+        self.info.resolved.insert(
+            id,
+            Resolved::Variant(enum_name.to_string(), name.to_string()),
+        );
+        Ty::Named(enum_name.to_string())
+    }
+
+    fn variant_call(
+        &mut self,
+        id: NodeId,
+        enum_name: &str,
+        name: &str,
+        args: &[Arg],
+        span: Span,
+    ) -> Ty {
+        let params = self
+            .variant(enum_name, name)
+            .map(|v| v.fields.clone())
+            .unwrap_or_default();
+        self.match_args(&params, args, span);
+        self.info.resolved.insert(
+            id,
+            Resolved::Variant(enum_name.to_string(), name.to_string()),
+        );
+        Ty::Named(enum_name.to_string())
+    }
+
+    fn field_expr(&mut self, id: NodeId, base: &Expr, name: &str, span: Span) -> Ty {
+        if let Some(t) = self.type_ref(base) {
+            let key = format!("{t}.{name}");
+            if self.consts.contains_key(&key) {
+                self.info.resolved.insert(id, Resolved::Const(key.clone()));
+                return self.const_type(&key);
+            }
+            if self.variant(&t, name).is_some() {
+                return self.unit_variant(id, &t, name, span);
+            }
+            return self.error(Code::unknown_field, span);
+        }
+        let bt = self.expr(base, None);
+        match self.subst.shallow(&bt) {
+            Ty::Named(class) => match self.field(&class, name) {
+                Some((ty, ..)) => ty,
+                None => self.error(Code::unknown_field, span),
+            },
+            Ty::Error => Ty::Error,
+            Ty::Var(_) => self.error(Code::type_needed, base.span),
+            _ => self.error(Code::unknown_field, span),
+        }
+    }
+
+    fn name(&mut self, id: NodeId, name: &str, span: Span, expected: Option<&Ty>) -> Ty {
         if let Some(var) = self.lookup(name) {
             return var.ty.clone();
         }
@@ -683,6 +1193,19 @@ impl Checker {
         }
         if name == "None" {
             return Ty::maybe(self.subst.fresh());
+        }
+        if let Some(owner) = &self.current_type {
+            let key = format!("{owner}.{name}");
+            if self.consts.contains_key(&key) {
+                self.info.resolved.insert(id, Resolved::Const(key.clone()));
+                return self.const_type(&key);
+            }
+        }
+        if let Some(e) = self.expected_variant(expected, name) {
+            return self.unit_variant(id, &e, name, span);
+        }
+        if self.enum_with_variant(name) {
+            return self.error(Code::unqualified_variant, span);
         }
         let code = if self.top_level_names.contains(name) && !self.fns.is_empty() {
             Code::used_before_set
@@ -733,11 +1256,20 @@ impl Checker {
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) -> Ty {
         match op {
             BinOp::And | BinOp::Or => {
-                for side in [lhs, rhs] {
-                    let t = self.expr(side, Some(&Ty::Bool));
-                    if !self.subst.unify(&t, &Ty::Bool) {
-                        self.error(Code::invalid_operand_types, side.span);
-                    }
+                let lt = self.expr(lhs, Some(&Ty::Bool));
+                if !self.subst.unify(&lt, &Ty::Bool) {
+                    self.error(Code::invalid_operand_types, lhs.span);
+                }
+                let binds = if op == BinOp::And {
+                    self.exports(lhs)
+                } else {
+                    Vec::new()
+                };
+                self.push_bindings(binds);
+                let rt = self.expr(rhs, Some(&Ty::Bool));
+                self.scopes.pop();
+                if !self.subst.unify(&rt, &Ty::Bool) {
+                    self.error(Code::invalid_operand_types, rhs.span);
                 }
                 Ty::Bool
             }
@@ -753,6 +1285,17 @@ impl Checker {
                     Ty::Error => Ty::Error,
                     _ => self.error(Code::type_mismatch, lhs.span),
                 }
+            }
+            BinOp::Eq | BinOp::Ne => {
+                let (lt, rt) = if self.bare_variant(lhs) {
+                    let rt = self.expr(rhs, None);
+                    (self.expr(lhs, Some(&rt)), rt)
+                } else {
+                    let lt = self.expr(lhs, None);
+                    let rt = self.expr(rhs, Some(&lt));
+                    (lt, rt)
+                };
+                self.binary_type(op, lhs, &lt, rhs, &rt, span)
             }
             _ => {
                 let lt = self.expr(lhs, None);
@@ -824,6 +1367,9 @@ impl Checker {
                 }
             }
             BinOp::Eq | BinOp::Ne => {
+                if self.holds_ref(&a, &mut HashSet::new()) {
+                    return self.error(Code::invalid_operand_types, span);
+                }
                 if numeric {
                     widen(self);
                 } else if !self.subst.unify(&a, &b) {
@@ -868,7 +1414,14 @@ impl Checker {
         true
     }
 
-    fn call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Ty {
+    fn call(
+        &mut self,
+        id: NodeId,
+        callee: &Expr,
+        args: &[Arg],
+        span: Span,
+        expected: Option<&Ty>,
+    ) -> Ty {
         if let ExprKind::Name(name) = &callee.kind
             && self.lookup(name).is_none()
         {
@@ -899,10 +1452,42 @@ impl Checker {
                     if args.len() != 1 {
                         return self.error(Code::wrong_arguments, span);
                     }
-                    let t = self.expr(&args[0].value, None);
+                    let inner = match expected.map(|e| self.subst.shallow(e)) {
+                        Some(Ty::Maybe(inner)) => Some(*inner),
+                        _ => None,
+                    };
+                    let t = self.expr(&args[0].value, inner.as_ref());
                     return Ty::maybe(t);
                 }
+                "same" => {
+                    if args.len() != 2 {
+                        return self.error(Code::wrong_arguments, span);
+                    }
+                    let a = self.expr(&args[0].value, None);
+                    let b = self.expr(&args[1].value, None);
+                    if !self.is_ref_class(&a) || !self.subst.unify(&a, &b) {
+                        self.error(Code::type_mismatch, span);
+                    }
+                    return Ty::Bool;
+                }
                 _ => {}
+            }
+            if let Some(TypeDef::Class(c)) = self.types.get(name) {
+                let params = c.fields.clone();
+                self.match_args(&params, args, span);
+                self.info
+                    .resolved
+                    .insert(id, Resolved::Construct(name.clone()));
+                return Ty::Named(name.clone());
+            }
+            if let Some(e) = self.expected_variant(expected, name) {
+                return self.variant_call(id, &e, name, args, span);
+            }
+            if self.enum_with_variant(name) {
+                for a in args {
+                    self.expr(&a.value, None);
+                }
+                return self.error(Code::unqualified_variant, callee.span);
             }
         }
         let callee_ty = self.expr(callee, None);
@@ -925,27 +1510,34 @@ impl Checker {
     }
 
     fn call_named(&mut self, name: &str, args: &[Arg], span: Span) -> Ty {
-        let sig = self.funcs[name].sig.clone();
-        let mut filled = vec![false; sig.params.len()];
+        let params = self.funcs[name].sig.params.clone();
+        self.match_args(&params, args, span);
+        match self.ensure_checked(name, span) {
+            Some(sig) => sig.ret.unwrap_or(Ty::Void),
+            None => Ty::Error,
+        }
+    }
+
+    fn match_args(&mut self, params: &[ParamSig], args: &[Arg], span: Span) {
+        let mut filled = vec![false; params.len()];
         let positional: Vec<&Arg> = args.iter().filter(|a| a.name.is_none()).collect();
-        let fixed: Vec<usize> = sig
-            .params
+        let fixed: Vec<usize> = params
             .iter()
             .enumerate()
             .filter(|(_, p)| !p.is_rest)
             .map(|(i, _)| i)
             .collect();
-        let rest = sig.params.iter().position(|p| p.is_rest);
+        let rest = params.iter().position(|p| p.is_rest);
         let mut ok = true;
         for (k, arg) in positional.iter().enumerate() {
             if let Some(&i) = fixed.get(k) {
                 filled[i] = true;
-                let t = self.expr(&arg.value, Some(&sig.params[i].ty));
-                self.expect(&arg.value, &t, &sig.params[i].ty);
+                let t = self.expr(&arg.value, Some(&params[i].ty));
+                self.expect(&arg.value, &t, &params[i].ty);
             } else if let Some(r) = rest {
                 filled[r] = true;
-                let t = self.expr(&arg.value, Some(&sig.params[r].ty));
-                self.expect(&arg.value, &t, &sig.params[r].ty);
+                let t = self.expr(&arg.value, Some(&params[r].ty));
+                self.expect(&arg.value, &t, &params[r].ty);
             } else {
                 self.expr(&arg.value, None);
                 ok = false;
@@ -953,15 +1545,11 @@ impl Checker {
         }
         for arg in args.iter().filter(|a| a.name.is_some()) {
             let arg_name = arg.name.as_deref().unwrap_or_default();
-            match sig
-                .params
-                .iter()
-                .position(|p| p.name == arg_name && !p.is_rest)
-            {
+            match params.iter().position(|p| p.name == arg_name && !p.is_rest) {
                 Some(i) if !filled[i] => {
                     filled[i] = true;
-                    let t = self.expr(&arg.value, Some(&sig.params[i].ty));
-                    self.expect(&arg.value, &t, &sig.params[i].ty);
+                    let t = self.expr(&arg.value, Some(&params[i].ty));
+                    self.expect(&arg.value, &t, &params[i].ty);
                 }
                 _ => {
                     self.expr(&arg.value, None);
@@ -969,7 +1557,7 @@ impl Checker {
                 }
             }
         }
-        for (i, p) in sig.params.iter().enumerate() {
+        for (i, p) in params.iter().enumerate() {
             if !filled[i] && !p.has_default && !p.is_rest {
                 ok = false;
             }
@@ -977,13 +1565,9 @@ impl Checker {
         if !ok {
             self.error(Code::wrong_arguments, span);
         }
-        match self.ensure_checked(name, span) {
-            Some(sig) => sig.ret.unwrap_or(Ty::Void),
-            None => Ty::Error,
-        }
     }
 
-    fn method(&mut self, recv: &Expr, name: &str, args: &[Arg], span: Span) -> Ty {
+    fn method(&mut self, id: NodeId, recv: &Expr, name: &str, args: &[Arg], span: Span) -> Ty {
         if let ExprKind::Name(type_name) = &recv.kind
             && self.lookup(type_name).is_none()
             && (type_name == "Int" || type_name == "Float")
@@ -998,20 +1582,46 @@ impl Checker {
                 Ty::Float
             });
         }
-        let recv_ty = self.expr(recv, None);
-        let recv_ty = self.subst.shallow(&recv_ty);
-        if MUTATING.contains(&name)
-            && let ExprKind::Name(var_name) = &recv.kind
-            && let Some(var) = self.lookup_mut(var_name)
-        {
-            if var.mutable {
-                var.reassigned = true;
-                var.list_len = None;
-            } else if matches!(recv_ty, Ty::List(_)) {
+        if let Some(t) = self.type_ref(recv) {
+            if self.variant(&t, name).is_some() {
+                return self.variant_call(id, &t, name, args, span);
+            }
+            let key = format!("{t}.{name}");
+            if self.funcs.get(&key).is_some_and(|f| f.this.is_none()) {
+                self.info.resolved.insert(id, Resolved::Static(key.clone()));
+                return self.call_named(&key, args, span);
+            }
+            for a in args {
+                self.expr(&a.value, None);
+            }
+            return self.error(Code::unknown_method, span);
+        }
+        let is_place = matches!(
+            recv.kind,
+            ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::This
+        );
+        let recv_ty = if MUTATING.contains(&name) && is_place {
+            let (t, err) = self.place(recv);
+            if err.is_some() && matches!(self.subst.shallow(&t), Ty::List(_)) {
                 self.error(Code::change_let_list, recv.span);
             }
-        }
+            t
+        } else {
+            self.expr(recv, None)
+        };
+        let recv_ty = self.subst.shallow(&recv_ty);
         match recv_ty {
+            Ty::Named(t) => {
+                let key = format!("{t}.{name}");
+                if self.funcs.get(&key).is_some_and(|f| f.this.is_some()) {
+                    self.info.resolved.insert(id, Resolved::Method(key.clone()));
+                    return self.call_named(&key, args, span);
+                }
+                for a in args {
+                    self.expr(&a.value, None);
+                }
+                self.error(Code::unknown_method, span)
+            }
             Ty::Error => {
                 for a in args {
                     self.expr(&a.value, None);
@@ -1218,7 +1828,9 @@ impl Checker {
     ) -> Ty {
         let c = self.expr(cond, Some(&Ty::Bool));
         self.expect(cond, &c, &Ty::Bool);
+        self.push_bindings(self.exports(cond));
         let tt = self.expr(then, expected);
+        self.scopes.pop();
         match otherwise {
             Some(other) => {
                 let ot = self.expr(other, expected);
@@ -1229,6 +1841,282 @@ impl Checker {
             }
             None => self.optional_value(expr, tt),
         }
+    }
+
+    fn match_expr(
+        &mut self,
+        expr: &Expr,
+        scrutinee: &Expr,
+        arms: &[Arm],
+        expected: Option<&Ty>,
+    ) -> Ty {
+        let st = self.expr(scrutinee, None);
+        let mut bodies = Vec::new();
+        for arm in arms {
+            let mut binds = Vec::new();
+            self.pattern(&arm.pattern, &st, &mut binds);
+            self.push_bindings(binds);
+            if let Some(guard) = &arm.guard {
+                let g = self.expr(guard, Some(&Ty::Bool));
+                self.expect(guard, &g, &Ty::Bool);
+            }
+            let t = self.expr(&arm.body, expected);
+            self.scopes.pop();
+            bodies.push((&arm.body, t));
+        }
+        let rows = arms
+            .iter()
+            .filter(|a| a.guard.is_none())
+            .map(|a| vec![&a.pattern])
+            .collect();
+        if let Some(witness) = self.missing_case(rows, &[st]) {
+            let mut d = Diagnostic::error(Code::non_exhaustive_match, scrutinee.span);
+            d.detail = witness.into_iter().next();
+            self.diags.push(d);
+        }
+        let mut target = Ty::Never;
+        for (_, t) in &bodies {
+            target = match (self.subst.shallow(&target), self.subst.shallow(t)) {
+                (Ty::Never, t) | (t, Ty::Never) => t,
+                (Ty::Int, Ty::Float) | (Ty::Float, Ty::Int) => Ty::Float,
+                (Ty::Maybe(a), b) if !matches!(b, Ty::Maybe(_)) && self.subst.unify(&a, &b) => {
+                    Ty::Maybe(a)
+                }
+                (a, Ty::Maybe(b)) if !matches!(a, Ty::Maybe(_)) && self.subst.unify(&a, &b) => {
+                    Ty::Maybe(b)
+                }
+                (a, _) => a,
+            };
+        }
+        for (body, t) in bodies {
+            if !self.subsume(body.id, &t, &target) {
+                return self.error(Code::branch_type_mismatch, expr.span);
+            }
+        }
+        target
+    }
+
+    fn pattern(&mut self, pat: &Pattern, ty: &Ty, binds: &mut Vec<Binding>) {
+        match &pat.kind {
+            PatternKind::Wildcard => {}
+            PatternKind::Name(name) => {
+                let enum_name = match self.subst.shallow(ty) {
+                    Ty::Named(e) if self.variant(&e, name).is_some() => Some(e),
+                    _ => None,
+                };
+                if let Some(e) = enum_name {
+                    if self.variant(&e, name).is_some_and(|v| !v.fields.is_empty()) {
+                        self.error(Code::wrong_arguments, pat.span);
+                    }
+                    self.info.variant_patterns.insert(pat.id);
+                } else if name == "None" {
+                    let fresh = self.subst.fresh();
+                    if !self.subst.unify(ty, &Ty::maybe(fresh)) {
+                        self.error(Code::type_mismatch, pat.span);
+                    }
+                    self.info.variant_patterns.insert(pat.id);
+                } else if binds.iter().any(|b| &b.0 == name) {
+                    self.error(Code::duplicate_name, pat.span);
+                } else {
+                    binds.push((name.clone(), pat.span, ty.clone()));
+                }
+            }
+            PatternKind::Literal(lit) => {
+                let t = self.expr(lit, Some(ty));
+                self.expect(lit, &t, ty);
+            }
+            PatternKind::Range(lo, hi, _) => {
+                for end in [lo, hi] {
+                    let t = self.expr(end, Some(ty));
+                    self.expect(end, &t, ty);
+                }
+                if !matches!(self.subst.shallow(ty), Ty::Int | Ty::Float | Ty::Error) {
+                    self.error(Code::type_mismatch, pat.span);
+                }
+            }
+            PatternKind::Variant(None, name, args) if name == "Some" => {
+                let inner = self.subst.fresh();
+                if !self.subst.unify(ty, &Ty::maybe(inner.clone())) {
+                    self.error(Code::type_mismatch, pat.span);
+                }
+                match args.as_slice() {
+                    [arg] => self.pattern(arg, &inner, binds),
+                    _ => {
+                        self.error(Code::wrong_arguments, pat.span);
+                    }
+                }
+            }
+            PatternKind::Variant(qualifier, name, args) => {
+                let enum_name = match (qualifier, self.subst.shallow(ty)) {
+                    (Some(q), t) => {
+                        if !self.subst.unify(&t, &Ty::Named(q.clone())) {
+                            self.error(Code::type_mismatch, pat.span);
+                            return;
+                        }
+                        q.clone()
+                    }
+                    (None, Ty::Named(e)) => e,
+                    (None, Ty::Error) => return,
+                    (None, Ty::Var(_)) => {
+                        self.error(Code::type_needed, pat.span);
+                        return;
+                    }
+                    (None, _) => {
+                        self.error(Code::type_mismatch, pat.span);
+                        return;
+                    }
+                };
+                let Some(fields) = self
+                    .variant(&enum_name, name)
+                    .map(|v| v.fields.iter().map(|f| f.ty.clone()).collect::<Vec<_>>())
+                else {
+                    self.error(Code::unknown_name, pat.span);
+                    return;
+                };
+                if fields.len() != args.len() {
+                    self.error(Code::wrong_arguments, pat.span);
+                    return;
+                }
+                for (arg, field) in args.iter().zip(&fields) {
+                    self.pattern(arg, field, binds);
+                }
+            }
+            PatternKind::Or(alternatives) => {
+                let mut first: Option<Vec<Binding>> = None;
+                for alt in alternatives {
+                    let mut alt_binds = Vec::new();
+                    self.pattern(alt, ty, &mut alt_binds);
+                    match &first {
+                        None => first = Some(alt_binds),
+                        Some(expected) => {
+                            let same = expected.len() == alt_binds.len()
+                                && expected.iter().all(|(n, _, t)| {
+                                    alt_binds
+                                        .iter()
+                                        .find(|b| &b.0 == n)
+                                        .is_some_and(|b| self.subst.unify(t, &b.2))
+                                });
+                            if !same {
+                                self.error(Code::or_pattern_bindings, alt.span);
+                            }
+                        }
+                    }
+                }
+                for bind in first.unwrap_or_default() {
+                    if binds.iter().any(|b| b.0 == bind.0) {
+                        self.error(Code::duplicate_name, pat.span);
+                    }
+                    binds.push(bind);
+                }
+            }
+        }
+    }
+
+    fn constructors(&self, ty: &Ty) -> Option<Vec<(String, Vec<Ty>)>> {
+        match self.subst.shallow(ty) {
+            Ty::Bool => Some(vec![
+                ("true".to_string(), Vec::new()),
+                ("false".to_string(), Vec::new()),
+            ]),
+            Ty::Maybe(inner) => Some(vec![
+                ("Some".to_string(), vec![*inner]),
+                ("None".to_string(), Vec::new()),
+            ]),
+            Ty::Named(e) => match self.types.get(&e) {
+                Some(TypeDef::Enum(vs)) => Some(
+                    vs.iter()
+                        .map(|v| {
+                            (
+                                v.name.clone(),
+                                v.fields.iter().map(|f| f.ty.clone()).collect(),
+                            )
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn irrefutable(&self, pat: &Pattern) -> bool {
+        match &pat.kind {
+            PatternKind::Wildcard => true,
+            PatternKind::Name(_) => !self.info.variant_patterns.contains(&pat.id),
+            _ => false,
+        }
+    }
+
+    fn missing_case(&self, rows: Vec<Vec<&Pattern>>, tys: &[Ty]) -> Option<Vec<String>> {
+        let Some((ty, rest_tys)) = tys.split_first() else {
+            return rows.is_empty().then(Vec::new);
+        };
+        let mut expanded = Vec::new();
+        for row in rows {
+            match &row[0].kind {
+                PatternKind::Or(alts) => {
+                    for alt in alts {
+                        let mut r = vec![alt];
+                        r.extend(&row[1..]);
+                        expanded.push(r);
+                    }
+                }
+                _ => expanded.push(row),
+            }
+        }
+        if matches!(self.subst.shallow(ty), Ty::Error) {
+            return None;
+        }
+        let Some(ctors) = self.constructors(ty) else {
+            let rest = expanded
+                .into_iter()
+                .filter(|r| self.irrefutable(r[0]))
+                .map(|r| r[1..].to_vec())
+                .collect();
+            return self.missing_case(rest, rest_tys).map(|mut w| {
+                w.insert(0, "_".to_string());
+                w
+            });
+        };
+        for (name, fields) in ctors {
+            let arity = fields.len();
+            let specialized = expanded
+                .iter()
+                .filter_map(|row| {
+                    let head = row[0];
+                    let mut sub: Vec<&Pattern> = if self.irrefutable(head) {
+                        vec![&WILDCARD; arity]
+                    } else {
+                        match &head.kind {
+                            PatternKind::Variant(_, n, args) if *n == name => args.iter().collect(),
+                            PatternKind::Name(n) if *n == name => Vec::new(),
+                            PatternKind::Literal(lit)
+                                if matches!(lit.kind, ExprKind::Bool(b) if b.to_string() == name) =>
+                            {
+                                Vec::new()
+                            }
+                            _ => return None,
+                        }
+                    };
+                    sub.extend(&row[1..]);
+                    Some(sub)
+                })
+                .collect();
+            let mut sub_tys = fields;
+            sub_tys.extend_from_slice(rest_tys);
+            if let Some(mut w) = self.missing_case(specialized, &sub_tys) {
+                let rest = w.split_off(arity);
+                let head = if arity == 0 {
+                    name
+                } else {
+                    format!("{name}({})", w.join(", "))
+                };
+                let mut out = vec![head];
+                out.extend(rest);
+                return Some(out);
+            }
+        }
+        None
     }
 
     fn optional_value(&mut self, expr: &Expr, body: Ty) -> Ty {
@@ -1327,13 +2215,24 @@ fn mutates(expr: &Expr, list: &str) -> bool {
             Stmt::Assign { target, value, .. } => is_list(target) || mutates(value, list),
             Stmt::Let { value, .. } => mutates(value, list),
             Stmt::Expr(e) => mutates(e, list),
-            Stmt::Func(_) => false,
+            Stmt::LetElse { value, .. } => mutates(value, list),
+            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) => false,
         }),
         ExprKind::Str(segs) => segs
             .iter()
             .any(|s| matches!(s, StrSeg::Expr(e) if mutates(e, list))),
         ExprKind::List(items) => items.iter().any(|e| mutates(e, list)),
-        ExprKind::Unary(_, e) | ExprKind::Loop(e) | ExprKind::Lambda(_, _, e) => mutates(e, list),
+        ExprKind::Unary(_, e)
+        | ExprKind::Loop(e)
+        | ExprKind::Lambda(_, _, e)
+        | ExprKind::Field(e, _)
+        | ExprKind::Is(e, _) => mutates(e, list),
+        ExprKind::Match(s, arms) => {
+            mutates(s, list)
+                || arms.iter().any(|a| {
+                    mutates(&a.body, list) || a.guard.as_ref().is_some_and(|g| mutates(g, list))
+                })
+        }
         ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
         | ExprKind::While(a, b)
