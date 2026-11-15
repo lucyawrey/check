@@ -85,6 +85,16 @@ codes! {
     loop_value_without_break => "[a loop used as a value with no break value]",
     break_type_mismatch => "[break values of different types in one loop]",
     constant_backwards_range => "[a backwards range with constant ends]",
+    nested_type => "[a class or enum declared inside a function body]",
+    mixed_fields => "[a variant with both named and positional fields]",
+    this_outside_method => "[this outside a method]",
+    unknown_field => "[a field that the type doesn't have]",
+    unqualified_variant => "[a variant written without its enum where the type isn't known]",
+    non_exhaustive_match => "[a match that misses a case]",
+    or_pattern_bindings => "[or-pattern alternatives that bind different names]",
+    let_else_can_finish => "[a let-else whose else can finish]",
+    const_not_constant => "[a const whose value isn't a constant expression]",
+    const_cycle => "[consts defined in terms of each other]",
     try_stopped => "[a top-level try found no value, so the program stopped]",
     panic_called => "[panic was called]",
     integer_overflow => "[integer overflow]",
@@ -94,10 +104,12 @@ codes! {
     shift_out_of_range => "[a shift amount out of range]",
     round_out_of_range => "[rounding a Float that has no Int]",
     stack_overflow => "[more than 10,000 nested calls]",
+    index_out_of_range => "[writing to a list index that doesn't exist]",
     unused_var => "[a var that's never reassigned]",
     shadowed_name => "[a local that shadows a function or type]",
     interpolated_maybe => "[interpolating a T?]",
     nested_maybe => "[an if or loop value that is a T??]",
+    let_else_some => "[let Some(x) = e else, which ?? can replace]",
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +123,7 @@ pub struct Diagnostic {
     pub code: Code,
     pub span: Span,
     pub severity: Severity,
+    pub detail: Option<String>,
 }
 
 impl Diagnostic {
@@ -119,6 +132,7 @@ impl Diagnostic {
             code,
             span,
             severity: Severity::Error,
+            detail: None,
         }
     }
 
@@ -127,6 +141,7 @@ impl Diagnostic {
             code,
             span,
             severity: Severity::Warning,
+            detail: None,
         }
     }
 
@@ -144,9 +159,14 @@ impl Diagnostic {
         };
         let gutter = " ".repeat(line.to_string().len());
         format!(
-            "{kind}[{code}]: {message}\n{gutter}--> {path}:{line}:{col}\n{gutter} |\n{line} | {text}\n{gutter} | {pad}{marks}\n",
+            "{kind}[{code}]: {message}{detail}\n{gutter}--> {path}:{line}:{col}\n{gutter} |\n{line} | {text}\n{gutter} | {pad}{marks}\n",
             code = self.code,
             message = self.code.message(),
+            detail = self
+                .detail
+                .as_ref()
+                .map(|d| format!(": {d}"))
+                .unwrap_or_default(),
             pad = " ".repeat(col - 1),
             marks = "^".repeat(width),
         )

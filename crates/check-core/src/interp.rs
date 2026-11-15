@@ -1,12 +1,13 @@
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::rc::Rc;
 
 use crate::ast::*;
-use crate::checker::Info;
+use crate::checker::{Info, Resolved};
 use crate::diag::{Code, Span};
-use crate::value::{Callable, Value};
+use crate::value::{Callable, Record, Value};
 
 pub struct Panic {
     pub code: Code,
@@ -25,6 +26,15 @@ pub enum Flow {
 
 type Eval = Result<Value, Flow>;
 
+type Writer<'f> = &'f mut dyn FnMut(&mut Value) -> Result<(), Flow>;
+
+type Descent<'s> = Result<Option<(Rc<RefCell<Record>>, &'s [Step])>, Flow>;
+
+enum Step {
+    Field(String),
+    Index(i64, Span),
+}
+
 struct Frame {
     scopes: Vec<HashMap<String, Value>>,
 }
@@ -32,6 +42,10 @@ struct Frame {
 pub struct Interpreter<'a> {
     info: &'a Info,
     funcs: HashMap<String, Rc<FuncDecl>>,
+    classes: HashMap<String, Rc<ClassDecl>>,
+    enums: HashMap<String, Rc<EnumDecl>>,
+    consts: HashMap<String, ConstDecl>,
+    const_values: HashMap<String, Value>,
     globals: HashMap<String, Value>,
     frames: Vec<Frame>,
     depth: usize,
@@ -50,6 +64,10 @@ pub fn run(
     let mut interp = Interpreter {
         info,
         funcs: HashMap::new(),
+        classes: HashMap::new(),
+        enums: HashMap::new(),
+        consts: HashMap::new(),
+        const_values: HashMap::new(),
         globals: HashMap::new(),
         frames: vec![Frame { scopes: Vec::new() }],
         depth: 0,
@@ -57,10 +75,27 @@ pub fn run(
         output,
     };
     for stmt in program {
-        if let Stmt::Func(decl) = stmt {
-            interp
-                .funcs
-                .insert(decl.name.clone(), Rc::new(decl.clone()));
+        match stmt {
+            Stmt::Func(decl) => interp.add_func(decl),
+            Stmt::Class(c) => {
+                if let Some(init) = &c.init {
+                    interp.add_func(init);
+                }
+                interp.add_members(&c.name, &c.members);
+                interp.classes.insert(c.name.clone(), Rc::new(c.clone()));
+            }
+            Stmt::Enum(e) => {
+                interp.add_members(&e.name, &e.members);
+                interp.enums.insert(e.name.clone(), Rc::new(e.clone()));
+            }
+            _ => {}
+        }
+    }
+    let mut consts: Vec<String> = interp.consts.keys().cloned().collect();
+    consts.sort();
+    for key in consts {
+        if let Err(Flow::Panic(p)) = interp.resolved(&Resolved::Const(key), &[], Span::default()) {
+            return Err(p);
         }
     }
     for stmt in program {
@@ -83,7 +118,241 @@ fn panic<T>(code: Code, span: Span) -> Result<T, Flow> {
     }))
 }
 
+fn coerce(info: &Info, id: NodeId, mut value: Value) -> Value {
+    if let Some(c) = info.coercions.get(&id) {
+        if c.to_float
+            && let Value::Int(n) = value
+        {
+            value = Value::Float(n as f64);
+        }
+        for _ in 0..c.wraps {
+            value = Value::Some(Rc::new(value));
+        }
+    }
+    value
+}
+
+fn descend<'s>(v: &mut Value, steps: &'s [Step], f: Writer) -> Descent<'s> {
+    let Some((step, rest)) = steps.split_first() else {
+        f(v)?;
+        return Ok(None);
+    };
+    match (v, step) {
+        (Value::Shared(rc), _) => Ok(Some((rc.clone(), steps))),
+        (Value::Object(rc), _) => descend_record(Rc::make_mut(rc), steps, f),
+        (Value::List(items), Step::Index(i, span)) => {
+            let items = Rc::make_mut(items);
+            match usize::try_from(*i).ok().filter(|i| *i < items.len()) {
+                Some(i) => descend(&mut items[i], rest, f),
+                None => panic(Code::index_out_of_range, *span),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn descend_record<'s>(r: &mut Record, steps: &'s [Step], f: Writer) -> Descent<'s> {
+    let Some((Step::Field(name), rest)) = steps.split_first() else {
+        return Ok(None);
+    };
+    let i = r.index(name);
+    descend(&mut r.fields[i], rest, f)
+}
+
 impl Interpreter<'_> {
+    fn add_func(&mut self, decl: &FuncDecl) {
+        self.funcs.insert(decl.name.clone(), Rc::new(decl.clone()));
+    }
+
+    fn add_members(&mut self, owner: &str, members: &Members) {
+        for decl in members.methods.iter().chain(&members.statics) {
+            self.add_func(decl);
+        }
+        for c in &members.consts {
+            self.consts.insert(format!("{owner}.{}", c.name), c.clone());
+        }
+    }
+
+    fn scoped(&mut self, f: impl FnOnce(&mut Self) -> Eval) -> Eval {
+        self.frame().scopes.push(HashMap::new());
+        let result = f(self);
+        self.frame().scopes.pop();
+        result
+    }
+
+    fn path(&mut self, e: &Expr, steps: &mut Vec<Step>) -> Result<String, Flow> {
+        match &e.kind {
+            ExprKind::Field(base, name) => {
+                let root = self.path(base, steps)?;
+                steps.push(Step::Field(name.clone()));
+                Ok(root)
+            }
+            ExprKind::Index(base, index) => {
+                let root = self.path(base, steps)?;
+                let i = match self.expr(index)? {
+                    Value::Int(i) => i,
+                    _ => -1,
+                };
+                steps.push(Step::Index(i, e.span));
+                Ok(root)
+            }
+            ExprKind::Name(name) => Ok(name.clone()),
+            _ => Ok("this".to_string()),
+        }
+    }
+
+    fn write_path(&mut self, target: &Expr, f: Writer) -> Result<(), Flow> {
+        let mut steps = Vec::new();
+        let root = self.path(target, &mut steps)?;
+        let Some(slot) = self.slot(&root) else {
+            return Ok(());
+        };
+        let mut next = descend(slot, &steps, f)?;
+        while let Some((shared, rest)) = next {
+            let mut record = shared.borrow_mut();
+            next = descend_record(&mut record, rest, f)?;
+        }
+        Ok(())
+    }
+
+    fn resolved(&mut self, r: &Resolved, args: &[Arg], span: Span) -> Eval {
+        match r {
+            Resolved::Const(key) => {
+                if let Some(v) = self.const_values.get(key) {
+                    return Ok(v.clone());
+                }
+                let value = self.consts[key].value.clone();
+                let v = self.expr(&value)?;
+                self.const_values.insert(key.clone(), v.clone());
+                Ok(v)
+            }
+            Resolved::Variant(enum_name, name) => {
+                let decl = self.enums[enum_name].clone();
+                let variant = decl.variants.iter().find(|v| &v.name == name);
+                let names = variant.and_then(|v| v.field_names.clone());
+                let mut fields = vec![Value::Void; variant.map_or(0, |v| v.fields.len())];
+                for (k, arg) in args.iter().enumerate() {
+                    let v = self.expr(&arg.value)?;
+                    let i = match (&arg.name, &names) {
+                        (Some(n), Some(names)) => names.iter().position(|f| f == n).unwrap_or(k),
+                        _ => k,
+                    };
+                    fields[i] = v;
+                }
+                Ok(Value::Variant(Rc::new(Record {
+                    name: name.as_str().into(),
+                    field_names: names.map(|n| n.iter().map(|f| f.as_str().into()).collect()),
+                    fields,
+                })))
+            }
+            Resolved::Construct(class_name) => {
+                if self.depth >= MAX_DEPTH {
+                    return panic(Code::stack_overflow, span);
+                }
+                self.depth += 1;
+                let result = self.construct(class_name, args, span);
+                self.depth -= 1;
+                result
+            }
+            Resolved::Static(key) | Resolved::Method(key) => {
+                let decl = self.funcs[key].clone();
+                self.call_named(&decl, args, span, None)
+            }
+        }
+    }
+
+    fn construct(&mut self, class_name: &str, args: &[Arg], span: Span) -> Eval {
+        let class = self.classes[class_name].clone();
+        let fields = self.bind_args(&class.fields, args)?;
+        let record = Record {
+            name: class_name.into(),
+            field_names: Some(
+                class
+                    .fields
+                    .iter()
+                    .map(|f| f.name.as_str().into())
+                    .collect(),
+            ),
+            fields,
+        };
+        let value = if class.is_ref {
+            Value::Shared(Rc::new(RefCell::new(record)))
+        } else {
+            Value::Object(Rc::new(record))
+        };
+        match &class.init {
+            Some(init) => self.run_init(init, value, span),
+            None => Ok(value),
+        }
+    }
+
+    fn run_init(&mut self, init: &FuncDecl, this: Value, span: Span) -> Eval {
+        let scope = HashMap::from([("this".to_string(), this)]);
+        self.frames.push(Frame {
+            scopes: vec![scope],
+        });
+        let result = self.expr(&init.body);
+        let mut frame = self.frames.pop().expect("frame");
+        match result {
+            Ok(_) | Err(Flow::Return(_)) => {}
+            Err(Flow::Panic(mut p)) => {
+                p.stack.push(span);
+                return Err(Flow::Panic(p));
+            }
+            Err(other) => return Err(other),
+        }
+        Ok(frame.scopes[0].remove("this").unwrap_or(Value::Void))
+    }
+
+    fn matches(
+        &mut self,
+        pat: &Pattern,
+        v: &Value,
+        binds: &mut Vec<(String, Value)>,
+    ) -> Result<bool, Flow> {
+        Ok(match &pat.kind {
+            PatternKind::Wildcard => true,
+            PatternKind::Name(name) if self.info.variant_patterns.contains(&pat.id) => match v {
+                Value::None => name == "None",
+                Value::Variant(r) => &*r.name == name,
+                _ => false,
+            },
+            PatternKind::Name(name) => {
+                binds.push((name.clone(), v.clone()));
+                true
+            }
+            PatternKind::Literal(lit) => self.expr(lit)? == *v,
+            PatternKind::Range(lo, hi, inclusive) => {
+                let (lo, hi) = (self.expr(lo)?, self.expr(hi)?);
+                v.compare(&lo).is_some_and(Ordering::is_ge)
+                    && v.compare(&hi)
+                        .is_some_and(|o| o.is_lt() || (*inclusive && o.is_eq()))
+            }
+            PatternKind::Variant(_, name, args) => match v {
+                Value::Some(inner) if name == "Some" => self.matches(&args[0], inner, binds)?,
+                Value::Variant(r) if &*r.name == name => {
+                    for (arg, field) in args.iter().zip(&r.fields) {
+                        if !self.matches(arg, field, binds)? {
+                            return Ok(false);
+                        }
+                    }
+                    true
+                }
+                _ => false,
+            },
+            PatternKind::Or(alternatives) => {
+                for alt in alternatives {
+                    let mut alt_binds = Vec::new();
+                    if self.matches(alt, v, &mut alt_binds)? {
+                        binds.extend(alt_binds);
+                        return Ok(true);
+                    }
+                }
+                false
+            }
+        })
+    }
+
     fn frame(&mut self) -> &mut Frame {
         self.frames.last_mut().expect("frame")
     }
@@ -126,24 +395,14 @@ impl Interpreter<'_> {
         }
     }
 
-    fn coerce(&self, id: NodeId, mut value: Value) -> Value {
-        if let Some(c) = self.info.coercions.get(&id) {
-            if c.to_float
-                && let Value::Int(n) = value
-            {
-                value = Value::Float(n as f64);
-            }
-            for _ in 0..c.wraps {
-                value = Value::Some(Rc::new(value));
-            }
-        }
-        value
+    fn coerce(&self, id: NodeId, value: Value) -> Value {
+        coerce(self.info, id, value)
     }
 
     fn stmt(&mut self, stmt: &Stmt) -> Eval {
         match stmt {
             Stmt::Let { name, value, .. } => {
-                let v = self.expr(value)?;
+                let v = self.scoped(|i| i.expr(value))?;
                 self.define(name, v);
                 Ok(Value::Void)
             }
@@ -153,25 +412,38 @@ impl Interpreter<'_> {
                 value,
                 span,
             } => {
-                let ExprKind::Name(name) = &target.kind else {
-                    return Ok(Value::Void);
-                };
-                let rhs = self.expr(value)?;
-                let new = match op {
-                    None => rhs,
-                    Some(op) => {
-                        let current = self.lookup(name).unwrap_or(Value::Void);
-                        let current = self.coerce(target.id, current);
-                        arith(*op, current, rhs, *span)?
-                    }
-                };
-                if let Some(slot) = self.slot(name) {
-                    *slot = new;
-                }
+                let rhs = self.scoped(|i| i.expr(value))?;
+                let info = self.info;
+                self.write_path(target, &mut |slot| {
+                    *slot = match op {
+                        None => rhs.clone(),
+                        Some(op) => {
+                            let current = coerce(info, target.id, slot.clone());
+                            arith(*op, current, rhs.clone(), *span)?
+                        }
+                    };
+                    Ok(())
+                })?;
                 Ok(Value::Void)
             }
-            Stmt::Func(_) => Ok(Value::Void),
-            Stmt::Expr(e) => self.expr(e),
+            Stmt::LetElse {
+                pattern,
+                value,
+                otherwise,
+                ..
+            } => {
+                let v = self.expr(value)?;
+                let mut binds = Vec::new();
+                if self.matches(pattern, &v, &mut binds)? {
+                    for (name, v) in binds {
+                        self.define(&name, v);
+                    }
+                    return Ok(Value::Void);
+                }
+                self.expr(otherwise)
+            }
+            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) => Ok(Value::Void),
+            Stmt::Expr(e) => self.scoped(|i| i.expr(e)),
         }
     }
 
@@ -197,6 +469,14 @@ impl Interpreter<'_> {
     }
 
     fn raw(&mut self, expr: &Expr) -> Eval {
+        let info = self.info;
+        if let Some(r) = info.resolved.get(&expr.id) {
+            match &expr.kind {
+                ExprKind::Name(_) | ExprKind::Field(..) => return self.resolved(r, &[], expr.span),
+                ExprKind::Call(_, args) => return self.resolved(r, args, expr.span),
+                _ => {}
+            }
+        }
         match &expr.kind {
             ExprKind::Int(n) => Ok(Value::Int(*n)),
             ExprKind::Float(f) => Ok(Value::Float(*f)),
@@ -212,6 +492,47 @@ impl Interpreter<'_> {
                 Ok(Value::Str(out.into()))
             }
             ExprKind::Name(name) => Ok(self.lookup(name).unwrap_or(Value::Void)),
+            ExprKind::This => Ok(self.lookup("this").unwrap_or(Value::Void)),
+            ExprKind::Field(base, name) => Ok(match self.expr(base)? {
+                Value::Object(r) => r.fields[r.index(name)].clone(),
+                Value::Shared(r) => {
+                    let r = r.borrow();
+                    r.fields[r.index(name)].clone()
+                }
+                _ => Value::Void,
+            }),
+            ExprKind::Is(lhs, pattern) => {
+                let v = self.expr(lhs)?;
+                let mut binds = Vec::new();
+                let matched = self.matches(pattern, &v, &mut binds)?;
+                for (name, v) in binds {
+                    self.define(&name, v);
+                }
+                Ok(Value::Bool(matched))
+            }
+            ExprKind::Match(scrutinee, arms) => {
+                let v = self.expr(scrutinee)?;
+                for arm in arms {
+                    let mut binds = Vec::new();
+                    if !self.matches(&arm.pattern, &v, &mut binds)? {
+                        continue;
+                    }
+                    self.frame().scopes.push(binds.into_iter().collect());
+                    let result = match &arm.guard {
+                        Some(g) => match self.expr(g) {
+                            Ok(g) if g.truthy() => Some(self.expr(&arm.body)),
+                            Ok(_) => None,
+                            Err(e) => Some(Err(e)),
+                        },
+                        None => Some(self.expr(&arm.body)),
+                    };
+                    self.frame().scopes.pop();
+                    if let Some(result) = result {
+                        return result;
+                    }
+                }
+                Ok(Value::Void)
+            }
             ExprKind::List(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
@@ -237,7 +558,7 @@ impl Interpreter<'_> {
             }
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expr.span),
             ExprKind::Call(callee, args) => self.call(callee, args, expr.span),
-            ExprKind::Method(recv, name, args) => self.method(recv, name, args, expr.span),
+            ExprKind::Method(recv, name, args) => self.method(expr.id, recv, name, args, expr.span),
             ExprKind::Index(list, index) => {
                 let l = self.expr(list)?;
                 let i = self.expr(index)?;
@@ -272,25 +593,44 @@ impl Interpreter<'_> {
             ExprKind::Block(stmts) => self.block(stmts),
             ExprKind::If(cond, then, otherwise) => {
                 let wraps = self.info.wrapping.contains(&expr.id);
-                if self.expr(cond)?.truthy() {
-                    let v = self.expr(then)?;
-                    Ok(if wraps {
-                        Value::Some(Rc::new(v))
-                    } else if otherwise.is_some() {
-                        v
-                    } else {
-                        Value::Void
-                    })
-                } else if let Some(other) = otherwise {
-                    self.expr(other)
-                } else {
-                    Ok(if wraps { Value::None } else { Value::Void })
+                self.frame().scopes.push(HashMap::new());
+                let taken = match self.expr(cond) {
+                    Ok(c) if c.truthy() => Some(self.expr(then)),
+                    Ok(_) => None,
+                    Err(e) => Some(Err(e)),
+                };
+                self.frame().scopes.pop();
+                match taken {
+                    Some(v) => {
+                        let v = v?;
+                        Ok(if wraps {
+                            Value::Some(Rc::new(v))
+                        } else if otherwise.is_some() {
+                            v
+                        } else {
+                            Value::Void
+                        })
+                    }
+                    None => match otherwise {
+                        Some(other) => self.expr(other),
+                        None => Ok(if wraps { Value::None } else { Value::Void }),
+                    },
                 }
             }
             ExprKind::While(cond, body) => {
                 let wraps = self.info.wrapping.contains(&expr.id);
-                while self.expr(cond)?.truthy() {
-                    match self.expr(body) {
+                loop {
+                    self.frame().scopes.push(HashMap::new());
+                    let step = match self.expr(cond) {
+                        Ok(c) if c.truthy() => Some(self.expr(body)),
+                        Ok(_) => None,
+                        Err(e) => Some(Err(e)),
+                    };
+                    self.frame().scopes.pop();
+                    let Some(step) = step else {
+                        break;
+                    };
+                    match step {
                         Ok(_) | Err(Flow::Continue) => {}
                         Err(Flow::Break(v)) => {
                             return Ok(if wraps {
@@ -394,7 +734,7 @@ impl Interpreter<'_> {
             && self.slot(name).is_none()
         {
             if let Some(decl) = self.funcs.get(name).cloned() {
-                return self.call_named(&decl, args, span);
+                return self.call_named(&decl, args, span, None);
             }
             match name.as_str() {
                 "print" => {
@@ -434,6 +774,13 @@ impl Interpreter<'_> {
                     let v = self.expr(&args[0].value)?;
                     return Ok(Value::Some(Rc::new(v)));
                 }
+                "same" => {
+                    let values = self.args(args)?;
+                    return Ok(Value::Bool(matches!(
+                        (&values[0], &values[1]),
+                        (Value::Shared(a), Value::Shared(b)) if Rc::ptr_eq(a, b)
+                    )));
+                }
                 _ => {}
             }
         }
@@ -442,11 +789,30 @@ impl Interpreter<'_> {
         self.call_value(&f, values, span)
     }
 
-    fn call_named(&mut self, decl: &Rc<FuncDecl>, args: &[Arg], span: Span) -> Eval {
-        let mut slots: Vec<Option<Value>> = vec![None; decl.params.len()];
-        let mut rest = Vec::new();
-        let fixed: Vec<usize> = decl
+    fn call_named(
+        &mut self,
+        decl: &Rc<FuncDecl>,
+        args: &[Arg],
+        span: Span,
+        this: Option<Value>,
+    ) -> Eval {
+        let values = self.bind_args(&decl.params, args)?;
+        let mut scope: HashMap<String, Value> = decl
             .params
+            .iter()
+            .map(|p| p.name.clone())
+            .zip(values)
+            .collect();
+        if let Some(this) = this {
+            scope.insert("this".to_string(), this);
+        }
+        self.enter(vec![scope], &decl.body, span)
+    }
+
+    fn bind_args(&mut self, params: &[Param], args: &[Arg]) -> Result<Vec<Value>, Flow> {
+        let mut slots: Vec<Option<Value>> = vec![None; params.len()];
+        let mut rest = Vec::new();
+        let fixed: Vec<usize> = params
             .iter()
             .enumerate()
             .filter(|(_, p)| !p.is_rest)
@@ -457,7 +823,7 @@ impl Interpreter<'_> {
             let v = self.expr(&arg.value)?;
             match &arg.name {
                 Some(name) => {
-                    if let Some(i) = decl.params.iter().position(|p| &p.name == name) {
+                    if let Some(i) = params.iter().position(|p| &p.name == name) {
                         slots[i] = Some(v);
                     }
                 }
@@ -470,8 +836,8 @@ impl Interpreter<'_> {
                 }
             }
         }
-        let mut scope = HashMap::new();
-        for (i, p) in decl.params.iter().enumerate() {
+        let mut values = Vec::with_capacity(params.len());
+        for (i, p) in params.iter().enumerate() {
             let v = if p.is_rest {
                 Value::List(Rc::new(std::mem::take(&mut rest)))
             } else {
@@ -483,9 +849,9 @@ impl Interpreter<'_> {
                     },
                 }
             };
-            scope.insert(p.name.clone(), v);
+            values.push(v);
         }
-        self.enter(vec![scope], &decl.body, span)
+        Ok(values)
     }
 
     fn call_value(&mut self, f: &Value, values: Vec<Value>, span: Span) -> Eval {
@@ -535,26 +901,44 @@ impl Interpreter<'_> {
         }
     }
 
-    fn method(&mut self, recv: &Expr, name: &str, args: &[Arg], span: Span) -> Eval {
-        if let ExprKind::Name(type_name) = &recv.kind {
-            if (type_name == "Int" || type_name == "Float") && self.slot(type_name).is_none() {
-                let text = self.expr(&args[0].value)?.display();
-                let text = text.trim();
-                return Ok(if type_name == "Int" {
-                    text.parse::<i64>()
-                        .map_or(Value::None, |n| Value::Some(Rc::new(Value::Int(n))))
-                } else {
-                    text.parse::<f64>()
-                        .map_or(Value::None, |f| Value::Some(Rc::new(Value::Float(f))))
-                });
+    fn method(&mut self, id: NodeId, recv: &Expr, name: &str, args: &[Arg], span: Span) -> Eval {
+        let info = self.info;
+        match info.resolved.get(&id) {
+            Some(Resolved::Method(key)) => {
+                let this = self.expr(recv)?;
+                let decl = self.funcs[key].clone();
+                return self.call_named(&decl, args, span, Some(this));
             }
-            if matches!(name, "push" | "pop" | "removeAt") {
-                let values = self.args(args)?;
-                let Some(Value::List(list)) = self.slot(type_name) else {
-                    return Ok(Value::Void);
+            Some(r) => return self.resolved(r, args, span),
+            None => {}
+        }
+        if let ExprKind::Name(type_name) = &recv.kind
+            && (type_name == "Int" || type_name == "Float")
+            && self.slot(type_name).is_none()
+        {
+            let text = self.expr(&args[0].value)?.display();
+            let text = text.trim();
+            return Ok(if type_name == "Int" {
+                text.parse::<i64>()
+                    .map_or(Value::None, |n| Value::Some(Rc::new(Value::Int(n))))
+            } else {
+                text.parse::<f64>()
+                    .map_or(Value::None, |f| Value::Some(Rc::new(Value::Float(f))))
+            });
+        }
+        let is_place = matches!(
+            recv.kind,
+            ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::This
+        );
+        if is_place && matches!(name, "push" | "pop" | "removeAt") {
+            let mut arg = self.args(args)?.into_iter().next();
+            let mut out = Value::Void;
+            self.write_path(recv, &mut |slot| {
+                let Value::List(list) = slot else {
+                    return Ok(());
                 };
                 let items = Rc::make_mut(list);
-                return Ok(match (name, values.into_iter().next()) {
+                out = match (name, arg.take()) {
                     ("push", Some(v)) => {
                         items.push(v);
                         Value::Void
@@ -565,8 +949,10 @@ impl Interpreter<'_> {
                         _ => Value::None,
                     },
                     _ => Value::Void,
-                });
-            }
+                };
+                Ok(())
+            })?;
+            return Ok(out);
         }
         let r = self.expr(recv)?;
         let values = self.args(args)?;

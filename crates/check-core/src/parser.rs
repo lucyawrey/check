@@ -91,6 +91,24 @@ impl Parser<'_> {
         }
     }
 
+    fn is_soft(&self, word: &str) -> bool {
+        matches!(self.peek(), Tok::Ident(w) if w == word)
+    }
+
+    fn is_type_decl(&self) -> bool {
+        self.is_kw("class")
+            || self.is_kw("enum")
+            || (self.is_soft("ref") && matches!(self.peek_at(1), Tok::Kw("class")))
+    }
+
+    fn field_name(&mut self) -> PResult<(String, Span)> {
+        match self.peek().clone() {
+            Tok::Ident(name) => Ok((name, self.advance().span)),
+            Tok::Kw(kw) => Ok((kw.to_string(), self.advance().span)),
+            _ => self.error(Code::unexpected_token, self.span()),
+        }
+    }
+
     fn ident(&mut self) -> PResult<(String, Span)> {
         match self.peek().clone() {
             Tok::Ident(name) => Ok((name, self.advance().span)),
@@ -174,6 +192,15 @@ impl Parser<'_> {
     }
 
     fn statement(&mut self) -> PResult<Stmt> {
+        if self.is_kw("enum") {
+            return Ok(Stmt::Enum(self.enum_decl()?));
+        }
+        if self.is_type_decl() {
+            return Ok(Stmt::Class(self.class_decl()?));
+        }
+        if self.is_kw("let") && !matches!(self.peek_at(2), Tok::Sym("=" | ":")) {
+            return self.let_else();
+        }
         if self.is_kw("let") || self.is_kw("var") {
             return self.let_stmt();
         }
@@ -218,6 +245,320 @@ impl Parser<'_> {
             is_var,
             ty,
             value,
+        })
+    }
+
+    fn let_else(&mut self) -> PResult<Stmt> {
+        let start = self.advance().span;
+        let pattern = self.pattern()?;
+        self.expect_sym("=")?;
+        let value = self.expr()?;
+        if !self.eat_kw("else") {
+            return self.error(Code::unexpected_token, self.span());
+        }
+        let otherwise = self.block()?;
+        Ok(Stmt::LetElse {
+            span: start.to(otherwise.span),
+            pattern,
+            value,
+            otherwise,
+        })
+    }
+
+    fn body(&mut self, mut item: impl FnMut(&mut Self) -> PResult<()>) -> PResult<()> {
+        let start = self.expect_sym("{")?;
+        loop {
+            self.skip_newlines();
+            if self.eat_sym("}") {
+                return Ok(());
+            }
+            if *self.peek() == Tok::Eof {
+                return self.error(Code::unclosed_bracket, start);
+            }
+            if item(self).is_err() {
+                self.recover();
+            }
+            self.end_statement(true);
+        }
+    }
+
+    fn member(&mut self, members: &mut Members, owner: &str) -> PResult<bool> {
+        if self.is_soft("static") && matches!(self.peek_at(1), Tok::Kw("func")) {
+            self.advance();
+            let mut decl = self.func_decl()?;
+            decl.name = format!("{owner}.{}", decl.name);
+            members.statics.push(decl);
+        } else if self.is_kw("func") {
+            let mut decl = self.func_decl()?;
+            decl.name = format!("{owner}.{}", decl.name);
+            members.methods.push(decl);
+        } else if self.eat_kw("const") {
+            let (name, span) = self.ident()?;
+            let ty = if self.eat_sym(":") {
+                Some(self.type_expr()?)
+            } else {
+                None
+            };
+            self.expect_sym("=")?;
+            let value = self.expr()?;
+            members.consts.push(ConstDecl {
+                name,
+                span,
+                ty,
+                value,
+            });
+        } else {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn class_decl(&mut self) -> PResult<ClassDecl> {
+        let start = self.span();
+        let is_ref = self.is_soft("ref");
+        if is_ref {
+            self.advance();
+        }
+        self.advance();
+        let (name, _) = self.ident()?;
+        let mut fields = Vec::new();
+        let mut init = None;
+        let mut members = Members::default();
+        if self.is_sym("(") {
+            fields = self.params()?;
+        } else {
+            let owner = name.clone();
+            self.body(|p| {
+                if p.member(&mut members, &owner)? {
+                    return Ok(());
+                }
+                if p.is_soft("init") && matches!(p.peek_at(1), Tok::Sym("{")) {
+                    let span = p.advance().span;
+                    let body = p.block()?;
+                    init = Some(FuncDecl {
+                        id: p.id(),
+                        name: format!("{owner}.init"),
+                        span: span.to(body.span),
+                        params: Vec::new(),
+                        ret: None,
+                        body,
+                    });
+                    return Ok(());
+                }
+                let is_var = p.is_kw("var");
+                if !is_var && !p.is_kw("let") {
+                    return p.error(Code::unexpected_token, p.span());
+                }
+                p.advance();
+                let (name, span) = p.field_name()?;
+                let ty = if p.eat_sym(":") {
+                    Some(p.type_expr()?)
+                } else {
+                    None
+                };
+                let default = if p.eat_sym("=") {
+                    Some(p.expr()?)
+                } else {
+                    None
+                };
+                fields.push(Param {
+                    name,
+                    span,
+                    ty,
+                    default,
+                    is_var,
+                    is_rest: false,
+                });
+                Ok(())
+            })?;
+        }
+        Ok(ClassDecl {
+            name,
+            span: start.to(self.prev_span()),
+            is_ref,
+            fields,
+            init,
+            members,
+        })
+    }
+
+    fn enum_decl(&mut self) -> PResult<EnumDecl> {
+        let start = self.advance().span;
+        let (name, _) = self.ident()?;
+        let mut variants = Vec::new();
+        let mut members = Members::default();
+        let owner = name.clone();
+        self.body(|p| {
+            if p.member(&mut members, &owner)? {
+                return Ok(());
+            }
+            loop {
+                variants.push(p.variant()?);
+                if !p.is_sym(",") {
+                    return Ok(());
+                }
+                let comma = p.advance().span;
+                if *p.peek() == Tok::Newline || p.is_sym("}") {
+                    p.diags
+                        .push(Diagnostic::error(Code::trailing_separator, comma));
+                    return Ok(());
+                }
+            }
+        })?;
+        Ok(EnumDecl {
+            name,
+            span: start.to(self.prev_span()),
+            variants,
+            members,
+        })
+    }
+
+    fn variant(&mut self) -> PResult<VariantDecl> {
+        let (name, span) = self.ident()?;
+        let mut names = Vec::new();
+        let mut fields = Vec::new();
+        if self.eat_sym("(") {
+            self.list_items(")", |p| {
+                if matches!(p.peek_at(1), Tok::Sym(":")) {
+                    names.push(p.field_name()?.0);
+                    p.advance();
+                }
+                fields.push(p.type_expr()?);
+                Ok(())
+            })?;
+        }
+        if !names.is_empty() && names.len() != fields.len() {
+            self.diags.push(Diagnostic::error(Code::mixed_fields, span));
+        }
+        Ok(VariantDecl {
+            name,
+            span,
+            field_names: (!names.is_empty()).then_some(names),
+            fields,
+        })
+    }
+
+    fn pattern(&mut self) -> PResult<Pattern> {
+        let first = self.single_pattern()?;
+        if !self.is_sym("|") {
+            return Ok(first);
+        }
+        let start = first.span;
+        let mut alternatives = vec![first];
+        while self.eat_sym("|") {
+            alternatives.push(self.single_pattern()?);
+        }
+        Ok(Pattern {
+            id: self.id(),
+            span: start.to(self.prev_span()),
+            kind: PatternKind::Or(alternatives),
+        })
+    }
+
+    fn single_pattern(&mut self) -> PResult<Pattern> {
+        let start = self.span();
+        let kind = match self.peek().clone() {
+            Tok::Ident(name) if name == "_" => {
+                self.advance();
+                PatternKind::Wildcard
+            }
+            Tok::Ident(name) => {
+                self.advance();
+                let (qualifier, name) = if self.eat_sym(".") {
+                    (Some(name), self.ident()?.0)
+                } else {
+                    (None, name)
+                };
+                if self.eat_sym("(") {
+                    let mut args = Vec::new();
+                    self.list_items(")", |p| {
+                        args.push(p.pattern()?);
+                        Ok(())
+                    })?;
+                    PatternKind::Variant(qualifier, name, args)
+                } else if qualifier.is_some() {
+                    PatternKind::Variant(qualifier, name, Vec::new())
+                } else {
+                    PatternKind::Name(name)
+                }
+            }
+            _ => {
+                let low = Box::new(self.literal_pattern()?);
+                if self.eat_sym("..") {
+                    PatternKind::Range(low, Box::new(self.literal_pattern()?), false)
+                } else if self.eat_sym("..=") {
+                    PatternKind::Range(low, Box::new(self.literal_pattern()?), true)
+                } else {
+                    PatternKind::Literal(low)
+                }
+            }
+        };
+        Ok(Pattern {
+            id: self.id(),
+            span: start.to(self.prev_span()),
+            kind,
+        })
+    }
+
+    fn literal_pattern(&mut self) -> PResult<Expr> {
+        let expr = self.unary()?;
+        let is_literal = match &expr.kind {
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => true,
+            ExprKind::Str(segs) => segs.iter().all(|s| matches!(s, StrSeg::Text(_))),
+            ExprKind::Unary(UnOp::Neg, inner) => {
+                matches!(inner.kind, ExprKind::Int(_) | ExprKind::Float(_))
+            }
+            _ => false,
+        };
+        if !is_literal {
+            return self.error(Code::unexpected_token, expr.span);
+        }
+        Ok(expr)
+    }
+
+    fn match_expr(&mut self, start: Span) -> PResult<Expr> {
+        let scrutinee = self.condition()?;
+        let open = self.expect_sym("{")?;
+        let mut arms = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.is_sym("}") {
+                break;
+            }
+            if *self.peek() == Tok::Eof {
+                return self.error(Code::unclosed_bracket, open);
+            }
+            match self.arm() {
+                Ok(arm) => arms.push(arm),
+                Err(()) => self.recover(),
+            }
+            if self.is_sym(",") {
+                let comma = self.advance().span;
+                if *self.peek() == Tok::Newline || self.is_sym("}") {
+                    self.diags
+                        .push(Diagnostic::error(Code::trailing_separator, comma));
+                }
+            } else {
+                self.end_statement(true);
+            }
+        }
+        let end = self.advance().span;
+        Ok(self.expr_node(start.to(end), ExprKind::Match(Box::new(scrutinee), arms)))
+    }
+
+    fn arm(&mut self) -> PResult<Arm> {
+        let pattern = self.pattern()?;
+        let guard = if self.eat_kw("if") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        self.expect_sym("=>")?;
+        let body = self.expr()?;
+        Ok(Arm {
+            pattern,
+            guard,
+            body,
         })
     }
 
@@ -355,6 +696,10 @@ impl Parser<'_> {
                 self.diags
                     .push(Diagnostic::error(Code::nested_named_function, self.span()));
             }
+            if self.is_type_decl() {
+                self.diags
+                    .push(Diagnostic::error(Code::nested_type, self.span()));
+            }
             match self.statement() {
                 Ok(stmt) => stmts.push(stmt),
                 Err(()) => self.recover(),
@@ -449,6 +794,11 @@ impl Parser<'_> {
 
     fn comparison(&mut self) -> PResult<Expr> {
         let lhs = self.coalesce()?;
+        if self.eat_kw("is") {
+            let pattern = self.pattern()?;
+            let span = lhs.span.to(pattern.span);
+            return Ok(self.expr_node(span, ExprKind::Is(Box::new(lhs), pattern)));
+        }
         let Some(op) = self.comparison_op() else {
             return Ok(lhs);
         };
@@ -593,9 +943,11 @@ impl Parser<'_> {
                 let span = expr.span.to(self.prev_span());
                 expr = self.expr_node(span, ExprKind::Call(Box::new(expr), args));
             } else if self.eat_sym(".") {
-                let (name, name_span) = self.ident()?;
+                let (name, _) = self.field_name()?;
                 if !self.eat_sym("(") {
-                    return self.error(Code::unexpected_token, name_span);
+                    let span = expr.span.to(self.prev_span());
+                    expr = self.expr_node(span, ExprKind::Field(Box::new(expr), name));
+                    continue;
                 }
                 let args = self.args()?;
                 let span = expr.span.to(self.prev_span());
@@ -629,6 +981,7 @@ impl Parser<'_> {
             Tok::Float(f) => ExprKind::Float(f),
             Tok::Kw("true") => ExprKind::Bool(true),
             Tok::Kw("false") => ExprKind::Bool(false),
+            Tok::Kw("this") => ExprKind::This,
             Tok::Ident(name) => ExprKind::Name(name),
             Tok::Str(parts) => ExprKind::Str(self.string_parts(parts)?),
             Tok::Sym("(") => {
@@ -666,6 +1019,7 @@ impl Parser<'_> {
                 ));
             }
             Tok::Kw("if") => return self.if_expr(span),
+            Tok::Kw("match") => return self.match_expr(span),
             Tok::Kw("while") => {
                 let cond = self.condition()?;
                 let body = self.block()?;

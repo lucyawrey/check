@@ -31,6 +31,71 @@ pub struct FuncDecl {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConstDecl {
+    pub name: String,
+    pub span: Span,
+    pub ty: Option<TypeExpr>,
+    pub value: Expr,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Members {
+    pub methods: Vec<FuncDecl>,
+    pub statics: Vec<FuncDecl>,
+    pub consts: Vec<ConstDecl>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassDecl {
+    pub name: String,
+    pub span: Span,
+    pub is_ref: bool,
+    pub fields: Vec<Param>,
+    pub init: Option<FuncDecl>,
+    pub members: Members,
+}
+
+#[derive(Debug, Clone)]
+pub struct VariantDecl {
+    pub name: String,
+    pub span: Span,
+    pub field_names: Option<Vec<String>>,
+    pub fields: Vec<TypeExpr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumDecl {
+    pub name: String,
+    pub span: Span,
+    pub variants: Vec<VariantDecl>,
+    pub members: Members,
+}
+
+#[derive(Debug, Clone)]
+pub struct Pattern {
+    pub id: NodeId,
+    pub span: Span,
+    pub kind: PatternKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum PatternKind {
+    Wildcard,
+    Name(String),
+    Literal(Box<Expr>),
+    Range(Box<Expr>, Box<Expr>, bool),
+    Variant(Option<String>, String, Vec<Pattern>),
+    Or(Vec<Pattern>),
+}
+
+#[derive(Debug, Clone)]
+pub struct Arm {
+    pub pattern: Pattern,
+    pub guard: Option<Expr>,
+    pub body: Expr,
+}
+
+#[derive(Debug, Clone)]
 pub enum Stmt {
     Let {
         id: NodeId,
@@ -46,7 +111,15 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    LetElse {
+        pattern: Pattern,
+        value: Expr,
+        otherwise: Expr,
+        span: Span,
+    },
     Func(FuncDecl),
+    Class(ClassDecl),
+    Enum(EnumDecl),
     Expr(Expr),
 }
 
@@ -111,15 +184,19 @@ pub enum ExprKind {
     Bool(bool),
     Str(Vec<StrSeg>),
     Name(String),
+    This,
     List(Vec<Expr>),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Arg>),
     Method(Box<Expr>, String, Vec<Arg>),
+    Field(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
     Lambda(Vec<Param>, Option<TypeExpr>, Box<Expr>),
     Block(Vec<Stmt>),
     If(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
+    Match(Box<Expr>, Vec<Arm>),
+    Is(Box<Expr>, Pattern),
     While(Box<Expr>, Box<Expr>),
     Loop(Box<Expr>),
     For(String, Span, Box<Expr>, Box<Expr>),
