@@ -1,5 +1,6 @@
 use std::io::Cursor;
 
+use check_core::ast::Stmt;
 use check_core::diag::Severity;
 use check_core::{Outcome, run_source};
 
@@ -408,4 +409,119 @@ fn building_an_object_counts_toward_the_call_limit() {
 fn consts_are_computed_before_the_program_runs() {
     let src = "enum E {\n  A\n  const big = 9223372036854775807 + 1\n}\nprint(\"start\")";
     panics_with(src, "integer_overflow");
+}
+
+#[test]
+fn library_files_hold_only_declarations_that_match_the_rust_bodies() {
+    let checked = check_core::check_source("");
+    assert!(checked.diagnostics.is_empty());
+    let mut declared = Vec::new();
+    for stmt in &checked.library {
+        match stmt {
+            Stmt::Func(f) => declared.push(f),
+            Stmt::Implement(i) => {
+                declared.extend(i.members.methods.iter().chain(&i.members.statics))
+            }
+            _ => panic!("a library file holds something other than a declaration"),
+        }
+    }
+    let mut names: Vec<&str> = declared
+        .iter()
+        .filter(|f| f.body.is_none())
+        .map(|f| f.name.as_str())
+        .collect();
+    let mut bodies: Vec<&str> = check_core::host::FUNCTIONS
+        .iter()
+        .map(|(n, _)| *n)
+        .collect();
+    names.sort();
+    bodies.sort();
+    assert_eq!(names, bodies);
+}
+
+#[test]
+fn a_users_function_or_method_replaces_the_librarys() {
+    let src = "func input() -> String? { Some(\"mine\") }\nimplement String {\n  func upper() -> String { \"UP\" }\n}\n\
+        print(input())\nprint(\"x\".upper())";
+    assert_eq!(output(src), "Some(\"mine\")\nUP");
+}
+
+#[test]
+fn host_functions_belong_only_in_library_files() {
+    assert_eq!(first_error("@Host func f() -> Int"), "host_outside_library");
+}
+
+#[test]
+fn implement_needs_a_class_enum_or_simple_built_in_type() {
+    assert_eq!(
+        first_error("implement List {\n  func f() { }\n}"),
+        "unknown_name"
+    );
+    assert_eq!(
+        first_error("implement Nope {\n  func f() { }\n}"),
+        "unknown_name"
+    );
+    assert_eq!(
+        output("implement Int {\n  func double() -> Int { this * 2 }\n}\nprint(21.double())"),
+        "42"
+    );
+}
+
+#[test]
+fn panic_from_the_library_still_never_returns() {
+    let src = "func f(x: Int) -> Int {\n  if x > 0 { return x }\n  panic(\"no\")\n}\nprint(f(1))";
+    assert_eq!(output(src), "1");
+    panics_with("panic()", "panic_called");
+}
+
+#[test]
+fn input_and_parse_behave_as_before() {
+    let mut out = Vec::new();
+    let src = "print(input(\"> \"))\nprint(input())\nprint(input())\nprint(Int.parse(\" 42 \"))\nprint(Float.parse(\"x\"))";
+    run_source(
+        "test.check",
+        src,
+        &mut Cursor::new(b"a\nb\n".to_vec()),
+        &mut out,
+    );
+    assert_eq!(
+        String::from_utf8(out).expect("utf-8"),
+        "> Some(\"a\")\nSome(\"b\")\nNone\nSome(42)\nNone\n"
+    );
+}
+
+#[test]
+fn wrong_calls_to_library_functions_are_errors() {
+    assert_eq!(first_error("print(\"abc\".upper(1))"), "wrong_arguments");
+    assert_eq!(first_error("panic(1)"), "type_mismatch");
+    assert_eq!(first_error("print(\"abc\".shout())"), "unknown_method");
+}
+
+#[test]
+fn a_users_variable_can_take_a_library_functions_name() {
+    assert_eq!(output("let input = 5\nprint(input)"), "5");
+    let report = run_source(
+        "test.check",
+        "func f() {\n  let panic = 3\n  print(panic)\n}\nf()",
+        &mut Cursor::new(Vec::new()),
+        &mut Vec::new(),
+    );
+    assert!(report.diagnostics.is_empty());
+}
+
+#[test]
+fn built_in_type_names_cant_be_reused_for_classes() {
+    assert_eq!(
+        first_error("class Int {\n  func toFloat() -> String { \"x\" }\n}"),
+        "redefined_builtin"
+    );
+}
+
+#[test]
+fn host_marks_only_functions() {
+    assert_eq!(first_error("@Host foo bar()"), "unexpected_token");
+    assert_eq!(
+        first_error("class C {\n  @Host const k = 1\n}"),
+        "unexpected_token"
+    );
 }
