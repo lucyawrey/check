@@ -7,6 +7,7 @@ use std::rc::Rc;
 use crate::ast::*;
 use crate::checker::{Info, Resolved};
 use crate::diag::{Code, Span};
+use crate::host::{self, Io};
 use crate::value::{Callable, Record, Value};
 
 pub struct Panic {
@@ -57,6 +58,7 @@ const MAX_DEPTH: usize = 10_000;
 
 pub fn run(
     program: &[Stmt],
+    library: &[Stmt],
     info: &Info,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
@@ -74,9 +76,10 @@ pub fn run(
         input,
         output,
     };
-    for stmt in program {
+    for stmt in library.iter().chain(program) {
         match stmt {
             Stmt::Func(decl) => interp.add_func(decl),
+            Stmt::Implement(i) => interp.add_members(&i.target, &i.members),
             Stmt::Class(c) => {
                 if let Some(init) = &c.init {
                     interp.add_func(init);
@@ -109,7 +112,7 @@ pub fn run(
     Ok(None)
 }
 
-fn panic<T>(code: Code, span: Span) -> Result<T, Flow> {
+pub(crate) fn panic<T>(code: Code, span: Span) -> Result<T, Flow> {
     Err(Flow::Panic(Panic {
         code,
         span,
@@ -291,7 +294,7 @@ impl Interpreter<'_> {
         self.frames.push(Frame {
             scopes: vec![scope],
         });
-        let result = self.expr(&init.body);
+        let result = self.expr(init.body.as_ref().expect("init has a body"));
         let mut frame = self.frames.pop().expect("frame");
         match result {
             Ok(_) | Err(Flow::Return(_)) => {}
@@ -442,7 +445,7 @@ impl Interpreter<'_> {
                 }
                 self.expr(otherwise)
             }
-            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) => Ok(Value::Void),
+            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) => Ok(Value::Void),
             Stmt::Expr(e) => self.scoped(|i| i.expr(e)),
         }
     }
@@ -742,34 +745,6 @@ impl Interpreter<'_> {
                     writeln!(self.output, "{}", v.display()).ok();
                     return Ok(Value::Void);
                 }
-                "panic" => {
-                    let reason = match args.first() {
-                        Some(a) => Some(self.expr(&a.value)?.display()),
-                        None => None,
-                    };
-                    return Err(Flow::Panic(Panic {
-                        code: Code::panic_called,
-                        span,
-                        reason,
-                        stack: Vec::new(),
-                    }));
-                }
-                "input" => {
-                    if let Some(a) = args.first() {
-                        let prompt = self.expr(&a.value)?.display();
-                        write!(self.output, "{prompt}").ok();
-                        self.output.flush().ok();
-                    }
-                    let mut line = String::new();
-                    return Ok(match self.input.read_line(&mut line) {
-                        Ok(0) | Err(_) => Value::None,
-                        Ok(_) => {
-                            let trimmed = line.strip_suffix('\n').unwrap_or(&line);
-                            let trimmed = trimmed.strip_suffix('\r').unwrap_or(trimmed);
-                            Value::Some(Rc::new(Value::Str(trimmed.into())))
-                        }
-                    });
-                }
                 "Some" => {
                     let v = self.expr(&args[0].value)?;
                     return Ok(Value::Some(Rc::new(v)));
@@ -797,6 +772,27 @@ impl Interpreter<'_> {
         this: Option<Value>,
     ) -> Eval {
         let values = self.bind_args(&decl.params, args)?;
+        self.run_decl(decl, values, this, span)
+    }
+
+    fn run_decl(
+        &mut self,
+        decl: &FuncDecl,
+        mut values: Vec<Value>,
+        this: Option<Value>,
+        span: Span,
+    ) -> Eval {
+        let Some(body) = &decl.body else {
+            if let Some(this) = this {
+                values.insert(0, this);
+            }
+            let f = host::find(&decl.name).expect("every @Host declaration has a body in host.rs");
+            let mut io = Io {
+                input: &mut *self.input,
+                output: &mut *self.output,
+            };
+            return f(&mut io, values, span);
+        };
         let mut scope: HashMap<String, Value> = decl
             .params
             .iter()
@@ -806,7 +802,7 @@ impl Interpreter<'_> {
         if let Some(this) = this {
             scope.insert("this".to_string(), this);
         }
-        self.enter(vec![scope], &decl.body, span)
+        self.enter(vec![scope], body, span)
     }
 
     fn bind_args(&mut self, params: &[Param], args: &[Arg]) -> Result<Vec<Value>, Flow> {
@@ -859,15 +855,7 @@ impl Interpreter<'_> {
             return Ok(Value::Void);
         };
         match &**callable {
-            Callable::Named(decl, _) => {
-                let scope = decl
-                    .params
-                    .iter()
-                    .map(|p| p.name.clone())
-                    .zip(values)
-                    .collect();
-                self.enter(vec![scope], &decl.body, span)
-            }
+            Callable::Named(decl, _) => self.run_decl(decl, values, None, span),
             Callable::Lambda {
                 params,
                 body,
@@ -912,20 +900,6 @@ impl Interpreter<'_> {
             Some(r) => return self.resolved(r, args, span),
             None => {}
         }
-        if let ExprKind::Name(type_name) = &recv.kind
-            && (type_name == "Int" || type_name == "Float")
-            && self.slot(type_name).is_none()
-        {
-            let text = self.expr(&args[0].value)?.display();
-            let text = text.trim();
-            return Ok(if type_name == "Int" {
-                text.parse::<i64>()
-                    .map_or(Value::None, |n| Value::Some(Rc::new(Value::Int(n))))
-            } else {
-                text.parse::<f64>()
-                    .map_or(Value::None, |f| Value::Some(Rc::new(Value::Float(f))))
-            });
-        }
         let is_place = matches!(
             recv.kind,
             ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::This
@@ -962,22 +936,6 @@ impl Interpreter<'_> {
     fn builtin_method(&mut self, recv: Value, name: &str, args: Vec<Value>, span: Span) -> Eval {
         let arg_str = |i: usize| args.get(i).map(Value::display).unwrap_or_default();
         Ok(match (recv, name) {
-            (Value::Str(s), "upper") => Value::Str(s.to_uppercase().into()),
-            (Value::Str(s), "lower") => Value::Str(s.to_lowercase().into()),
-            (Value::Str(s), "trim") => Value::Str(s.trim().into()),
-            (Value::Str(s), "isEmpty") => Value::Bool(s.is_empty()),
-            (Value::Str(s), "isBlank") => Value::Bool(s.trim().is_empty()),
-            (Value::Str(s), "contains") => Value::Bool(s.contains(arg_str(0).as_str())),
-            (Value::Str(s), "split") => {
-                let parts: Vec<Value> = if args.is_empty() {
-                    s.split_whitespace().map(|p| Value::Str(p.into())).collect()
-                } else {
-                    s.split(arg_str(0).as_str())
-                        .map(|p| Value::Str(p.into()))
-                        .collect()
-                };
-                Value::List(Rc::new(parts))
-            }
             (Value::List(items), "length") => Value::Int(items.len() as i64),
             (Value::List(items), "isEmpty") => Value::Bool(items.is_empty()),
             (Value::List(items), "contains") => {
@@ -1011,19 +969,6 @@ impl Interpreter<'_> {
                     }
                 }
                 Value::List(Rc::new(out))
-            }
-            (Value::Int(n), "toFloat") => Value::Float(n as f64),
-            (Value::Float(f), "round" | "floor" | "ceil" | "truncate") => {
-                let r = match name {
-                    "round" => f.round(),
-                    "floor" => f.floor(),
-                    "ceil" => f.ceil(),
-                    _ => f.trunc(),
-                };
-                if !r.is_finite() || r < i64::MIN as f64 || r >= i64::MAX as f64 {
-                    return panic(Code::round_out_of_range, span);
-                }
-                Value::Int(r as i64)
             }
             (Value::Some(v), "orPanic") => (*v).clone(),
             (Value::None, "orPanic") => {

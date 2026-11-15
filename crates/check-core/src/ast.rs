@@ -27,7 +27,7 @@ pub struct FuncDecl {
     pub span: Span,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
-    pub body: Expr,
+    pub body: Option<Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +52,13 @@ pub struct ClassDecl {
     pub is_ref: bool,
     pub fields: Vec<Param>,
     pub init: Option<FuncDecl>,
+    pub members: Members,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImplementDecl {
+    pub target: String,
+    pub span: Span,
     pub members: Members,
 }
 
@@ -120,6 +127,7 @@ pub enum Stmt {
     Func(FuncDecl),
     Class(ClassDecl),
     Enum(EnumDecl),
+    Implement(ImplementDecl),
     Expr(Expr),
 }
 

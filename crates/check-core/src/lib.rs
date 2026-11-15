@@ -1,6 +1,7 @@
 pub mod ast;
 pub mod checker;
 pub mod diag;
+pub mod host;
 pub mod interp;
 pub mod lexer;
 pub mod parser;
@@ -24,17 +25,47 @@ pub struct Report {
     pub panic_text: Option<String>,
 }
 
-pub fn check_source(src: &str) -> (Vec<ast::Stmt>, checker::Info, Vec<Diagnostic>) {
+pub const LIBRARY: &[&str] = &[
+    include_str!("../../../lib/std/core.check"),
+    include_str!("../../../lib/std/text.check"),
+    include_str!("../../../lib/std/numbers.check"),
+    include_str!("../../../lib/cli/io.check"),
+];
+
+pub struct Checked {
+    pub program: Vec<ast::Stmt>,
+    pub library: Vec<ast::Stmt>,
+    pub info: checker::Info,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+pub fn check_source(src: &str) -> Checked {
     let mut diags = Vec::new();
-    let tokens = lexer::lex(src, &mut diags);
     let mut next_id = 0;
-    let program = parser::parse_program(tokens, &mut next_id, &mut diags);
-    if diags.iter().any(|d| d.severity == Severity::Error) {
-        return (program, checker::Info::default(), diags);
+    let mut library = Vec::new();
+    for file in LIBRARY {
+        let tokens = lexer::lex(file, &mut diags);
+        library.extend(parser::parse_program(tokens, &mut next_id, &mut diags));
     }
-    let (info, check_diags) = checker::check(&program);
-    diags.extend(check_diags);
-    (program, info, diags)
+    let tokens = lexer::lex(src, &mut diags);
+    let program = parser::parse_program(tokens, &mut next_id, &mut diags);
+    let mut checked = Checked {
+        program,
+        library,
+        info: checker::Info::default(),
+        diagnostics: diags,
+    };
+    if checked
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == Severity::Error)
+    {
+        return checked;
+    }
+    let (info, check_diags) = checker::check(&checked.program, &checked.library);
+    checked.info = info;
+    checked.diagnostics.extend(check_diags);
+    checked
 }
 
 pub fn run_source(
@@ -43,7 +74,12 @@ pub fn run_source(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Report {
-    let (program, info, diagnostics) = check_source(src);
+    let Checked {
+        program,
+        library,
+        info,
+        diagnostics,
+    } = check_source(src);
     if diagnostics.iter().any(|d| d.severity == Severity::Error) {
         return Report {
             outcome: Outcome::CheckFailed,
@@ -51,7 +87,7 @@ pub fn run_source(
             panic_text: None,
         };
     }
-    match interp::run(&program, &info, input, output) {
+    match interp::run(&program, &library, &info, input, output) {
         Ok(None) => Report {
             outcome: Outcome::Finished,
             diagnostics,

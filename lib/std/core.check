@@ -1,0 +1,1 @@
+@Host func panic(reason: String? = None) -> Never

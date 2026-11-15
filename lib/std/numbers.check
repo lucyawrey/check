@@ -1,0 +1,12 @@
+implement Int {
+  @Host func toFloat() -> Float
+  @Host static func parse(text: String) -> Int?
+}
+
+implement Float {
+  @Host func round() -> Int
+  @Host func floor() -> Int
+  @Host func ceil() -> Int
+  @Host func truncate() -> Int
+  @Host static func parse(text: String) -> Float?
+}

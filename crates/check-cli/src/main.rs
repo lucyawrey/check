@@ -73,7 +73,7 @@ fn check(path: &str) -> ExitCode {
     let Some(src) = read(path) else {
         return ExitCode::FAILURE;
     };
-    let (_, _, diags) = check_source(&src);
+    let diags = check_source(&src).diagnostics;
     for d in &diags {
         eprint!("{}", d.render(path, &src));
     }

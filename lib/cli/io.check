@@ -1,0 +1,1 @@
+@Host func input(prompt: String = "") -> String?

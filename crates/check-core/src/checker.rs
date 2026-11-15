@@ -56,6 +56,7 @@ struct FuncEntry {
     state: FuncState,
     this: Option<(Ty, bool)>,
     owner: Option<String>,
+    library: bool,
 }
 
 struct ClassDef {
@@ -151,12 +152,14 @@ pub struct Checker {
     current_type: Option<String>,
     is_bindings: HashMap<NodeId, Vec<Binding>>,
     defaults: Vec<(Expr, Ty, Option<String>)>,
+    in_library: bool,
 }
 
 const RESERVED_NAMES: &[&str] = &["Maybe", "Some", "None", "Result", "Ok", "Err"];
 const MUTATING: &[&str] = &["push", "pop", "removeAt"];
+const BUILT_IN_TYPES: &[&str] = &["String", "Int", "Float", "Bool"];
 
-pub fn check(program: &[Stmt]) -> (Info, Vec<Diagnostic>) {
+pub fn check(program: &[Stmt], library: &[Stmt]) -> (Info, Vec<Diagnostic>) {
     let mut checker = Checker {
         subst: Subst::default(),
         diags: Vec::new(),
@@ -174,8 +177,9 @@ pub fn check(program: &[Stmt]) -> (Info, Vec<Diagnostic>) {
         current_type: None,
         is_bindings: HashMap::new(),
         defaults: Vec::new(),
+        in_library: false,
     };
-    checker.program(program);
+    checker.program(program, library);
     (checker.info, checker.diags)
 }
 
@@ -193,14 +197,14 @@ impl Checker {
         self.subst.resolve(ty)
     }
 
-    fn program(&mut self, program: &[Stmt]) {
+    fn program(&mut self, program: &[Stmt], library: &[Stmt]) {
         for stmt in program {
             let (name, span) = match stmt {
                 Stmt::Class(c) => (&c.name, c.span),
                 Stmt::Enum(e) => (&e.name, e.span),
                 _ => continue,
             };
-            if RESERVED_NAMES.contains(&name.as_str()) {
+            if RESERVED_NAMES.contains(&name.as_str()) || BUILT_IN_TYPES.contains(&name.as_str()) {
                 self.error(Code::redefined_builtin, span);
             } else if !self.type_names.insert(name.clone()) {
                 self.error(Code::duplicate_name, span);
@@ -224,9 +228,19 @@ impl Checker {
                 Stmt::Let { name, .. } => {
                     self.top_level_names.insert(name.clone());
                 }
+                Stmt::Implement(i) => self.declare_implement(i),
                 _ => {}
             }
         }
+        self.in_library = true;
+        for stmt in library {
+            match stmt {
+                Stmt::Func(decl) => self.declare_func(decl, None, None),
+                Stmt::Implement(i) => self.declare_implement(i),
+                _ => {}
+            }
+        }
+        self.in_library = false;
         for (default, ty, owner) in std::mem::take(&mut self.defaults) {
             self.current_type = owner;
             let actual = self.expr(&default, Some(&ty));
@@ -301,7 +315,22 @@ impl Checker {
         if let Some(init) = &c.init {
             self.declare_func(init, Some((Ty::Named(c.name.clone()), true)), Some(&c.name));
         }
-        self.declare_members(&c.name, &c.members);
+        self.declare_members(&c.name, Ty::Named(c.name.clone()), &c.members);
+    }
+
+    fn declare_implement(&mut self, i: &ImplementDecl) {
+        let this = match i.target.as_str() {
+            "String" => Ty::Str,
+            "Int" => Ty::Int,
+            "Float" => Ty::Float,
+            "Bool" => Ty::Bool,
+            name if self.type_names.contains(name) => Ty::Named(name.to_string()),
+            _ => {
+                self.error(Code::unknown_name, i.span);
+                return;
+            }
+        };
+        self.declare_members(&i.target, this, &i.members);
     }
 
     fn declare_enum(&mut self, e: &EnumDecl) {
@@ -328,11 +357,10 @@ impl Checker {
             })
             .collect();
         self.types.insert(e.name.clone(), TypeDef::Enum(variants));
-        self.declare_members(&e.name, &e.members);
+        self.declare_members(&e.name, Ty::Named(e.name.clone()), &e.members);
     }
 
-    fn declare_members(&mut self, owner: &str, members: &Members) {
-        let this = Ty::Named(owner.to_string());
+    fn declare_members(&mut self, owner: &str, this: Ty, members: &Members) {
         for m in &members.methods {
             self.declare_func(m, Some((this.clone(), false)), Some(owner));
         }
@@ -368,8 +396,13 @@ impl Checker {
 
     fn declare_func(&mut self, decl: &FuncDecl, this: Option<(Ty, bool)>, owner: Option<&str>) {
         if self.funcs.contains_key(&decl.name) {
-            self.error(Code::duplicate_name, decl.span);
+            if !self.in_library {
+                self.error(Code::duplicate_name, decl.span);
+            }
             return;
+        }
+        if decl.body.is_none() && !self.in_library {
+            self.error(Code::host_outside_library, decl.span);
         }
         if RESERVED_NAMES.contains(&decl.name.as_str()) {
             self.error(Code::redefined_builtin, decl.span);
@@ -382,6 +415,7 @@ impl Checker {
             state: FuncState::Unchecked,
             this,
             owner: owner.map(str::to_string),
+            library: self.in_library,
         };
         self.funcs.insert(decl.name.clone(), entry);
     }
@@ -522,6 +556,11 @@ impl Checker {
                 }
                 return Some(entry.sig.clone());
             }
+            FuncState::Unchecked if entry.decl.body.is_none() => {
+                entry.state = FuncState::Done;
+                entry.sig.ret.get_or_insert(Ty::Void);
+                return Some(entry.sig.clone());
+            }
             FuncState::Unchecked => entry.state = FuncState::InProgress,
         }
         let decl = entry.decl.clone();
@@ -564,7 +603,8 @@ impl Checker {
             );
         }
         self.scopes.push(scope);
-        let ret = self.function_body(&decl.body, sig.ret.clone());
+        let body = decl.body.as_ref().expect("checked functions have bodies");
+        let ret = self.function_body(body, sig.ret.clone());
         self.finish_scope();
         self.current_type = saved_type;
         self.scopes.truncate(1);
@@ -704,11 +744,10 @@ impl Checker {
             self.error(Code::redefined_builtin, span);
         }
         let global = self.scopes.len() == 1;
-        if self.scopes.last().is_some_and(|s| s.contains_key(name))
-            || (global && self.funcs.contains_key(name))
-        {
+        let user_func = self.funcs.get(name).is_some_and(|f| !f.library);
+        if self.scopes.last().is_some_and(|s| s.contains_key(name)) || (global && user_func) {
             self.error(Code::duplicate_name, span);
-        } else if self.lookup(name).is_some() || self.funcs.contains_key(name) {
+        } else if self.lookup(name).is_some() || user_func {
             self.warn(Code::shadowed_name, span);
         }
         self.scopes
@@ -787,7 +826,7 @@ impl Checker {
                 }
                 Ty::Void
             }
-            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) => Ty::Void,
+            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) => Ty::Void,
             Stmt::Expr(e) => self.expr(e, None),
         }
     }
@@ -874,7 +913,10 @@ impl Checker {
 
     fn type_ref(&self, e: &Expr) -> Option<String> {
         match &e.kind {
-            ExprKind::Name(n) if self.lookup(n).is_none() && self.type_names.contains(n) => {
+            ExprKind::Name(n)
+                if self.lookup(n).is_none()
+                    && (self.type_names.contains(n) || BUILT_IN_TYPES.contains(&n.as_str())) =>
+            {
                 Some(n.clone())
             }
             _ => None,
@@ -1436,18 +1478,6 @@ impl Checker {
                     self.expr(&args[0].value, None);
                     return Ty::Void;
                 }
-                "panic" => {
-                    if !args.is_empty() {
-                        self.args_of(args, span, &[Ty::Str]);
-                    }
-                    return Ty::Never;
-                }
-                "input" => {
-                    if !args.is_empty() {
-                        self.args_of(args, span, &[Ty::Str]);
-                    }
-                    return Ty::maybe(Ty::Str);
-                }
                 "Some" => {
                     if args.len() != 1 {
                         return self.error(Code::wrong_arguments, span);
@@ -1568,20 +1598,6 @@ impl Checker {
     }
 
     fn method(&mut self, id: NodeId, recv: &Expr, name: &str, args: &[Arg], span: Span) -> Ty {
-        if let ExprKind::Name(type_name) = &recv.kind
-            && self.lookup(type_name).is_none()
-            && (type_name == "Int" || type_name == "Float")
-        {
-            if name != "parse" {
-                return self.error(Code::unknown_method, span);
-            }
-            self.args_of(args, span, &[Ty::Str]);
-            return Ty::maybe(if type_name == "Int" {
-                Ty::Int
-            } else {
-                Ty::Float
-            });
-        }
         if let Some(t) = self.type_ref(recv) {
             if self.variant(&t, name).is_some() {
                 return self.variant_call(id, &t, name, args, span);
@@ -1611,8 +1627,8 @@ impl Checker {
         };
         let recv_ty = self.subst.shallow(&recv_ty);
         match recv_ty {
-            Ty::Named(t) => {
-                let key = format!("{t}.{name}");
+            t @ (Ty::Named(_) | Ty::Str | Ty::Int | Ty::Float | Ty::Bool) => {
+                let key = format!("{}.{name}", Show(&t));
                 if self.funcs.get(&key).is_some_and(|f| f.this.is_some()) {
                     self.info.resolved.insert(id, Resolved::Method(key.clone()));
                     return self.call_named(&key, args, span);
@@ -1629,16 +1645,7 @@ impl Checker {
                 Ty::Error
             }
             Ty::Var(_) => self.error(Code::type_needed, recv.span),
-            Ty::Str => self.string_method(name, args, span),
             Ty::List(elem) => self.list_method(*elem, name, args, span),
-            Ty::Int if name == "toFloat" => {
-                self.args_of(args, span, &[]);
-                Ty::Float
-            }
-            Ty::Float if matches!(name, "round" | "floor" | "ceil" | "truncate") => {
-                self.args_of(args, span, &[]);
-                Ty::Int
-            }
             Ty::Maybe(inner) => match name {
                 "orPanic" => {
                     if !args.is_empty() {
@@ -1659,30 +1666,6 @@ impl Checker {
                 }
                 _ => self.error(Code::unknown_method, span),
             },
-            _ => self.error(Code::unknown_method, span),
-        }
-    }
-
-    fn string_method(&mut self, name: &str, args: &[Arg], span: Span) -> Ty {
-        match name {
-            "upper" | "lower" | "trim" => {
-                self.args_of(args, span, &[]);
-                Ty::Str
-            }
-            "isEmpty" | "isBlank" => {
-                self.args_of(args, span, &[]);
-                Ty::Bool
-            }
-            "contains" => {
-                self.args_of(args, span, &[Ty::Str]);
-                Ty::Bool
-            }
-            "split" => {
-                if !args.is_empty() {
-                    self.args_of(args, span, &[Ty::Str]);
-                }
-                Ty::list(Ty::Str)
-            }
             _ => self.error(Code::unknown_method, span),
         }
     }
@@ -2216,7 +2199,7 @@ fn mutates(expr: &Expr, list: &str) -> bool {
             Stmt::Let { value, .. } => mutates(value, list),
             Stmt::Expr(e) => mutates(e, list),
             Stmt::LetElse { value, .. } => mutates(value, list),
-            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) => false,
+            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) => false,
         }),
         ExprKind::Str(segs) => segs
             .iter()

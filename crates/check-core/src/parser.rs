@@ -98,6 +98,7 @@ impl Parser<'_> {
     fn is_type_decl(&self) -> bool {
         self.is_kw("class")
             || self.is_kw("enum")
+            || self.is_kw("implement")
             || (self.is_soft("ref") && matches!(self.peek_at(1), Tok::Kw("class")))
     }
 
@@ -195,6 +196,17 @@ impl Parser<'_> {
         if self.is_kw("enum") {
             return Ok(Stmt::Enum(self.enum_decl()?));
         }
+        if self.is_kw("implement") {
+            return Ok(Stmt::Implement(self.implement_decl()?));
+        }
+        if self.is_host() {
+            self.advance();
+            self.advance();
+            if !self.is_kw("func") {
+                return self.error(Code::unexpected_token, self.span());
+            }
+            return Ok(Stmt::Func(self.func_decl(true)?));
+        }
         if self.is_type_decl() {
             return Ok(Stmt::Class(self.class_decl()?));
         }
@@ -205,7 +217,7 @@ impl Parser<'_> {
             return self.let_stmt();
         }
         if self.is_kw("func") && matches!(self.peek_at(1), Tok::Ident(_)) {
-            return Ok(Stmt::Func(self.func_decl()?));
+            return Ok(Stmt::Func(self.func_decl(false)?));
         }
         let target = self.expr()?;
         let op = match self.peek() {
@@ -282,14 +294,45 @@ impl Parser<'_> {
         }
     }
 
+    fn is_host(&self) -> bool {
+        self.is_sym("@") && matches!(self.peek_at(1), Tok::Ident(w) if w == "Host")
+    }
+
+    fn implement_decl(&mut self) -> PResult<ImplementDecl> {
+        let start = self.advance().span;
+        let (target, _) = self.ident()?;
+        let mut members = Members::default();
+        let owner = target.clone();
+        self.body(|p| {
+            if p.member(&mut members, &owner)? {
+                return Ok(());
+            }
+            p.error(Code::unexpected_token, p.span())
+        })?;
+        Ok(ImplementDecl {
+            target,
+            span: start.to(self.prev_span()),
+            members,
+        })
+    }
+
     fn member(&mut self, members: &mut Members, owner: &str) -> PResult<bool> {
+        let is_host = self.is_host();
+        if is_host {
+            self.advance();
+            self.advance();
+            let is_static = self.is_soft("static") && matches!(self.peek_at(1), Tok::Kw("func"));
+            if !is_static && !self.is_kw("func") {
+                return self.error(Code::unexpected_token, self.span());
+            }
+        }
         if self.is_soft("static") && matches!(self.peek_at(1), Tok::Kw("func")) {
             self.advance();
-            let mut decl = self.func_decl()?;
+            let mut decl = self.func_decl(is_host)?;
             decl.name = format!("{owner}.{}", decl.name);
             members.statics.push(decl);
         } else if self.is_kw("func") {
-            let mut decl = self.func_decl()?;
+            let mut decl = self.func_decl(is_host)?;
             decl.name = format!("{owner}.{}", decl.name);
             members.methods.push(decl);
         } else if self.eat_kw("const") {
@@ -341,7 +384,7 @@ impl Parser<'_> {
                         span: span.to(body.span),
                         params: Vec::new(),
                         ret: None,
-                        body,
+                        body: Some(body),
                     });
                     return Ok(());
                 }
@@ -562,7 +605,7 @@ impl Parser<'_> {
         })
     }
 
-    fn func_decl(&mut self) -> PResult<FuncDecl> {
+    fn func_decl(&mut self, is_host: bool) -> PResult<FuncDecl> {
         let start = self.advance().span;
         let (name, _) = self.ident()?;
         let params = self.params()?;
@@ -571,7 +614,11 @@ impl Parser<'_> {
         } else {
             None
         };
-        let body = self.func_body(ret.is_some())?;
+        let body = if is_host {
+            None
+        } else {
+            Some(self.func_body(ret.is_some())?)
+        };
         Ok(FuncDecl {
             id: self.id(),
             name,
