@@ -402,7 +402,7 @@ impl Checker {
             return;
         }
         if decl.body.is_none() && !self.in_library {
-            self.error(Code::host_outside_library, decl.span);
+            self.error(Code::external_outside_library, decl.span);
         }
         if RESERVED_NAMES.contains(&decl.name.as_str()) {
             self.error(Code::redefined_builtin, decl.span);

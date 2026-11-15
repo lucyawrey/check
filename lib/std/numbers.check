@@ -1,12 +1,12 @@
 implement Int {
-  @Host func toFloat() -> Float
-  @Host static func parse(text: String) -> Int?
+  external func toFloat() -> Float
+  external static func parse(text: String) -> Int?
 }
 
 implement Float {
-  @Host func round() -> Int
-  @Host func floor() -> Int
-  @Host func ceil() -> Int
-  @Host func truncate() -> Int
-  @Host static func parse(text: String) -> Float?
+  external func round() -> Int
+  external func floor() -> Int
+  external func ceil() -> Int
+  external func truncate() -> Int
+  external static func parse(text: String) -> Float?
 }
