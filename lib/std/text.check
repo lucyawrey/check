@@ -1,0 +1,9 @@
+implement String {
+  @Host func upper() -> String
+  @Host func lower() -> String
+  @Host func trim() -> String
+  @Host func isEmpty() -> Bool
+  @Host func isBlank() -> Bool
+  @Host func contains(text: String) -> Bool
+  @Host func split(separator: String? = None) -> List<String>
+}

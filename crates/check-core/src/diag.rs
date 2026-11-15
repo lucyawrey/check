@@ -95,6 +95,7 @@ codes! {
     let_else_can_finish => "[a let-else whose else can finish]",
     const_not_constant => "[a const whose value isn't a constant expression]",
     const_cycle => "[consts defined in terms of each other]",
+    host_outside_library => "[an @Host function outside a library package]",
     try_stopped => "[a top-level try found no value, so the program stopped]",
     panic_called => "[panic was called]",
     integer_overflow => "[integer overflow]",
