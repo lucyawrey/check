@@ -48,6 +48,16 @@
 - `loop_value_without_break` a `for`, `while` or `loop` used as a value with no `break` value
 - `break_type_mismatch` `break` values of different types in one loop
 - `constant_backwards_range` a backwards range with constant ends (`10..0`)
+- `nested_type` a class or enum declared inside a function body
+- `mixed_fields` a variant with both named and positional fields
+- `this_outside_method` `this` outside a method
+- `unknown_field` a field that the type doesn't have
+- `unqualified_variant` a variant written without its enum where the expected type isn't known (`let s = Circle(1.0)`)
+- `non_exhaustive_match` a `match` that misses a case, named in the message
+- `or_pattern_bindings` alternatives of an or-pattern that bind different names
+- `let_else_can_finish` a `let ... else` whose `else` can finish
+- `const_not_constant` a `const` whose value isn't a constant expression
+- `const_cycle` consts defined in terms of each other
 
 ## Stops
 - `try_stopped` a top-level `try` found `None`, so the program stopped (not a panic; exit status 1)
@@ -61,9 +71,11 @@
 - `shift_out_of_range` a shift amount below 0 or of 64 and above
 - `round_out_of_range` rounding `NaN`, `Infinity` or a `Float` too big for an `Int`
 - `stack_overflow` more than 10,000 nested calls
+- `index_out_of_range` writing to a list index that doesn't exist (`list[9] = x`)
 
 ## Warnings
 - `unused_var` a `var` that's never reassigned
 - `shadowed_name` a local that shadows a function or type
 - `interpolated_maybe` interpolating a `T?`
 - `nested_maybe` an `if` or loop value that is a `T??`
+- `let_else_some` `let Some(x) = e else { ... }`, which `let x = e ?? ...` replaces
