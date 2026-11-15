@@ -786,7 +786,8 @@ impl Interpreter<'_> {
             if let Some(this) = this {
                 values.insert(0, this);
             }
-            let f = host::find(&decl.name).expect("every @Host declaration has a body in host.rs");
+            let f =
+                host::find(&decl.name).expect("every external declaration has a body in host.rs");
             let mut io = Io {
                 input: &mut *self.input,
                 output: &mut *self.output,

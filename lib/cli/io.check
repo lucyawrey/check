@@ -1,1 +1,1 @@
-@Host func input(prompt: String = "") -> String?
+external func input(prompt: String = "") -> String?

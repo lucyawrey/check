@@ -58,7 +58,7 @@
 - `let_else_can_finish` a `let ... else` whose `else` can finish
 - `const_not_constant` a `const` whose value isn't a constant expression
 - `const_cycle` consts defined in terms of each other
-- `host_outside_library` an `@Host` function outside a library package
+- `external_outside_library` an `external` function outside a library package
 
 ## Stops
 - `try_stopped` a top-level `try` found `None`, so the program stopped (not a panic; exit status 1)

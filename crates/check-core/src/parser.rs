@@ -199,8 +199,7 @@ impl Parser<'_> {
         if self.is_kw("implement") {
             return Ok(Stmt::Implement(self.implement_decl()?));
         }
-        if self.is_host() {
-            self.advance();
+        if self.is_external() {
             self.advance();
             if !self.is_kw("func") {
                 return self.error(Code::unexpected_token, self.span());
@@ -294,8 +293,13 @@ impl Parser<'_> {
         }
     }
 
-    fn is_host(&self) -> bool {
-        self.is_sym("@") && matches!(self.peek_at(1), Tok::Ident(w) if w == "Host")
+    fn is_external(&self) -> bool {
+        self.is_soft("external")
+            && match self.peek_at(1) {
+                Tok::Kw("func") => true,
+                Tok::Ident(w) => w == "static" && matches!(self.peek_at(2), Tok::Kw("func")),
+                _ => false,
+            }
     }
 
     fn implement_decl(&mut self) -> PResult<ImplementDecl> {
@@ -317,22 +321,17 @@ impl Parser<'_> {
     }
 
     fn member(&mut self, members: &mut Members, owner: &str) -> PResult<bool> {
-        let is_host = self.is_host();
-        if is_host {
+        let is_external = self.is_external();
+        if is_external {
             self.advance();
-            self.advance();
-            let is_static = self.is_soft("static") && matches!(self.peek_at(1), Tok::Kw("func"));
-            if !is_static && !self.is_kw("func") {
-                return self.error(Code::unexpected_token, self.span());
-            }
         }
         if self.is_soft("static") && matches!(self.peek_at(1), Tok::Kw("func")) {
             self.advance();
-            let mut decl = self.func_decl(is_host)?;
+            let mut decl = self.func_decl(is_external)?;
             decl.name = format!("{owner}.{}", decl.name);
             members.statics.push(decl);
         } else if self.is_kw("func") {
-            let mut decl = self.func_decl(is_host)?;
+            let mut decl = self.func_decl(is_external)?;
             decl.name = format!("{owner}.{}", decl.name);
             members.methods.push(decl);
         } else if self.eat_kw("const") {
@@ -605,7 +604,7 @@ impl Parser<'_> {
         })
     }
 
-    fn func_decl(&mut self, is_host: bool) -> PResult<FuncDecl> {
+    fn func_decl(&mut self, is_external: bool) -> PResult<FuncDecl> {
         let start = self.advance().span;
         let (name, _) = self.ident()?;
         let params = self.params()?;
@@ -614,7 +613,7 @@ impl Parser<'_> {
         } else {
             None
         };
-        let body = if is_host {
+        let body = if is_external {
             None
         } else {
             Some(self.func_body(ret.is_some())?)

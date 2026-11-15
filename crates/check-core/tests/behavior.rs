@@ -447,8 +447,11 @@ fn a_users_function_or_method_replaces_the_librarys() {
 }
 
 #[test]
-fn host_functions_belong_only_in_library_files() {
-    assert_eq!(first_error("@Host func f() -> Int"), "host_outside_library");
+fn external_functions_belong_only_in_library_files() {
+    assert_eq!(
+        first_error("external func f() -> Int"),
+        "external_outside_library"
+    );
 }
 
 #[test]
@@ -518,10 +521,10 @@ fn built_in_type_names_cant_be_reused_for_classes() {
 }
 
 #[test]
-fn host_marks_only_functions() {
-    assert_eq!(first_error("@Host foo bar()"), "unexpected_token");
+fn external_marks_only_functions() {
     assert_eq!(
-        first_error("class C {\n  @Host const k = 1\n}"),
+        first_error("class C {\n  external const k = 1\n}"),
         "unexpected_token"
     );
+    assert_eq!(output("let external = 1\nprint(external)"), "1");
 }
