@@ -49,7 +49,9 @@
 - `break_type_mismatch` `break` values of different types in one loop
 - `constant_backwards_range` a backwards range with constant ends (`10..0`)
 - `nested_type` a class or enum declared inside a function body
-- `mixed_fields` a variant with both named and positional fields
+- `mixed_fields` a variant, record literal or record type with both named and positional fields
+- `record_to_class` a record value, not a literal, used where a class is expected (`let q: Point = t`)
+- `spread_not_first` a `...` spread that isn't first in a call or record literal, or a second one
 - `this_outside_method` `this` outside a method
 - `unknown_field` a field that the type doesn't have
 - `unqualified_variant` a variant written without its enum where the expected type isn't known (`let s = Circle(1.0)`)
@@ -80,3 +82,4 @@
 - `interpolated_maybe` interpolating a `T?`
 - `nested_maybe` an `if` or loop value that is a `T??`
 - `let_else_some` `let Some(x) = e else { ... }`, which `let x = e ?? ...` replaces
+- `record_beside_class` a record literal whose class is written right beside it (`let q: Point = (1, 2)`), which `let q = Point(1, 2)` replaces
