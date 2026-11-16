@@ -8,6 +8,7 @@ pub enum TypeExpr {
     Generic(String, Vec<TypeExpr>, Span),
     Maybe(Box<TypeExpr>),
     Func(Vec<TypeExpr>, Option<Box<TypeExpr>>),
+    Record(Vec<String>, Vec<TypeExpr>, Span),
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +94,9 @@ pub enum PatternKind {
     Range(Box<Expr>, Box<Expr>, bool),
     Variant(Option<String>, String, Vec<Pattern>),
     Or(Vec<Pattern>),
+    Record(Vec<Pattern>),
+    List(Vec<Pattern>),
+    Rest(String),
 }
 
 #[derive(Debug, Clone)]
@@ -118,10 +122,11 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
-    LetElse {
+    LetPattern {
         pattern: Pattern,
+        is_var: bool,
         value: Expr,
-        otherwise: Expr,
+        otherwise: Option<Expr>,
         span: Span,
     },
     Func(FuncDecl),
@@ -194,6 +199,8 @@ pub enum ExprKind {
     Name(String),
     This,
     List(Vec<Expr>),
+    Record(Vec<Arg>),
+    Spread(Box<Expr>),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Arg>),
@@ -207,7 +214,7 @@ pub enum ExprKind {
     Is(Box<Expr>, Pattern),
     While(Box<Expr>, Box<Expr>),
     Loop(Box<Expr>),
-    For(String, Span, Box<Expr>, Box<Expr>),
+    For(Pattern, Box<Expr>, Box<Expr>),
     Break(Option<Box<Expr>>),
     Continue,
     Return(Option<Box<Expr>>),

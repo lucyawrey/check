@@ -84,6 +84,17 @@ struct ConstEntry {
 
 type Binding = (String, Span, Ty);
 
+enum ArgSource<'a> {
+    Expr(&'a Expr),
+    Spread(Ty, Span),
+}
+
+#[derive(Clone, Copy)]
+enum Cell<'p> {
+    Pat(&'p Pattern),
+    Items(&'p [Pattern]),
+}
+
 static WILDCARD: Pattern = Pattern {
     id: 0,
     span: Span { start: 0, end: 0 },
@@ -542,6 +553,10 @@ impl Checker {
                 let ret = ret.as_ref().map_or(Ty::Void, |r| self.type_from(r));
                 Ty::Func(params, Box::new(ret))
             }
+            TypeExpr::Record(names, fields, _) => {
+                let fields = fields.iter().map(|f| self.type_from(f)).collect();
+                Ty::Record(names.clone(), fields)
+            }
         }
     }
 
@@ -643,11 +658,13 @@ impl Checker {
             }
         };
         if !self.subsume(body.id, &body_ty, &ret) {
-            self.error(Code::return_type_mismatch, body.span);
+            let code = self.mismatch(&body_ty, &ret, Code::return_type_mismatch);
+            self.error(code, body.span);
         }
         for (id, span, ty) in ctx.returns {
             if !self.subsume(id, &ty, &ret) {
-                self.error(Code::return_type_mismatch, span);
+                let code = self.mismatch(&ty, &ret, Code::return_type_mismatch);
+                self.error(code, span);
             }
         }
         ret
@@ -691,9 +708,22 @@ impl Checker {
         let code = if matches!(a, Ty::Maybe(_)) {
             Code::unhandled_maybe
         } else {
-            Code::type_mismatch
+            self.mismatch(&a, expected, Code::type_mismatch)
         };
         self.error(code, expr.span);
+    }
+
+    fn mismatch(&self, actual: &Ty, expected: &Ty, otherwise: Code) -> Code {
+        let expected = match self.subst.shallow(expected) {
+            Ty::Maybe(inner) => self.subst.shallow(&inner),
+            e => e,
+        };
+        match (self.subst.shallow(actual), expected) {
+            (Ty::Record(..), Ty::Named(class)) if self.class(&class).is_some() => {
+                Code::record_to_class
+            }
+            _ => otherwise,
+        }
     }
 
     fn join(&mut self, a: (&Expr, Ty), b: (&Expr, Ty)) -> Option<Ty> {
@@ -767,6 +797,14 @@ impl Checker {
                 ..
             } => {
                 let declared = ty.as_ref().map(|t| self.type_from(t));
+                if let (ExprKind::Record(args), Some(Ty::Named(class))) = (&value.kind, &declared)
+                    && self.class(class).is_some()
+                    && !args
+                        .first()
+                        .is_some_and(|a| matches!(a.value.kind, ExprKind::Spread(_)))
+                {
+                    self.warn(Code::record_beside_class, value.span);
+                }
                 let actual = self.expr(value, declared.as_ref());
                 let ty = match declared {
                     Some(d) => {
@@ -802,8 +840,9 @@ impl Checker {
                 self.assign(target, *op, value, *span);
                 Ty::Void
             }
-            Stmt::LetElse {
+            Stmt::LetPattern {
                 pattern,
+                is_var,
                 value,
                 otherwise,
                 ..
@@ -811,18 +850,27 @@ impl Checker {
                 let t = self.expr(value, None);
                 let mut binds = Vec::new();
                 self.pattern(pattern, &t, &mut binds);
-                let ot = self.expr(otherwise, None);
-                if self.subst.shallow(&ot) != Ty::Never {
-                    self.error(Code::let_else_can_finish, otherwise.span);
-                }
-                if let PatternKind::Variant(None, name, args) = &pattern.kind
-                    && name == "Some"
-                    && matches!(args.as_slice(), [p] if matches!(p.kind, PatternKind::Name(_)) && !self.info.variant_patterns.contains(&p.id))
-                {
-                    self.warn(Code::let_else_some, pattern.span);
+                match otherwise {
+                    Some(otherwise) => {
+                        let ot = self.expr(otherwise, None);
+                        if self.subst.shallow(&ot) != Ty::Never {
+                            self.error(Code::let_else_can_finish, otherwise.span);
+                        }
+                        if let PatternKind::Variant(None, name, args) = &pattern.kind
+                            && name == "Some"
+                            && matches!(args.as_slice(), [p] if matches!(p.kind, PatternKind::Name(_)) && !self.info.variant_patterns.contains(&p.id))
+                        {
+                            self.warn(Code::let_else_some, pattern.span);
+                        }
+                    }
+                    None => self.report_missing(vec![vec![Cell::Pat(pattern)]], &t, pattern.span),
                 }
                 for (name, span, ty) in binds {
-                    self.declare(&name, span, Var::binding(ty, span));
+                    let var = Var {
+                        mutable: *is_var,
+                        ..Var::binding(ty, span)
+                    };
+                    self.declare(&name, span, var);
                 }
                 Ty::Void
             }
@@ -883,6 +931,10 @@ impl Checker {
                         }
                         None => (self.error(Code::unknown_field, target.span), None),
                     },
+                    Ty::Record(names, fields) => match record_field(&names, &fields, name) {
+                        Some(ty) => (ty, Some(Code::assign_to_let)),
+                        None => (self.error(Code::unknown_field, target.span), None),
+                    },
                     Ty::Error => (Ty::Error, None),
                     Ty::Var(_) => (self.error(Code::type_needed, base.span), None),
                     _ => (self.error(Code::unknown_field, target.span), None),
@@ -903,12 +955,21 @@ impl Checker {
         }
     }
 
+    fn class(&self, type_name: &str) -> Option<&ClassDef> {
+        match self.types.get(type_name) {
+            Some(TypeDef::Class(c)) => Some(c),
+            _ => None,
+        }
+    }
+
     fn field(&self, type_name: &str, field: &str) -> Option<(Ty, bool, bool)> {
-        let Some(TypeDef::Class(c)) = self.types.get(type_name) else {
-            return None;
-        };
+        let c = self.class(type_name)?;
         let i = c.fields.iter().position(|f| f.name == field)?;
-        Some((c.fields[i].ty.clone(), c.mutable[i], c.is_ref))
+        let ty = match &c.fields[i] {
+            f if f.is_rest => Ty::list(f.ty.clone()),
+            f => f.ty.clone(),
+        };
+        Some((ty, c.mutable[i], c.is_ref))
     }
 
     fn type_ref(&self, e: &Expr) -> Option<String> {
@@ -1065,6 +1126,11 @@ impl Checker {
                 }
                 Ty::list(elem)
             }
+            ExprKind::Record(args) => self.record_literal(expr, args, expected),
+            ExprKind::Spread(inner) => {
+                self.expr(inner, None);
+                self.error(Code::wrong_arguments, expr.span)
+            }
             ExprKind::Unary(op, operand) => self.unary(*op, operand, expr.span),
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expr.span),
             ExprKind::Call(callee, args) => self.call(expr.id, callee, args, expr.span, expected),
@@ -1085,9 +1151,7 @@ impl Checker {
                 self.scopes.pop();
                 ty
             }
-            ExprKind::For(name, span, iter, body) => {
-                self.for_loop(expr.id, name, *span, iter, body)
-            }
+            ExprKind::For(pattern, iter, body) => self.for_loop(expr.id, pattern, iter, body),
             ExprKind::Loop(body) => {
                 self.loops.push(LoopCtx {
                     kind: LoopKind::Loop,
@@ -1198,6 +1262,109 @@ impl Checker {
         Ty::Named(enum_name.to_string())
     }
 
+    fn record_literal(&mut self, expr: &Expr, args: &[Arg], expected: Option<&Ty>) -> Ty {
+        if let Some(ExprKind::Spread(inner)) = args.first().map(|a| &a.value.kind) {
+            return self.record_copy(inner, &args[1..]);
+        }
+        let expected = expected.map(|e| match self.subst.shallow(e) {
+            Ty::Maybe(inner) => self.subst.shallow(&inner),
+            e => e,
+        });
+        if let Some(Ty::Named(class)) = &expected
+            && let Some(c) = self.class(class)
+        {
+            let params = c.fields.clone();
+            self.match_args(&params, args, expr.span);
+            self.info
+                .resolved
+                .insert(expr.id, Resolved::Construct(class.clone()));
+            return Ty::Named(class.clone());
+        }
+        if args.is_empty() {
+            return self.error(Code::type_needed, expr.span);
+        }
+        let names: Vec<String> = args.iter().filter_map(|a| a.name.clone()).collect();
+        self.check_unique(
+            args.iter()
+                .filter_map(|a| Some((a.name.as_ref()?, a.value.span))),
+        );
+        let hint = match expected {
+            Some(Ty::Record(n, f)) if n == names && f.len() == args.len() => Some(f),
+            _ => None,
+        };
+        let mut fields = Vec::new();
+        for (i, arg) in args.iter().enumerate() {
+            if let ExprKind::Spread(inner) = &arg.value.kind {
+                self.expr(inner, None);
+                fields.push(self.error(Code::spread_not_first, arg.value.span));
+                continue;
+            }
+            fields.push(match &hint {
+                Some(h) => {
+                    let t = self.expr(&arg.value, Some(&h[i]));
+                    self.expect(&arg.value, &t, &h[i]);
+                    h[i].clone()
+                }
+                None => self.expr(&arg.value, None),
+            });
+        }
+        if !names.is_empty() && names.len() != args.len() {
+            return self.error(Code::mixed_fields, expr.span);
+        }
+        Ty::Record(names, fields)
+    }
+
+    fn record_copy(&mut self, original: &Expr, changes: &[Arg]) -> Ty {
+        let t = self.expr(original, None);
+        let copyable = match self.subst.shallow(&t) {
+            Ty::Named(class) => self.class(&class).is_some(),
+            Ty::Record(..) | Ty::Error => true,
+            Ty::Var(_) => {
+                self.error(Code::type_needed, original.span);
+                false
+            }
+            _ => false,
+        };
+        if !copyable {
+            self.error(Code::type_mismatch, original.span);
+        }
+        let mut changed = HashSet::new();
+        for change in changes {
+            if let Some(name) = &change.name
+                && !changed.insert(name)
+            {
+                self.expr(&change.value, None);
+                self.error(Code::wrong_arguments, change.value.span);
+                continue;
+            }
+            let field = match (&change.name, self.subst.shallow(&t)) {
+                (Some(name), Ty::Named(class)) => self.field(&class, name).map(|f| f.0),
+                (Some(name), Ty::Record(names, fields)) if !names.is_empty() => {
+                    record_field(&names, &fields, name)
+                }
+                (_, Ty::Error) => Some(Ty::Error),
+                _ => None,
+            };
+            let code = match (&change.value.kind, &change.name, field) {
+                (ExprKind::Spread(_), ..) => Code::spread_not_first,
+                (_, None, _) => Code::wrong_arguments,
+                (_, Some(_), None) => Code::unknown_field,
+                (_, Some(_), Some(ft)) => {
+                    let v = self.expr(&change.value, Some(&ft));
+                    self.expect(&change.value, &v, &ft);
+                    continue;
+                }
+            };
+            let value = match &change.value.kind {
+                ExprKind::Spread(inner) => inner,
+                _ => &change.value,
+            };
+            self.expr(value, None);
+            self.error(code, change.value.span);
+        }
+        if copyable { t } else { Ty::Error }
+    }
+
     fn field_expr(&mut self, id: NodeId, base: &Expr, name: &str, span: Span) -> Ty {
         if let Some(t) = self.type_ref(base) {
             let key = format!("{t}.{name}");
@@ -1214,6 +1381,10 @@ impl Checker {
         match self.subst.shallow(&bt) {
             Ty::Named(class) => match self.field(&class, name) {
                 Some((ty, ..)) => ty,
+                None => self.error(Code::unknown_field, span),
+            },
+            Ty::Record(names, fields) => match record_field(&names, &fields, name) {
+                Some(ty) => ty,
                 None => self.error(Code::unknown_field, span),
             },
             Ty::Error => Ty::Error,
@@ -1441,17 +1612,78 @@ impl Checker {
         }
     }
 
+    fn spread_args<'a>(&mut self, args: &'a [Arg]) -> Option<Vec<(Option<String>, ArgSource<'a>)>> {
+        let mut out = Vec::new();
+        let mut known = true;
+        for (i, arg) in args.iter().enumerate() {
+            let ExprKind::Spread(inner) = &arg.value.kind else {
+                out.push((arg.name.clone(), ArgSource::Expr(&arg.value)));
+                continue;
+            };
+            let t = self.expr(inner, None);
+            if i > 0 {
+                self.error(Code::spread_not_first, arg.value.span);
+                known = false;
+                continue;
+            }
+            match self.subst.shallow(&t) {
+                Ty::Record(names, fields) => {
+                    for (k, ty) in fields.into_iter().enumerate() {
+                        out.push((names.get(k).cloned(), ArgSource::Spread(ty, arg.value.span)));
+                    }
+                }
+                Ty::Error => known = false,
+                _ => {
+                    self.error(Code::type_mismatch, inner.span);
+                    known = false;
+                }
+            }
+        }
+        if !known {
+            for (_, source) in out {
+                if let ArgSource::Expr(e) = source {
+                    self.expr(e, None);
+                }
+            }
+            return None;
+        }
+        Some(out)
+    }
+
+    fn check_arg(&mut self, source: &ArgSource, param: &Ty) {
+        match source {
+            ArgSource::Expr(e) => {
+                let t = self.expr(e, Some(param));
+                self.expect(e, &t, param);
+            }
+            ArgSource::Spread(t, span) => {
+                if !self.subst.unify(t, param) {
+                    let code = self.mismatch(t, param, Code::type_mismatch);
+                    self.error(code, *span);
+                }
+            }
+        }
+    }
+
+    fn skip_arg(&mut self, source: &ArgSource) {
+        if let ArgSource::Expr(e) = source {
+            self.expr(e, None);
+        }
+    }
+
     fn args_of(&mut self, args: &[Arg], span: Span, params: &[Ty]) -> bool {
-        if args.len() != params.len() || args.iter().any(|a| a.name.is_some()) {
-            for a in args {
-                self.expr(&a.value, None);
+        let Some(sources) = self.spread_args(args) else {
+            return false;
+        };
+        if sources.len() != params.len() || sources.iter().any(|(name, _)| name.is_some()) {
+            for (_, source) in &sources {
+                self.skip_arg(source);
             }
             self.error(Code::wrong_arguments, span);
             return false;
         }
-        for (arg, param) in args.iter().zip(params) {
-            let t = self.expr(&arg.value, Some(param));
-            self.expect(&arg.value, &t, param);
+        for ((_, source), param) in sources.iter().zip(params) {
+            self.check_arg(source, param);
         }
         true
     }
@@ -1549,8 +1781,15 @@ impl Checker {
     }
 
     fn match_args(&mut self, params: &[ParamSig], args: &[Arg], span: Span) {
+        let Some(sources) = self.spread_args(args) else {
+            return;
+        };
         let mut filled = vec![false; params.len()];
-        let positional: Vec<&Arg> = args.iter().filter(|a| a.name.is_none()).collect();
+        let positional: Vec<&ArgSource> = sources
+            .iter()
+            .filter(|(name, _)| name.is_none())
+            .map(|(_, source)| source)
+            .collect();
         let fixed: Vec<usize> = params
             .iter()
             .enumerate()
@@ -1559,30 +1798,32 @@ impl Checker {
             .collect();
         let rest = params.iter().position(|p| p.is_rest);
         let mut ok = true;
-        for (k, arg) in positional.iter().enumerate() {
+        for (k, source) in positional.into_iter().enumerate() {
             if let Some(&i) = fixed.get(k) {
                 filled[i] = true;
-                let t = self.expr(&arg.value, Some(&params[i].ty));
-                self.expect(&arg.value, &t, &params[i].ty);
+                self.check_arg(source, &params[i].ty);
             } else if let Some(r) = rest {
                 filled[r] = true;
-                let t = self.expr(&arg.value, Some(&params[r].ty));
-                self.expect(&arg.value, &t, &params[r].ty);
+                self.check_arg(source, &params[r].ty);
             } else {
-                self.expr(&arg.value, None);
+                self.skip_arg(source);
                 ok = false;
             }
         }
-        for arg in args.iter().filter(|a| a.name.is_some()) {
-            let arg_name = arg.name.as_deref().unwrap_or_default();
-            match params.iter().position(|p| p.name == arg_name && !p.is_rest) {
+        for (name, source) in &sources {
+            let Some(arg_name) = name else {
+                continue;
+            };
+            match params
+                .iter()
+                .position(|p| &p.name == arg_name && !p.is_rest)
+            {
                 Some(i) if !filled[i] => {
                     filled[i] = true;
-                    let t = self.expr(&arg.value, Some(&params[i].ty));
-                    self.expect(&arg.value, &t, &params[i].ty);
+                    self.check_arg(source, &params[i].ty);
                 }
                 _ => {
-                    self.expr(&arg.value, None);
+                    self.skip_arg(source);
                     ok = false;
                 }
             }
@@ -1850,13 +2091,9 @@ impl Checker {
         let rows = arms
             .iter()
             .filter(|a| a.guard.is_none())
-            .map(|a| vec![&a.pattern])
+            .map(|a| vec![Cell::Pat(&a.pattern)])
             .collect();
-        if let Some(witness) = self.missing_case(rows, &[st]) {
-            let mut d = Diagnostic::error(Code::non_exhaustive_match, scrutinee.span);
-            d.detail = witness.into_iter().next();
-            self.diags.push(d);
-        }
+        self.report_missing(rows, &st, scrutinee.span);
         let mut target = Ty::Never;
         for (_, t) in &bodies {
             target = match (self.subst.shallow(&target), self.subst.shallow(t)) {
@@ -1929,6 +2166,13 @@ impl Checker {
                     }
                 }
             }
+            PatternKind::Variant(None, name, args) if self.class(name).is_some() => {
+                if !self.subst.unify(ty, &Ty::Named(name.clone())) {
+                    self.error(Code::type_mismatch, pat.span);
+                    return;
+                }
+                self.class_pattern(name, args, pat.span, binds);
+            }
             PatternKind::Variant(qualifier, name, args) => {
                 let enum_name = match (qualifier, self.subst.shallow(ty)) {
                     (Some(q), t) => {
@@ -1992,7 +2236,93 @@ impl Checker {
                     binds.push(bind);
                 }
             }
+            PatternKind::Record(items) => match self.subst.shallow(ty) {
+                Ty::Record(_, fields) => self.positional_patterns(items, &fields, pat.span, binds),
+                Ty::Named(class) if self.rest_field(&class).is_some() => {
+                    self.error(Code::wrong_arguments, pat.span);
+                }
+                Ty::Named(class) if self.class(&class).is_some() => {
+                    self.class_pattern(&class, items, pat.span, binds);
+                }
+                Ty::Error => {}
+                Ty::Var(_) => {
+                    self.error(Code::type_needed, pat.span);
+                }
+                _ => {
+                    self.error(Code::type_mismatch, pat.span);
+                }
+            },
+            PatternKind::List(items) => {
+                let elem = self.subst.fresh();
+                if !self.subst.unify(ty, &Ty::list(elem.clone())) {
+                    self.error(Code::type_mismatch, pat.span);
+                    return;
+                }
+                self.list_pattern(items, &elem, binds);
+            }
+            PatternKind::Rest(_) => {
+                self.error(Code::wrong_arguments, pat.span);
+            }
         }
+    }
+
+    fn class_pattern(
+        &mut self,
+        class: &str,
+        items: &[Pattern],
+        span: Span,
+        binds: &mut Vec<Binding>,
+    ) {
+        let fields = self
+            .class(class)
+            .map(|c| c.fields.clone())
+            .unwrap_or_default();
+        let tys: Vec<Ty> = fields.iter().map(|f| f.ty.clone()).collect();
+        match fields.iter().position(|f| f.is_rest) {
+            Some(r) if items.len() >= r => {
+                self.positional_patterns(&items[..r], &tys[..r], span, binds);
+                self.list_pattern(&items[r..], &tys[r], binds);
+            }
+            Some(_) => {
+                self.error(Code::wrong_arguments, span);
+            }
+            None => self.positional_patterns(items, &tys, span, binds),
+        }
+    }
+
+    fn positional_patterns(
+        &mut self,
+        items: &[Pattern],
+        tys: &[Ty],
+        span: Span,
+        binds: &mut Vec<Binding>,
+    ) {
+        if items.len() != tys.len() {
+            self.error(Code::wrong_arguments, span);
+            return;
+        }
+        for (item, ty) in items.iter().zip(tys) {
+            self.pattern(item, ty, binds);
+        }
+    }
+
+    fn list_pattern(&mut self, items: &[Pattern], elem: &Ty, binds: &mut Vec<Binding>) {
+        for item in items {
+            match &item.kind {
+                PatternKind::Rest(name) if name == "_" => {}
+                PatternKind::Rest(name) if binds.iter().any(|b| &b.0 == name) => {
+                    self.error(Code::duplicate_name, item.span);
+                }
+                PatternKind::Rest(name) => {
+                    binds.push((name.clone(), item.span, Ty::list(elem.clone())));
+                }
+                _ => self.pattern(item, elem, binds),
+            }
+        }
+    }
+
+    fn rest_field(&self, class: &str) -> Option<usize> {
+        self.class(class)?.fields.iter().position(|f| f.is_rest)
     }
 
     fn constructors(&self, ty: &Ty) -> Option<Vec<(String, Vec<Ty>)>> {
@@ -2005,6 +2335,7 @@ impl Checker {
                 ("Some".to_string(), vec![*inner]),
                 ("None".to_string(), Vec::new()),
             ]),
+            Ty::Record(_, fields) => Some(vec![(String::new(), fields)]),
             Ty::Named(e) => match self.types.get(&e) {
                 Some(TypeDef::Enum(vs)) => Some(
                     vs.iter()
@@ -2016,7 +2347,18 @@ impl Checker {
                         })
                         .collect(),
                 ),
-                _ => None,
+                Some(TypeDef::Class(c)) => {
+                    let mut fields = Vec::new();
+                    for f in &c.fields {
+                        if f.is_rest {
+                            fields.push(Ty::list(f.ty.clone()));
+                            break;
+                        }
+                        fields.push(f.ty.clone());
+                    }
+                    Some(vec![(e, fields)])
+                }
+                None => None,
             },
             _ => None,
         }
@@ -2026,34 +2368,104 @@ impl Checker {
         match &pat.kind {
             PatternKind::Wildcard => true,
             PatternKind::Name(_) => !self.info.variant_patterns.contains(&pat.id),
+            PatternKind::Record(items) => items.iter().all(|p| self.irrefutable(p)),
+            PatternKind::Variant(None, name, items) if self.class(name).is_some() => self
+                .class_cells(name, items)
+                .iter()
+                .all(|c| self.irrefutable_cell(*c)),
             _ => false,
         }
     }
 
-    fn missing_case(&self, rows: Vec<Vec<&Pattern>>, tys: &[Ty]) -> Option<Vec<String>> {
+    fn irrefutable_cell(&self, cell: Cell) -> bool {
+        match cell {
+            Cell::Pat(p) => self.irrefutable(p),
+            Cell::Items(items) => matches!(items, [p] if matches!(p.kind, PatternKind::Rest(_))),
+        }
+    }
+
+    fn class_cells<'p>(&self, class: &str, items: &'p [Pattern]) -> Vec<Cell<'p>> {
+        match self.rest_field(class) {
+            Some(r) if items.len() >= r => {
+                let mut cells: Vec<Cell> = items[..r].iter().map(Cell::Pat).collect();
+                cells.push(Cell::Items(&items[r..]));
+                cells
+            }
+            _ => items.iter().map(Cell::Pat).collect(),
+        }
+    }
+
+    fn specialize<'p>(&self, head: Cell<'p>, name: &str, arity: usize) -> Option<Vec<Cell<'p>>> {
+        if self.irrefutable_cell(head) {
+            return Some(vec![Cell::Pat(&WILDCARD); arity]);
+        }
+        let Cell::Pat(p) = head else {
+            return None;
+        };
+        let cells = match &p.kind {
+            PatternKind::Variant(_, n, args) if *n == name => self.class_cells(n, args),
+            PatternKind::Record(items) => items.iter().map(Cell::Pat).collect(),
+            PatternKind::Name(n) if *n == name => Vec::new(),
+            PatternKind::Literal(lit) if matches!(lit.kind, ExprKind::Bool(b) if b.to_string() == name) => {
+                Vec::new()
+            }
+            _ => return None,
+        };
+        if cells.len() != arity {
+            return Some(vec![Cell::Pat(&WILDCARD); arity]);
+        }
+        Some(cells)
+    }
+
+    fn head_cell(p: &Pattern) -> Cell<'_> {
+        match &p.kind {
+            PatternKind::List(items) => Cell::Items(items),
+            _ => Cell::Pat(p),
+        }
+    }
+
+    fn report_missing(&mut self, rows: Vec<Vec<Cell>>, ty: &Ty, span: Span) {
+        if let Some(witness) = self.missing_case(rows, std::slice::from_ref(ty)) {
+            let mut d = Diagnostic::error(Code::non_exhaustive_match, span);
+            d.detail = witness.into_iter().next();
+            self.diags.push(d);
+        }
+    }
+
+    fn missing_case(&self, rows: Vec<Vec<Cell>>, tys: &[Ty]) -> Option<Vec<String>> {
         let Some((ty, rest_tys)) = tys.split_first() else {
             return rows.is_empty().then(Vec::new);
         };
         let mut expanded = Vec::new();
         for row in rows {
-            match &row[0].kind {
-                PatternKind::Or(alts) => {
+            match row[0] {
+                Cell::Pat(Pattern {
+                    kind: PatternKind::Or(alts),
+                    ..
+                }) => {
                     for alt in alts {
-                        let mut r = vec![alt];
+                        let mut r = vec![Self::head_cell(alt)];
                         r.extend(&row[1..]);
                         expanded.push(r);
                     }
                 }
+                Cell::Pat(p) => {
+                    let mut r = vec![Self::head_cell(p)];
+                    r.extend(&row[1..]);
+                    expanded.push(r);
+                }
                 _ => expanded.push(row),
             }
         }
-        if matches!(self.subst.shallow(ty), Ty::Error) {
-            return None;
+        match self.subst.shallow(ty) {
+            Ty::Error => return None,
+            Ty::List(elem) => return self.missing_list_case(expanded, &elem, rest_tys),
+            _ => {}
         }
         let Some(ctors) = self.constructors(ty) else {
             let rest = expanded
                 .into_iter()
-                .filter(|r| self.irrefutable(r[0]))
+                .filter(|r| self.irrefutable_cell(r[0]))
                 .map(|r| r[1..].to_vec())
                 .collect();
             return self.missing_case(rest, rest_tys).map(|mut w| {
@@ -2066,21 +2478,7 @@ impl Checker {
             let specialized = expanded
                 .iter()
                 .filter_map(|row| {
-                    let head = row[0];
-                    let mut sub: Vec<&Pattern> = if self.irrefutable(head) {
-                        vec![&WILDCARD; arity]
-                    } else {
-                        match &head.kind {
-                            PatternKind::Variant(_, n, args) if *n == name => args.iter().collect(),
-                            PatternKind::Name(n) if *n == name => Vec::new(),
-                            PatternKind::Literal(lit)
-                                if matches!(lit.kind, ExprKind::Bool(b) if b.to_string() == name) =>
-                            {
-                                Vec::new()
-                            }
-                            _ => return None,
-                        }
-                    };
+                    let mut sub = self.specialize(row[0], &name, arity)?;
                     sub.extend(&row[1..]);
                     Some(sub)
                 })
@@ -2095,6 +2493,70 @@ impl Checker {
                     format!("{name}({})", w.join(", "))
                 };
                 let mut out = vec![head];
+                out.extend(rest);
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    fn missing_list_case(
+        &self,
+        rows: Vec<Vec<Cell>>,
+        elem: &Ty,
+        rest_tys: &[Ty],
+    ) -> Option<Vec<String>> {
+        let fixed_len = |items: &[Pattern]| {
+            items
+                .iter()
+                .filter(|p| !matches!(p.kind, PatternKind::Rest(_)))
+                .count()
+        };
+        let longest = rows
+            .iter()
+            .filter_map(|r| match r[0] {
+                Cell::Items(items) => Some(fixed_len(items)),
+                Cell::Pat(_) => None,
+            })
+            .max()
+            .unwrap_or(0);
+        for len in 0..=longest + 1 {
+            let specialized = rows
+                .iter()
+                .filter_map(|row| {
+                    let mut sub: Vec<Cell> = match row[0] {
+                        head if self.irrefutable_cell(head) => vec![Cell::Pat(&WILDCARD); len],
+                        Cell::Items(items) => {
+                            let fixed = fixed_len(items);
+                            match items
+                                .iter()
+                                .position(|p| matches!(p.kind, PatternKind::Rest(_)))
+                            {
+                                Some(k) if len >= fixed => {
+                                    let mut sub: Vec<Cell> =
+                                        items[..k].iter().map(Cell::Pat).collect();
+                                    sub.extend(vec![Cell::Pat(&WILDCARD); len - fixed]);
+                                    sub.extend(items[k + 1..].iter().map(Cell::Pat));
+                                    sub
+                                }
+                                None if items.len() == len => items.iter().map(Cell::Pat).collect(),
+                                _ => return None,
+                            }
+                        }
+                        Cell::Pat(_) => return None,
+                    };
+                    sub.extend(&row[1..]);
+                    Some(sub)
+                })
+                .collect();
+            let mut sub_tys = vec![elem.clone(); len];
+            sub_tys.extend_from_slice(rest_tys);
+            if let Some(mut w) = self.missing_case(specialized, &sub_tys) {
+                let rest = w.split_off(len);
+                if len > longest {
+                    w.push("...".to_string());
+                }
+                let mut out = vec![format!("[{}]", w.join(", "))];
                 out.extend(rest);
                 return Some(out);
             }
@@ -2132,7 +2594,7 @@ impl Checker {
         }
     }
 
-    fn for_loop(&mut self, id: NodeId, name: &str, span: Span, iter: &Expr, body: &Expr) -> Ty {
+    fn for_loop(&mut self, id: NodeId, pattern: &Pattern, iter: &Expr, body: &Expr) -> Ty {
         let it = self.expr(iter, None);
         let elem = match self.subst.shallow(&it) {
             Ty::Range => Ty::Int,
@@ -2140,23 +2602,24 @@ impl Checker {
             Ty::Error => Ty::Error,
             _ => self.error(Code::not_iterable, iter.span),
         };
-        let narrowed_list = narrowing_list(iter).filter(|list| !mutates(body, list));
-        if let Some(list) = &narrowed_list {
-            self.narrowed.push((list.clone(), name.to_string()));
+        let mut binds = Vec::new();
+        self.pattern(pattern, &elem, &mut binds);
+        self.report_missing(vec![vec![Cell::Pat(pattern)]], &elem, pattern.span);
+        let narrowed_list = match &pattern.kind {
+            PatternKind::Name(name) => narrowing_list(iter)
+                .filter(|list| !mutates(body, list))
+                .map(|list| (list, name.clone())),
+            _ => None,
+        };
+        if let Some(narrowed) = &narrowed_list {
+            self.narrowed.push(narrowed.clone());
         }
-        let mut scope = HashMap::new();
-        scope.insert(
-            name.to_string(),
-            Var {
-                ty: elem,
-                mutable: false,
-                kind: VarKind::Local,
-                span,
-                reassigned: false,
-                list_len: None,
-            },
+        self.scopes.push(
+            binds
+                .into_iter()
+                .map(|(name, span, ty)| (name, Var::binding(ty, span)))
+                .collect(),
         );
-        self.scopes.push(scope);
         let ty = self.valued_loop(id, body);
         self.scopes.pop();
         if narrowed_list.is_some() {
@@ -2164,6 +2627,15 @@ impl Checker {
         }
         ty
     }
+}
+
+fn record_field(names: &[String], fields: &[Ty], name: &str) -> Option<Ty> {
+    let i = if names.is_empty() {
+        name.parse().ok()?
+    } else {
+        names.iter().position(|n| n == name)?
+    };
+    fields.get(i).cloned()
 }
 
 fn narrowing_list(iter: &Expr) -> Option<String> {
@@ -2198,18 +2670,20 @@ fn mutates(expr: &Expr, list: &str) -> bool {
             Stmt::Assign { target, value, .. } => is_list(target) || mutates(value, list),
             Stmt::Let { value, .. } => mutates(value, list),
             Stmt::Expr(e) => mutates(e, list),
-            Stmt::LetElse { value, .. } => mutates(value, list),
+            Stmt::LetPattern { value, .. } => mutates(value, list),
             Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) => false,
         }),
         ExprKind::Str(segs) => segs
             .iter()
             .any(|s| matches!(s, StrSeg::Expr(e) if mutates(e, list))),
         ExprKind::List(items) => items.iter().any(|e| mutates(e, list)),
+        ExprKind::Record(args) => args.iter().any(|a| mutates(&a.value, list)),
         ExprKind::Unary(_, e)
         | ExprKind::Loop(e)
         | ExprKind::Lambda(_, _, e)
         | ExprKind::Field(e, _)
-        | ExprKind::Is(e, _) => mutates(e, list),
+        | ExprKind::Is(e, _)
+        | ExprKind::Spread(e) => mutates(e, list),
         ExprKind::Match(s, arms) => {
             mutates(s, list)
                 || arms.iter().any(|a| {
@@ -2219,7 +2693,7 @@ fn mutates(expr: &Expr, list: &str) -> bool {
         ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
         | ExprKind::While(a, b)
-        | ExprKind::For(_, _, a, b) => mutates(a, list) || mutates(b, list),
+        | ExprKind::For(_, a, b) => mutates(a, list) || mutates(b, list),
         ExprKind::Call(f, args) => mutates(f, list) || args.iter().any(|a| mutates(&a.value, list)),
         ExprKind::If(c, t, o) => {
             mutates(c, list) || mutates(t, list) || o.as_ref().is_some_and(|o| mutates(o, list))

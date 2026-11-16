@@ -187,6 +187,11 @@ impl Parser<'_> {
                 let span = self.span();
                 self.diags
                     .push(Diagnostic::error(Code::unexpected_token, span));
+                // recover() stops at a closing bracket, so a stray one has to be skipped
+                // here or the caller's loop never moves past it.
+                if matches!(self.peek(), Tok::Sym(")" | "]" | "}")) {
+                    self.advance();
+                }
                 self.recover();
             }
         }
@@ -209,8 +214,11 @@ impl Parser<'_> {
         if self.is_type_decl() {
             return Ok(Stmt::Class(self.class_decl()?));
         }
-        if self.is_kw("let") && !matches!(self.peek_at(2), Tok::Sym("=" | ":")) {
-            return self.let_else();
+        if (self.is_kw("let") || self.is_kw("var"))
+            && !(matches!(self.peek_at(1), Tok::Ident(_))
+                && matches!(self.peek_at(2), Tok::Sym("=" | ":")))
+        {
+            return self.let_pattern();
         }
         if self.is_kw("let") || self.is_kw("var") {
             return self.let_stmt();
@@ -259,18 +267,21 @@ impl Parser<'_> {
         })
     }
 
-    fn let_else(&mut self) -> PResult<Stmt> {
+    fn let_pattern(&mut self) -> PResult<Stmt> {
+        let is_var = self.is_kw("var");
         let start = self.advance().span;
         let pattern = self.pattern()?;
         self.expect_sym("=")?;
         let value = self.expr()?;
-        if !self.eat_kw("else") {
-            return self.error(Code::unexpected_token, self.span());
-        }
-        let otherwise = self.block()?;
-        Ok(Stmt::LetElse {
-            span: start.to(otherwise.span),
+        let otherwise = if self.eat_kw("else") {
+            Some(self.block()?)
+        } else {
+            None
+        };
+        Ok(Stmt::LetPattern {
+            span: start.to(self.prev_span()),
             pattern,
+            is_var,
             value,
             otherwise,
         })
@@ -512,17 +523,24 @@ impl Parser<'_> {
                     (None, name)
                 };
                 if self.eat_sym("(") {
-                    let mut args = Vec::new();
-                    self.list_items(")", |p| {
-                        args.push(p.pattern()?);
-                        Ok(())
-                    })?;
-                    PatternKind::Variant(qualifier, name, args)
+                    PatternKind::Variant(qualifier, name, self.pattern_items(")", true)?)
                 } else if qualifier.is_some() {
                     PatternKind::Variant(qualifier, name, Vec::new())
                 } else {
                     PatternKind::Name(name)
                 }
+            }
+            Tok::Sym("(") => {
+                self.advance();
+                let mut items = self.pattern_items(")", false)?;
+                if items.len() == 1 {
+                    return Ok(items.remove(0));
+                }
+                PatternKind::Record(items)
+            }
+            Tok::Sym("[") => {
+                self.advance();
+                PatternKind::List(self.pattern_items("]", true)?)
             }
             _ => {
                 let low = Box::new(self.literal_pattern()?);
@@ -540,6 +558,27 @@ impl Parser<'_> {
             span: start.to(self.prev_span()),
             kind,
         })
+    }
+
+    fn pattern_items(&mut self, close: &str, allow_rest: bool) -> PResult<Vec<Pattern>> {
+        let mut items = Vec::new();
+        let mut has_rest = false;
+        self.list_items(close, |p| {
+            let start = p.span();
+            if allow_rest && !has_rest && p.eat_sym("...") {
+                has_rest = true;
+                let (name, _) = p.ident()?;
+                items.push(Pattern {
+                    id: p.id(),
+                    span: start.to(p.prev_span()),
+                    kind: PatternKind::Rest(name),
+                });
+            } else {
+                items.push(p.pattern()?);
+            }
+            Ok(())
+        })?;
+        Ok(items)
     }
 
     fn literal_pattern(&mut self) -> PResult<Expr> {
@@ -695,6 +734,7 @@ impl Parser<'_> {
     }
 
     fn type_expr(&mut self) -> PResult<TypeExpr> {
+        let start = self.span();
         let mut ty = if self.eat_kw("func") {
             self.expect_sym("(")?;
             let mut params = Vec::new();
@@ -708,6 +748,27 @@ impl Parser<'_> {
                 None
             };
             TypeExpr::Func(params, ret)
+        } else if self.is_sym("(") {
+            let start = self.advance().span;
+            let mut names = Vec::new();
+            let mut types = Vec::new();
+            self.list_items(")", |p| {
+                if matches!(p.peek_at(1), Tok::Sym(":")) {
+                    names.push(p.field_name()?.0);
+                    p.advance();
+                }
+                types.push(p.type_expr()?);
+                Ok(())
+            })?;
+            let span = start.to(self.prev_span());
+            if !names.is_empty() && names.len() != types.len() {
+                self.diags.push(Diagnostic::error(Code::mixed_fields, span));
+            }
+            if names.is_empty() && types.len() == 1 {
+                types.remove(0)
+            } else {
+                TypeExpr::Record(names, types, span)
+            }
         } else {
             let (name, span) = self.ident()?;
             if self.eat_sym("<") {
@@ -721,10 +782,17 @@ impl Parser<'_> {
                 TypeExpr::Name(name, span)
             }
         };
-        while self.eat_sym("?") {
-            ty = TypeExpr::Maybe(Box::new(ty));
+        loop {
+            if self.eat_sym("?") {
+                ty = TypeExpr::Maybe(Box::new(ty));
+            } else if self.is_sym("[") && matches!(self.peek_at(1), Tok::Sym("]")) {
+                self.advance();
+                self.advance();
+                ty = TypeExpr::Generic("List".to_string(), vec![ty], start.to(self.prev_span()));
+            } else {
+                return Ok(ty);
+            }
         }
-        Ok(ty)
     }
 
     fn block(&mut self) -> PResult<Expr> {
@@ -972,10 +1040,14 @@ impl Parser<'_> {
                 }
                 _ => None,
             };
-            args.push(Arg {
-                name,
-                value: p.expr()?,
-            });
+            let start = p.span();
+            let value = if name.is_none() && p.eat_sym("...") {
+                let inner = p.expr()?;
+                p.expr_node(start.to(inner.span), ExprKind::Spread(Box::new(inner)))
+            } else {
+                p.expr()?
+            };
+            args.push(Arg { name, value });
             Ok(())
         })?;
         Ok(args)
@@ -989,7 +1061,13 @@ impl Parser<'_> {
                 let span = expr.span.to(self.prev_span());
                 expr = self.expr_node(span, ExprKind::Call(Box::new(expr), args));
             } else if self.eat_sym(".") {
-                let (name, _) = self.field_name()?;
+                let name = match self.peek().clone() {
+                    Tok::Int(n) => {
+                        self.advance();
+                        n.to_string()
+                    }
+                    _ => self.field_name()?.0,
+                };
                 if !self.eat_sym("(") {
                     let span = expr.span.to(self.prev_span());
                     expr = self.expr_node(span, ExprKind::Field(Box::new(expr), name));
@@ -1031,11 +1109,14 @@ impl Parser<'_> {
             Tok::Ident(name) => ExprKind::Name(name),
             Tok::Str(parts) => ExprKind::Str(self.string_parts(parts)?),
             Tok::Sym("(") => {
-                self.skip_newlines();
-                let inner = self.expr()?;
-                self.skip_newlines();
-                self.expect_sym(")")?;
-                return Ok(inner);
+                let mut args = self.args()?;
+                let span = span.to(self.prev_span());
+                if let [Arg { name: None, value }] = args.as_slice()
+                    && !matches!(value.kind, ExprKind::Spread(_))
+                {
+                    return Ok(args.remove(0).value);
+                }
+                return Ok(self.expr_node(span, ExprKind::Record(args)));
             }
             Tok::Sym("[") => {
                 let mut items = Vec::new();
@@ -1079,7 +1160,7 @@ impl Parser<'_> {
                 return Ok(self.expr_node(span.to(body.span), ExprKind::Loop(Box::new(body))));
             }
             Tok::Kw("for") => {
-                let (name, name_span) = self.ident()?;
+                let pattern = self.pattern()?;
                 if !self.eat_kw("in") {
                     return self.error(Code::unexpected_token, self.span());
                 }
@@ -1087,7 +1168,7 @@ impl Parser<'_> {
                 let body = self.block()?;
                 return Ok(self.expr_node(
                     span.to(body.span),
-                    ExprKind::For(name, name_span, Box::new(iter), Box::new(body)),
+                    ExprKind::For(pattern, Box::new(iter), Box::new(body)),
                 ));
             }
             Tok::Kw("break" | "continue" | "return") => {
