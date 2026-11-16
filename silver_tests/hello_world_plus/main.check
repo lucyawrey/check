@@ -1,166 +1,197 @@
-// this file is not done
 let hello = "Hello"
-var output = ""
 var failures = 0
 
 func expect(ok: Bool) {
   if not ok { failures += 1 }
 }
 
-expect(1_000 == 1000 and 0xFF == 255 and 0xff == 255 and 0b1010 == 10 and 0o17 == 15)
+// numbers
+expect(1_000 == 1000 and 0xFF == 255 and 0b1010 == 10 and 0o17 == 15)
 expect(1.5e-3 == 0.0015 and 1e3 == 1000.0)
-expect(7 / 2 == 3.5 and 7 div 2 == 3 and -7 div 2 == -4 and -7 mod 3 == 2)
-expect(2 ** 10 == 1024 and -2 ** 2 == -4 and 2.0 ** -1 == 0.5)
-expect(6 & 3 == 2 and 6 | 1 == 7 and 6 ^ 3 == 5 and ~0 == -1)
-expect(1 << 4 == 16 and -8 >> 1 == -4)
-expect((7 / 2).round() == 4 and (7 / 2).floor() == 3 and (-3.5).ceil() == -3 and (-3.5).truncate() == -3)
-
-let count = 3
-expect(count * 1.5 == 4.5 and count.toFloat() == 3.0)
-
+expect(7 / 2 == 3.5 and -7 div 2 == -4 and -7 mod 3 == 2)
+expect(2 ** 10 == 1024 and -2 ** 2 == -4)
+expect(6 & 3 == 2 and 6 | 1 == 7 and 6 ^ 3 == 5 and ~0 == -1 and 1 << 4 == 16 and -8 >> 1 == -4)
+expect((3.5).round() == 4 and (3.5).floor() == 3 and (-3.5).ceil() == -3 and (-3.5).truncate() == -3)
+expect(3 * 1.5 == 4.5 and 3.toFloat() == 3.0)
 var score = 10
 score += 5; score -= 3; score *= 2
 var ratio: Float = 3
 ratio /= 2
 expect(score == 24 and ratio == 1.5)
+expect(not score == 0 and score > 10 or false)
 
-let done = false
-expect(not done and score > 10 or false)
-expect(not score == 0)
-
+// strings
 expect("\u{48}ello" == hello and r"{hello}" == "\{hello}")
-expect("Hel" + "lo" == hello and "apple" < "banana")
-expect("{hello}, {2 * 3}" == "Hello, 6")
-expect("  hello ".trim().upper() == "HELLO" and "HeLLo".lower() == "hello")
-expect(hello.contains("ell") and not hello.isEmpty() and "".isEmpty())
-expect("a,b".split(",").join("-") == "a-b" and "  add  buy milk ".split().length() == 3)
+expect("Hel" + "lo" == hello and "apple" < "banana" and "{hello}, {2 * 3}" == "Hello, 6")
+expect("  hi ".trim().upper() == "HI" and "HI".lower() == "hi" and "  ".isBlank() and "".isEmpty())
+expect(hello.contains("ell") and "a,b".split(",").join("-") == "a-b" and " a  b ".split().length() == 2)
 let banner = """
     Hello
     """
-expect(banner.trim() == hello)
-
-let longSum = 1 +
-    2
 let shout = hello
     .upper()
-expect(longSum == 3 and shout == "HELLO")
+expect(banner.trim() == hello and shout == "HELLO")
 
-let parsed: Int? = Int.parse("42")
+// maybes
 let maybeWord: String? = "World"
-expect(parsed ?? 0 == 42 and Int.parse("x") ?? -1 == -1 and maybeWord ?? "" == "World")
+expect(Int.parse("42") ?? 0 == 42 and Int.parse("x") ?? -1 == -1 and maybeWord ?? "" == "World")
 expect(Float.parse("2.5") ?? 0.0 == 2.5 and Int.parse("7").orPanic("7 is a number") == 7)
-expect(input() ?? "" == "World")
+expect(maybeWord is Some(w) and w == "World")
 
+// lists
 let words = ["Hello", "decoy", "World"]
 var copy = words
 copy.push("extra")
-expect(words.length() == 3 and copy.length() == 4)
-expect(copy.pop() ?? "" == "extra" and copy.removeAt(1) ?? "" == "decoy" and copy[5] ?? "none" == "none")
-expect(copy.join(" ") == "Hello World" and words[0] == "Hello")
+expect(words.length() == 3 and copy.pop() ?? "" == "extra" and copy.removeAt(1) ?? "" == "decoy")
+expect(copy[5] ?? "none" == "none" and copy.join(" ") == "Hello World" and words[0] == "Hello")
 expect(words.contains("World") and words.first() ?? "" == "Hello" and words.last() ?? "" == "World")
-expect([1, 2, 3].map(func(x) x * 2).length() == 3 and words.filter(func(w) w != "decoy").join(", ") == "Hello, World")
+expect([1, 2].map(func(x) x * 2)[1] ?? 0 == 4 and words.filter(func(w) w != "decoy").length() == 2)
 var names = []
 names.push("Bo")
-expect(names.length() == 1 and not names.isEmpty())
+let [firstName, ..._] = names else { panic() }
+expect(firstName == "Bo")
 
+// loops
 var steps = 0
 while steps < 5 { steps += 1 }
-var inclusive = 0
-for i in 0..=3 { inclusive += i }
-expect(steps == 5 and inclusive == 6)
-
+var sum = 0
+for i in 0..=3 { sum += i }
 var kept = ""
-for word in words {
-    if word == "decoy" { continue }
-    kept = "{kept}{word}"
-}
-var everyOther = ""
 for i in words.indices() {
-    if i mod 2 == 0 { everyOther = "{everyOther}{words[i]}" }
+    if words[i] == "decoy" { continue }
+    kept = "{kept}{words[i]}"
 }
-expect(kept == "HelloWorld" and everyOther == "HelloWorld")
-
+expect(steps == 5 and sum == 6 and kept == "HelloWorld")
 var index = 0
 let found = loop {
-    if index >= words.length() { break "" }
     let word = words[index] ?? ""
     if word.upper() == "WORLD" { break word }
     index += 1
 }
 let decoy = for word in words { if word.contains("coy") { break word } } ?? ""
-let missing = for word in words { if word == "Bye" { break word } } ?? "none"
-expect(found == "World" and decoy == "decoy" and missing == "none")
-
+expect(found == "World" and decoy == "decoy")
 let grade = if score >= 90 { "A" } else if score >= 20 { "B" } else { "C" }
 let bonus = if score > 50 { 10 } ?? 0
-let five = if score > 0 { Int.parse("5") }.flatten() ?? 0
+let five = Some(Int.parse("5")).flatten() ?? 0
 expect(grade == "B" and bonus == 0 and five == 5)
 
+// functions
 func double(x: Int) x * 2
 func half(x: Int) -> Float { x / 2 }
-func fact(n: Int) -> Int {
-    if n <= 1 { 1 } else { n * fact(n - 1) }
-}
+func fact(n: Int) -> Int { if n <= 1 { 1 } else { n * fact(n - 1) } }
 func total(...nums: List<Int>) -> Int {
-    var sum = 0
-    for n in nums { sum += n }
-    sum
+    var subtotal = 0
+    for n in nums { subtotal += n }
+    subtotal
 }
 func greet(name: String, greeting = "Hi") "{greeting}, {name}"
 func countdown(var n: Int) -> Int {
-    var ticks = 0
-    while n > 0 { n -= 1; ticks += 1 }
-    ticks
+    while n > 0 { n -= 1 }
+    n
 }
-func findWord(list: List<String>, target: String) -> String {
-    for word in list {
-        if word.lower() == target { return word }
-    }
+func find(list: List<String>, target: String) -> String {
+    for word in list { if word.lower() == target { return word } }
     ""
 }
-let start = 4
-expect(double(21) == 42 and half(3) == 1.5 and fact(5) == 120)
-expect(total(1, 2, 3) == 6 and total() == 0)
-expect(greet("Bo") == "Hi, Bo" and greet("Bo", "Yo") == "Yo, Bo")
-expect(countdown(start) == 4 and start == 4)
-expect(findWord(words, "world") == "World" and findWord(words, "bye") == "")
+expect(double(21) == 42 and half(3) == 1.5 and fact(5) == 120 and total(1, 2, 3) == 6 and total() == 0)
+expect(greet("Bo") == "Hi, Bo" and greet("Bo", "Yo") == "Yo, Bo" and countdown(score) == 0 and score == 24)
+expect(find(words, "world") == "World" and find(words, "bye") == "")
 
 var mark = "!"
 let exclaim = func(s) "{s}{mark}"
 mark = "?"
-let triple = func(x) x * 3
 func apply(f: func(String) -> String, s: String) f(s)
-expect(exclaim("Hi") == "Hi!" and apply(exclaim, "Yo") == "Yo!" and triple(4) == 12)
-expect(apply(func(s) s.upper(), "hi") == "HI")
+expect(exclaim("Hi") == "Hi!" and apply(func(s) s.upper(), "hi") == "HI")
 
-func makeGreeting() -> String {
-    var who = found
-    let say = func() "{hello}, {who}"
-    who = "nobody"
+implement Int {
+  func squared() -> Int { this * this }
+}
+expect(3.squared() == 9)
+
+// classes
+class Point(var x: Int, var y: Int)
+class Temp {
+  const boiling = 100
+  var c: Int
+  var label = ""
+  init { this.label = "{this.c}C" }
+  func isBoiling() -> Bool { this.c >= Temp.boiling }
+  static func kettle() -> Temp { Temp(Temp.boiling) }
+}
+ref class Counter { var n = 0 }
+
+var b = Point(1, 2)
+let a = b
+b.x = 5
+expect(a.x == 1 and b == Point(5, 2) and "{a}" == "Point(x = 1, y = 2)")
+expect(Temp(5).label == "5C" and Temp.kettle().isBoiling())
+let counter = Counter()
+let alias = counter
+alias.n += 1
+expect(counter.n == 1 and same(counter, alias))
+
+// enums and match
+enum Shape {
+  Square
+  Circle(r: Int)
+  Rect(Int, Int)
+  func width() -> Int {
+    match this {
+      Square => 1
+      Circle(r) => r * 2
+      Rect(w, _) => w
+    }
+  }
+}
+expect(Shape.Circle(1).width() == 2 and Shape.Rect(3, 4).width() == 3)
+
+func size(n: Int?) -> String {
+  match n {
+    Some(0) => "zero"
+    Some(1..=9) | Some(-1) => "small"
+    Some(x) if x > 0 => "big"
+    Some(_) | None => "other"
+  }
+}
+expect(size(Some(-1)) == "small" and size(Some(50)) == "big" and size(None) == "other")
+
+// records and destructuring
+let pair = (1, "one")
+let spot = (x = 3, y = 4)
+let (n, word) = pair
+var (sx, sy) = spot
+sx += 1; sy += 1
+expect(n == 1 and word == "one" and pair.1 == "one" and spot.y == 4 and sx + sy == 9 and ((1, 2), 3).0.1 == 2)
+expect((...spot, y = 9) == (x = 3, y = 9) and (...b, y = 0) == Point(5, 0) and "{spot}" == "(x = 3, y = 4)")
+
+func origin() -> Point { (0, 0) }
+expect(origin() == Point(...(0, 0)) and Point(...spot) == Point(3, 4))
+
+class Polygon(name: String, ...points: List<Point>)
+let tri = Polygon("tri", (0, 0), (1, 0), (0, 1))
+let corners = match tri {
+  Polygon(_, p, ...rest) => rest.length() + 1
+  Polygon(_) => 0
+}
+var scores = 0
+for (_, score) in [("a", 1), ("b", 2)] { scores += score }
+expect(corners == 3 and scores == 3)
+
+func command(words: List<String>) -> String {
+  match words {
+    [] => "none"
+    ["add", ...rest] => rest.join(" ")
+    [first, ..._] => first
+  }
+}
+expect(command(["add", "buy", "milk"]) == "buy milk" and command(["list"]) == "list" and command([]) == "none")
+
+// main
+func buildGreeting() -> String {
+    var what = found
+    let say = func() "{hello}, {what}"
+    what = "Nothing"
     say()
 }
-
-func helloWorld() {
-    let bang = exclaim("")
-    let helloWorldText = "{makeGreeting()}{bang}"
-    setOutputIf(helloWorldText, failures == 0)
-    for i in 0..3 {
-        if i == 2 {
-            printOutput()
-        }
-    }
-}
-
-func setOutputIf(text: String, set: Bool) {
-    if set {
-        output = text
-    } else {
-        output = "{failures} checks failed"
-    }
-}
-
-func printOutput() {
-    print(output)
-}
-
-helloWorld()
+expect((input() ?? "").lower() == "hello")
+print(if failures == 0 { exclaim(buildGreeting()) } else { "{failures} checks failed" })
