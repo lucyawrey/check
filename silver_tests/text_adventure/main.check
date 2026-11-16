@@ -1,11 +1,18 @@
-enum StoryLine {
-  
-}
+// var name = ref("")
 
-ref class Story {
-  script = StoryLine[]
-  position = 0
-}
+// let story = Story([
+//   Text("Welcome to Awakening Quest! Check's premier for-testing-purposes only text adventure.")
+//   Text("Have fun!")
+//   Pause
+//   Text("You awaken on soft grass, the sound of rushing water filling your ears.")
+//   Pause
+//   Text("Your eyes are too heavy to open, but you hear footsteps approach. Someone, probably a young woman, speaks:")
+//   Text("  Ah, so you're awake? Good.")
+//   Text("  Can you tell me your name?")
+//   Input(name)
+//   Text("  {state.name}? A strange name, but it will do.")
+//   Text("\nThat's all for now!")
+// ])
 
 func main() {
   print("Welcome to Awakening Quest! Check's premier for-testing-purposes only text adventure.")
@@ -22,5 +29,13 @@ func main() {
   }
   print("{name}? A strange name, but it will do.")
 }
+
+// enum StoryLine {
+//   Text(text: String)
+//   Pause
+//   Input(store: Ref<String>)
+// }
+
+// ref class Story(script: StoryLine[], position = 0)
 
 try main()
