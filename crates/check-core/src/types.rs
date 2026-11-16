@@ -13,6 +13,7 @@ pub enum Ty {
     Maybe(Box<Ty>),
     Func(Vec<Ty>, Box<Ty>),
     Named(String),
+    Record(Vec<String>, Vec<Ty>),
     Var(usize),
     Error,
 }
@@ -61,6 +62,9 @@ impl Subst {
                 params.iter().map(|p| self.resolve(p)).collect(),
                 Box::new(self.resolve(&ret)),
             ),
+            Ty::Record(names, fields) => {
+                Ty::Record(names, fields.iter().map(|f| self.resolve(f)).collect())
+            }
             other => other,
         }
     }
@@ -72,6 +76,7 @@ impl Subst {
             Ty::Func(params, ret) => {
                 params.iter().any(|p| self.occurs(v, p)) || self.occurs(v, &ret)
             }
+            Ty::Record(_, fields) => fields.iter().any(|f| self.occurs(v, f)),
             _ => false,
         }
     }
@@ -93,6 +98,9 @@ impl Subst {
                 p1.len() == p2.len()
                     && p1.iter().zip(p2).all(|(x, y)| self.unify(x, y))
                     && self.unify(r1, r2)
+            }
+            (Ty::Record(n1, f1), Ty::Record(n2, f2)) => {
+                n1 == n2 && f1.len() == f2.len() && f1.iter().zip(f2).all(|(x, y)| self.unify(x, y))
             }
             _ => a == b,
         }
@@ -127,6 +135,19 @@ impl fmt::Display for Show<'_> {
                     write!(f, " -> {}", Show(ret))?;
                 }
                 Ok(())
+            }
+            Ty::Record(names, fields) => {
+                f.write_str("(")?;
+                for (i, field) in fields.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    match names.get(i) {
+                        Some(name) => write!(f, "{name}: {}", Show(field))?,
+                        None => write!(f, "{}", Show(field))?,
+                    }
+                }
+                f.write_str(")")
             }
             Ty::Var(_) | Ty::Error => f.write_str("_"),
         }

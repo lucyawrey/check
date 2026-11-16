@@ -27,6 +27,8 @@ pub enum Flow {
 
 type Eval = Result<Value, Flow>;
 
+type ArgValue = (Option<Rc<str>>, Value);
+
 type Writer<'f> = &'f mut dyn FnMut(&mut Value) -> Result<(), Flow>;
 
 type Descent<'s> = Result<Option<(Rc<RefCell<Record>>, &'s [Step])>, Flow>;
@@ -289,6 +291,30 @@ impl Interpreter<'_> {
         }
     }
 
+    fn copy_with_changes(&mut self, original: &Expr, changes: &[Arg], span: Span) -> Eval {
+        let mut copy = self.expr(original)?;
+        let mut record = match &copy {
+            Value::Object(r) | Value::Record(r) => (**r).clone(),
+            Value::Shared(r) => r.borrow().clone(),
+            _ => return Ok(copy),
+        };
+        for change in changes {
+            let value = self.expr(&change.value)?;
+            let i = record.index(change.name.as_deref().unwrap_or_default());
+            record.fields[i] = value;
+        }
+        let class = self.classes.get(&*record.name).cloned();
+        copy = match &copy {
+            Value::Shared(_) => Value::Shared(Rc::new(RefCell::new(record))),
+            Value::Object(_) => Value::Object(Rc::new(record)),
+            _ => Value::Record(Rc::new(record)),
+        };
+        match class.as_ref().and_then(|c| c.init.as_ref()) {
+            Some(init) => self.run_init(init, copy, span),
+            None => Ok(copy),
+        }
+    }
+
     fn run_init(&mut self, init: &FuncDecl, this: Value, span: Span) -> Eval {
         let scope = HashMap::from([("this".to_string(), this)]);
         self.frames.push(Frame {
@@ -333,16 +359,25 @@ impl Interpreter<'_> {
             }
             PatternKind::Variant(_, name, args) => match v {
                 Value::Some(inner) if name == "Some" => self.matches(&args[0], inner, binds)?,
-                Value::Variant(r) if &*r.name == name => {
-                    for (arg, field) in args.iter().zip(&r.fields) {
-                        if !self.matches(arg, field, binds)? {
-                            return Ok(false);
-                        }
-                    }
-                    true
+                Value::Variant(r) if &*r.name == name => self.match_all(args, &r.fields, binds)?,
+                Value::Object(_) | Value::Shared(_) => {
+                    let (class, fields) = object_fields(v);
+                    *class == **name && self.match_class(name, args, &fields, binds)?
                 }
                 _ => false,
             },
+            PatternKind::Record(items) => match v {
+                Value::Record(r) => self.match_all(items, &r.fields, binds)?,
+                Value::Object(_) | Value::Shared(_) => {
+                    self.match_all(items, &object_fields(v).1, binds)?
+                }
+                _ => false,
+            },
+            PatternKind::List(items) => match v {
+                Value::List(values) => self.match_list(items, values, binds)?,
+                _ => false,
+            },
+            PatternKind::Rest(_) => false,
             PatternKind::Or(alternatives) => {
                 for alt in alternatives {
                     let mut alt_binds = Vec::new();
@@ -354,6 +389,68 @@ impl Interpreter<'_> {
                 false
             }
         })
+    }
+
+    fn match_all(
+        &mut self,
+        items: &[Pattern],
+        values: &[Value],
+        binds: &mut Vec<(String, Value)>,
+    ) -> Result<bool, Flow> {
+        for (item, value) in items.iter().zip(values) {
+            if !self.matches(item, value, binds)? {
+                return Ok(false);
+            }
+        }
+        Ok(items.len() == values.len())
+    }
+
+    fn match_class(
+        &mut self,
+        class: &str,
+        items: &[Pattern],
+        fields: &[Value],
+        binds: &mut Vec<(String, Value)>,
+    ) -> Result<bool, Flow> {
+        let rest = self.classes[class].fields.iter().position(|f| f.is_rest);
+        let Some(r) = rest else {
+            return self.match_all(items, fields, binds);
+        };
+        let Value::List(tail) = &fields[r] else {
+            return Ok(false);
+        };
+        Ok(self.match_all(&items[..r], &fields[..r], binds)?
+            && self.match_list(&items[r..], tail, binds)?)
+    }
+
+    fn match_list(
+        &mut self,
+        items: &[Pattern],
+        values: &[Value],
+        binds: &mut Vec<(String, Value)>,
+    ) -> Result<bool, Flow> {
+        let Some(k) = items
+            .iter()
+            .position(|p| matches!(p.kind, PatternKind::Rest(_)))
+        else {
+            return self.match_all(items, values, binds);
+        };
+        let after = items.len() - k - 1;
+        if values.len() < k + after {
+            return Ok(false);
+        }
+        let end = values.len() - after;
+        if !self.match_all(&items[..k], &values[..k], binds)?
+            || !self.match_all(&items[k + 1..], &values[end..], binds)?
+        {
+            return Ok(false);
+        }
+        if let PatternKind::Rest(name) = &items[k].kind
+            && name != "_"
+        {
+            binds.push((name.clone(), Value::List(Rc::new(values[k..end].to_vec()))));
+        }
+        Ok(true)
     }
 
     fn frame(&mut self) -> &mut Frame {
@@ -429,7 +526,7 @@ impl Interpreter<'_> {
                 })?;
                 Ok(Value::Void)
             }
-            Stmt::LetElse {
+            Stmt::LetPattern {
                 pattern,
                 value,
                 otherwise,
@@ -437,13 +534,16 @@ impl Interpreter<'_> {
             } => {
                 let v = self.expr(value)?;
                 let mut binds = Vec::new();
-                if self.matches(pattern, &v, &mut binds)? {
-                    for (name, v) in binds {
-                        self.define(&name, v);
+                let matched = self.matches(pattern, &v, &mut binds)?;
+                match otherwise {
+                    Some(otherwise) if !matched => self.expr(otherwise),
+                    _ => {
+                        for (name, v) in binds {
+                            self.define(&name, v);
+                        }
+                        Ok(Value::Void)
                     }
-                    return Ok(Value::Void);
                 }
-                self.expr(otherwise)
             }
             Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) => Ok(Value::Void),
             Stmt::Expr(e) => self.scoped(|i| i.expr(e)),
@@ -476,7 +576,9 @@ impl Interpreter<'_> {
         if let Some(r) = info.resolved.get(&expr.id) {
             match &expr.kind {
                 ExprKind::Name(_) | ExprKind::Field(..) => return self.resolved(r, &[], expr.span),
-                ExprKind::Call(_, args) => return self.resolved(r, args, expr.span),
+                ExprKind::Call(_, args) | ExprKind::Record(args) => {
+                    return self.resolved(r, args, expr.span);
+                }
                 _ => {}
             }
         }
@@ -497,7 +599,7 @@ impl Interpreter<'_> {
             ExprKind::Name(name) => Ok(self.lookup(name).unwrap_or(Value::Void)),
             ExprKind::This => Ok(self.lookup("this").unwrap_or(Value::Void)),
             ExprKind::Field(base, name) => Ok(match self.expr(base)? {
-                Value::Object(r) => r.fields[r.index(name)].clone(),
+                Value::Object(r) | Value::Record(r) => r.fields[r.index(name)].clone(),
                 Value::Shared(r) => {
                     let r = r.borrow();
                     r.fields[r.index(name)].clone()
@@ -536,6 +638,20 @@ impl Interpreter<'_> {
                 }
                 Ok(Value::Void)
             }
+            ExprKind::Record(args) => match args.first().map(|a| &a.value.kind) {
+                Some(ExprKind::Spread(original)) => {
+                    self.copy_with_changes(original, &args[1..], expr.span)
+                }
+                _ => {
+                    let names: Option<Rc<[Rc<str>]>> = args
+                        .iter()
+                        .map(|a| a.name.as_deref().map(Rc::from))
+                        .collect();
+                    let fields = self.args(args)?;
+                    Ok(Value::Record(Rc::new(Record::unnamed(names, fields))))
+                }
+            },
+            ExprKind::Spread(inner) => self.expr(inner),
             ExprKind::List(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
@@ -654,7 +770,7 @@ impl Interpreter<'_> {
                     Err(other) => return Err(other),
                 }
             },
-            ExprKind::For(name, _, iter, body) => {
+            ExprKind::For(pattern, iter, body) => {
                 let wraps = self.info.wrapping.contains(&expr.id);
                 let items: Box<dyn Iterator<Item = Value>> = match self.expr(iter)? {
                     Value::Range(lo, hi, false) => Box::new((lo..hi).map(Value::Int)),
@@ -663,9 +779,9 @@ impl Interpreter<'_> {
                     _ => Box::new(std::iter::empty()),
                 };
                 for item in items {
-                    self.frame()
-                        .scopes
-                        .push(HashMap::from([(name.clone(), item)]));
+                    let mut binds = Vec::new();
+                    self.matches(pattern, &item, &mut binds)?;
+                    self.frame().scopes.push(binds.into_iter().collect());
                     let result = self.expr(body);
                     self.frame().scopes.pop();
                     match result {
@@ -729,7 +845,29 @@ impl Interpreter<'_> {
     }
 
     fn args(&mut self, args: &[Arg]) -> Result<Vec<Value>, Flow> {
-        args.iter().map(|a| self.expr(&a.value)).collect()
+        Ok(self
+            .spread_args(args)?
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect())
+    }
+
+    fn spread_args(&mut self, args: &[Arg]) -> Result<Vec<ArgValue>, Flow> {
+        let mut out = Vec::new();
+        for arg in args {
+            let ExprKind::Spread(inner) = &arg.value.kind else {
+                out.push((arg.name.as_deref().map(Rc::from), self.expr(&arg.value)?));
+                continue;
+            };
+            let Value::Record(r) = self.expr(inner)? else {
+                continue;
+            };
+            for (i, v) in r.fields.iter().enumerate() {
+                let name = r.field_names.as_ref().map(|names| names[i].clone());
+                out.push((name, v.clone()));
+            }
+        }
+        Ok(out)
     }
 
     fn call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Eval {
@@ -816,11 +954,10 @@ impl Interpreter<'_> {
             .map(|(i, _)| i)
             .collect();
         let mut k = 0;
-        for arg in args {
-            let v = self.expr(&arg.value)?;
-            match &arg.name {
+        for (name, v) in self.spread_args(args)? {
+            match name {
                 Some(name) => {
-                    if let Some(i) = params.iter().position(|p| &p.name == name) {
+                    if let Some(i) = params.iter().position(|p| *p.name == *name) {
                         slots[i] = Some(v);
                     }
                 }
@@ -993,6 +1130,19 @@ impl Interpreter<'_> {
             }
             _ => Value::Void,
         })
+    }
+}
+
+fn object_fields(v: &Value) -> (Rc<str>, Vec<Value>) {
+    match v {
+        Value::Shared(r) => {
+            let r = r.borrow();
+            (r.name.clone(), r.fields.clone())
+        }
+        Value::Object(r) | Value::Variant(r) | Value::Record(r) => {
+            (r.name.clone(), r.fields.clone())
+        }
+        _ => ("".into(), Vec::new()),
     }
 }
 

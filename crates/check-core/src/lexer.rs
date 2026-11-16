@@ -127,6 +127,9 @@ impl Lexer<'_> {
                         self.pos += 1;
                     }
                 }
+                b'0'..=b'9' if matches!(out.last(), Some(t) if t.tok == Tok::Sym(".")) => {
+                    out.push(self.field_index())
+                }
                 b'0'..=b'9' => out.push(self.number()),
                 b'"' => out.push(self.string(false)),
                 b'r' if self.peek(1) == b'"' => {
@@ -262,6 +265,29 @@ impl Lexer<'_> {
                     self.error(Code::literal_too_big, start);
                     Tok::Int(0)
                 }
+            }
+        };
+        Token {
+            tok,
+            span: self.span(start),
+        }
+    }
+
+    fn field_index(&mut self) -> Token {
+        let start = self.pos;
+        while self.peek(0).is_ascii_digit() {
+            self.pos += 1;
+        }
+        let digits = &self.text[start..self.pos];
+        let tok = match digits.parse() {
+            Ok(_) if digits.len() > 1 && digits.starts_with('0') => {
+                self.error(Code::leading_zero, start);
+                Tok::Int(0)
+            }
+            Ok(n) => Tok::Int(n),
+            Err(_) => {
+                self.error(Code::malformed_number, start);
+                Tok::Int(0)
             }
         };
         Token {

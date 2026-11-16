@@ -24,10 +24,11 @@ pub struct Record {
 
 impl Record {
     pub fn index(&self, field: &str) -> usize {
-        self.field_names
-            .as_ref()
-            .and_then(|names| names.iter().position(|n| &**n == field))
-            .unwrap_or(0)
+        match &self.field_names {
+            Some(names) => names.iter().position(|n| &**n == field),
+            None => field.parse().ok(),
+        }
+        .unwrap_or(0)
     }
 
     fn code(&self, always_parens: bool) -> String {
@@ -45,6 +46,14 @@ impl Record {
             .collect();
         format!("{}({})", self.name, fields.join(", "))
     }
+
+    pub fn unnamed(field_names: Option<Rc<[Rc<str>]>>, fields: Vec<Value>) -> Record {
+        Record {
+            name: "".into(),
+            field_names,
+            fields,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -61,6 +70,7 @@ pub enum Value {
     Object(Rc<Record>),
     Shared(Rc<RefCell<Record>>),
     Variant(Rc<Record>),
+    Record(Rc<Record>),
     Void,
 }
 
@@ -79,7 +89,9 @@ impl PartialEq for Value {
             (Value::None, Value::None) | (Value::Void, Value::Void) => true,
             (Value::Range(a, b, x), Value::Range(c, d, y)) => a == c && b == d && x == y,
             (Value::Func(a), Value::Func(b)) => Rc::ptr_eq(a, b),
-            (Value::Object(a), Value::Object(b)) | (Value::Variant(a), Value::Variant(b)) => a == b,
+            (Value::Object(a), Value::Object(b))
+            | (Value::Variant(a), Value::Variant(b))
+            | (Value::Record(a), Value::Record(b)) => a == b,
             (Value::Shared(a), Value::Shared(b)) => Rc::ptr_eq(a, b),
             _ => false,
         }
@@ -134,6 +146,7 @@ impl Value {
                 Err(_) => "...".to_string(),
             },
             Value::Variant(r) => r.code(false),
+            Value::Record(r) => r.code(true),
             Value::Void => String::new(),
         }
     }
