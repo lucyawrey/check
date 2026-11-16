@@ -187,6 +187,11 @@ impl Parser<'_> {
                 let span = self.span();
                 self.diags
                     .push(Diagnostic::error(Code::unexpected_token, span));
+                // recover() stops at a closing bracket, so a stray one has to be skipped
+                // here or the caller's loop never moves past it.
+                if matches!(self.peek(), Tok::Sym(")" | "]" | "}")) {
+                    self.advance();
+                }
                 self.recover();
             }
         }

@@ -528,3 +528,11 @@ fn external_marks_only_functions() {
     );
     assert_eq!(output("let external = 1\nprint(external)"), "1");
 }
+
+#[test]
+fn a_bad_variant_field_is_an_error_not_a_hang() {
+    assert_eq!(
+        first_error("enum E {\n  A(ref x: Int)\n}"),
+        "unexpected_token"
+    );
+}
