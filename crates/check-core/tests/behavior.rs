@@ -528,3 +528,244 @@ fn external_marks_only_functions() {
     );
     assert_eq!(output("let external = 1\nprint(external)"), "1");
 }
+
+fn warnings(src: &str) -> Vec<String> {
+    let report = run_source(
+        "test.check",
+        src,
+        &mut Cursor::new(Vec::new()),
+        &mut Vec::new(),
+    );
+    report
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Warning)
+        .map(|d| d.code.to_string())
+        .collect()
+}
+
+const POINT: &str = "class Point(x: Int, y: Int = 0)\n";
+
+#[test]
+fn records_print_compare_and_read_fields() {
+    prints("(1, 2)", "(1, 2)");
+    prints("(x = 1, y = \"a\")", "(x = 1, y = \"a\")");
+    prints("(x = 1, y = 2).y", "2");
+    prints("((1, 2), 3).0.1", "2");
+    assert_eq!(first_error("print((1, 2).01)"), "leading_zero");
+    assert_eq!(
+        first_error("let p: (0: Int, 1: Int) = (1, 2)"),
+        "unexpected_token"
+    );
+    prints("(1, 2) == (1, 2)", "true");
+    prints("(1 + 2)", "3");
+}
+
+#[test]
+fn record_types_match_by_field_names_types_and_order() {
+    assert_eq!(
+        output("let p: (x: Int, y: Int) = (x = 1, y = 2)\nprint(p.y)"),
+        "2"
+    );
+    assert_eq!(output("let p: (Int, String) = (1, \"a\")\nprint(p.1)"), "a");
+    assert_eq!(
+        first_error("let p: (y: Int, x: Int) = (x = 1, y = 2)"),
+        "type_mismatch"
+    );
+    assert_eq!(
+        first_error("let p: (x: Int, Int) = (x = 1, y = 2)"),
+        "mixed_fields"
+    );
+    assert_eq!(first_error("let p = (1, y = 2)"), "mixed_fields");
+}
+
+#[test]
+fn a_record_literal_builds_the_expected_class_but_a_record_value_never_does() {
+    let src = format!(
+        "{POINT}func f(p: Point) -> Point {{ p }}\nfunc g() -> Point {{ (4, 5) }}\n\
+         print(f((1, 2)))\nprint(f((x = 3)))\nprint(g())"
+    );
+    assert_eq!(
+        output(&src),
+        "Point(x = 1, y = 2)\nPoint(x = 3, y = 0)\nPoint(x = 4, y = 5)"
+    );
+    assert_eq!(
+        output("class C(n: Int = 7)\nfunc make() -> C { () }\nprint(make())"),
+        "C(n = 7)"
+    );
+    assert_eq!(
+        output(&format!(
+            "{POINT}func maybe() -> Point? {{ (1, 2) }}\nprint(maybe())"
+        )),
+        "Some(Point(x = 1, y = 2))"
+    );
+    for misuse in [
+        "let t = (1, 2)\nlet p: Point = t",
+        "let t = (1, 2)\nfunc f(p: Point) { }\nf(t)",
+        "func h(t: (Int, Int)) -> Point { t }",
+    ] {
+        assert_eq!(
+            first_error(&format!("{POINT}{misuse}")),
+            "record_to_class",
+            "{misuse}"
+        );
+    }
+    assert_eq!(first_error("let r = ()"), "type_needed");
+}
+
+#[test]
+fn record_fields_never_change() {
+    assert_eq!(first_error("var t = (1, 2)\nt.0 = 3"), "assign_to_let");
+    assert_eq!(first_error("var t = (x = 1)\nt.x = 3"), "assign_to_let");
+}
+
+#[test]
+fn a_copy_changes_only_the_named_fields() {
+    assert_eq!(
+        output("let p = (x = 1, y = 2)\nprint((...p, y = 5))\nprint(p)"),
+        "(x = 1, y = 5)\n(x = 1, y = 2)"
+    );
+    let temp = "class Temp {\n  var c: Int\n  var label = \"\"\n  init { this.label = \"{this.c}C\" }\n}\n";
+    assert_eq!(
+        output(&format!("{temp}print((...Temp(5), c = 7).label)")),
+        "7C"
+    );
+    let shared = "ref class Box(var n: Int)\nlet a = Box(1)\nlet b = (...a, n = 2)\nprint(same(a, b))\nprint(a.n)";
+    assert_eq!(output(shared), "false\n1");
+    for (src, code) in [
+        ("(...p, z = 1)", "unknown_field"),
+        ("(...p, x = 5, x = 6)", "wrong_arguments"),
+        ("(...p, y = \"a\")", "type_mismatch"),
+        ("(...p, 1)", "wrong_arguments"),
+        ("(...p, ...p)", "spread_not_first"),
+        ("(y = 1, ...p)", "spread_not_first"),
+    ] {
+        assert_eq!(
+            first_error(&format!("let p = (x = 1, y = 2)\nprint({src})")),
+            code,
+            "{src}"
+        );
+    }
+}
+
+#[test]
+fn a_spread_fills_arguments_by_position_or_name() {
+    let src = format!(
+        "{POINT}func sum(first: Int, ...more: List<Int>) -> Int {{ first + more.length() }}\n\
+         print(sum(...(1, 2, 3)))\nprint(Point(...(y = 2, x = 1)))\nprint(Point(...(5, 6)))"
+    );
+    assert_eq!(output(&src), "3\nPoint(x = 1, y = 2)\nPoint(x = 5, y = 6)");
+    for (call, code) in [
+        ("Point(1, ...(2, 3))", "spread_not_first"),
+        ("Point(...(1, 2, 3))", "wrong_arguments"),
+        ("Point(...(x = 1, y = 2), x = 3)", "wrong_arguments"),
+        ("Point(...(\"a\", 2))", "type_mismatch"),
+        ("Point(...5)", "type_mismatch"),
+    ] {
+        assert_eq!(
+            first_error(&format!("{POINT}print({call})")),
+            code,
+            "{call}"
+        );
+    }
+}
+
+#[test]
+fn patterns_take_records_classes_and_lists_apart() {
+    let src = format!(
+        "{POINT}func describe(words: List<String>) -> String {{\n  match words {{\n\
+         \x20   [] => \"none\"\n    [\"add\", ...rest] => \"add {{rest}}\"\n    [first, ..._, last] => \"{{first}}..{{last}}\"\n    [only] => only\n  }}\n}}\n\
+         print(describe([]))\nprint(describe([\"add\", \"a\", \"b\"]))\nprint(describe([\"x\", \"y\", \"z\"]))\nprint(describe([\"x\"]))\n\
+         print(match Point(1, 2) {{ Point(0, _) => \"on axis\", Point(x, y) => \"{{x}},{{y}}\" }})\n\
+         print(match (1, (2, 3)) {{ (a, (b, c)) => a + b + c }})"
+    );
+    assert_eq!(output(&src), "none\nadd [\"a\", \"b\"]\nx..z\nx\n1,2\n6");
+}
+
+#[test]
+fn a_class_rest_field_matches_like_a_list() {
+    let src = format!(
+        "{POINT}class Polygon(name: String, ...points: List<Point>)\n\
+         let tri = Polygon(\"tri\", (0, 0), (1, 0), (0, 1))\n\
+         print(match tri {{ Polygon(_, first, ...rest) => \"{{first.x}} {{rest.length()}}\", Polygon(name) => name }})"
+    );
+    assert_eq!(output(&src), "0 2");
+    let copy = format!(
+        "{POINT}class Polygon(name: String, ...points: List<Point>)\nlet a = Polygon(\"a\", (0, 0))\n\
+         print((...a, points = [(1, 1), (2, 2)]).points.length())"
+    );
+    assert_eq!(output(&copy), "2");
+}
+
+#[test]
+fn exhaustiveness_covers_records_classes_and_lists() {
+    let cases = [
+        ("match (true, 1) { (true, _) => 1 }", Some("(false, _)")),
+        ("match Point(1) { Point(0, _) => 1 }", Some("Point(_, _)")),
+        ("match [1] { [] => 1, [x] => x }", Some("[_, _, ...]")),
+        ("match [\"a\"] { [\"add\", ...rest] => 1 }", Some("[]")),
+        ("match [1] { [] => 1, [_, ..._] => 2 }", None),
+        ("match [1] { [x, ...rest] => x, [] => 0 }", None),
+        ("match [1] { [] | [_, ..._] => 1 }", None),
+    ];
+    for (m, missing) in cases {
+        assert_eq!(
+            missing_case(&format!("{POINT}print({m})")).as_deref(),
+            missing,
+            "{m}"
+        );
+    }
+}
+
+#[test]
+fn a_pattern_with_the_wrong_number_of_fields_is_only_an_error() {
+    for src in [
+        "print(match (true, true, true) { (true, true) => 1, (false, _) => 2 })",
+        "enum S { A(x: Int, y: Int) }\nprint(match S.A(1, 2) { A(x) => 1 })",
+    ] {
+        assert_eq!(first_error(src), "wrong_arguments", "{src}");
+    }
+}
+
+#[test]
+fn let_var_and_for_destructure_with_patterns_that_cant_fail() {
+    assert_eq!(output("let (a, b) = (1, 2)\nprint(a + b)"), "3");
+    assert_eq!(
+        output("var (a, b) = (1, 2)\na = 5\nb = 6\nprint(a + b)"),
+        "11"
+    );
+    assert_eq!(first_error("let (a, b) = (1, 2)\na = 5"), "assign_to_let");
+    assert_eq!(
+        output("for (name, n) in [(\"a\", 1), (\"b\", 2)] { print(\"{name}{n}\") }"),
+        "a1\nb2"
+    );
+    for refutable in [
+        "let Some(x) = Int.parse(\"1\")",
+        "let [x] = [1]",
+        "for [x] in [[1]] { }",
+    ] {
+        assert_eq!(
+            first_error(refutable),
+            "non_exhaustive_match",
+            "{refutable}"
+        );
+    }
+}
+
+#[test]
+fn a_record_literal_beside_its_class_is_a_style_warning() {
+    assert_eq!(
+        warnings(&format!("{POINT}let p: Point = (1, 2)")),
+        ["record_beside_class"]
+    );
+    for elsewhere in [
+        "func f(p: Point) { }\nf((1, 2))",
+        "func g() -> Point { (1, 2) }",
+        "let p = Point(1)\nlet q: Point = (...p, y = 2)",
+    ] {
+        assert!(
+            warnings(&format!("{POINT}{elsewhere}")).is_empty(),
+            "{elsewhere}"
+        );
+    }
+}
