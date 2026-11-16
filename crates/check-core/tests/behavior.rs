@@ -769,3 +769,11 @@ fn a_record_literal_beside_its_class_is_a_style_warning() {
         );
     }
 }
+
+#[test]
+fn a_bad_variant_field_is_an_error_not_a_hang() {
+    assert_eq!(
+        first_error("enum E {\n  A(ref x: Int)\n}"),
+        "unexpected_token"
+    );
+}
