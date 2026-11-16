@@ -734,6 +734,7 @@ impl Parser<'_> {
     }
 
     fn type_expr(&mut self) -> PResult<TypeExpr> {
+        let start = self.span();
         let mut ty = if self.eat_kw("func") {
             self.expect_sym("(")?;
             let mut params = Vec::new();
@@ -781,10 +782,17 @@ impl Parser<'_> {
                 TypeExpr::Name(name, span)
             }
         };
-        while self.eat_sym("?") {
-            ty = TypeExpr::Maybe(Box::new(ty));
+        loop {
+            if self.eat_sym("?") {
+                ty = TypeExpr::Maybe(Box::new(ty));
+            } else if self.is_sym("[") && matches!(self.peek_at(1), Tok::Sym("]")) {
+                self.advance();
+                self.advance();
+                ty = TypeExpr::Generic("List".to_string(), vec![ty], start.to(self.prev_span()));
+            } else {
+                return Ok(ty);
+            }
         }
-        Ok(ty)
     }
 
     fn block(&mut self) -> PResult<Expr> {

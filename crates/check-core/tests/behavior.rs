@@ -777,3 +777,13 @@ fn a_bad_variant_field_is_an_error_not_a_hang() {
         "unexpected_token"
     );
 }
+
+#[test]
+fn a_list_type_can_be_written_with_brackets_read_left_to_right() {
+    assert_eq!(
+        output(
+            "class Bag(items: Int[] = [])\nlet m: Int?[] = [1, None]\nlet n: Int[]? = None\nlet g: Int[][] = [[1], []]\nprint(Bag().items)\nprint(m)\nprint(n)\nprint(g)"
+        ),
+        "[]\n[Some(1), None]\nNone\n[[1], []]"
+    );
+}
