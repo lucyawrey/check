@@ -74,12 +74,12 @@ const CONTINUES_AFTER: &[&str] = &[
 
 const CONTINUING_WORDS: &[&str] = &["and", "or", "not", "div", "mod", "is", "in", "as"];
 
-pub fn lex(src: &str, diags: &mut Vec<Diagnostic>) -> Vec<Token> {
+pub fn lex(src: &str, base: usize, diags: &mut Vec<Diagnostic>) -> Vec<Token> {
     let mut lexer = Lexer {
         src: src.as_bytes(),
         text: src,
         pos: 0,
-        base: 0,
+        base,
         diags,
     };
     let raw = lexer.run();

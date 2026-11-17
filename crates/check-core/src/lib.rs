@@ -4,13 +4,19 @@ pub mod diag;
 pub mod host;
 pub mod interp;
 pub mod lexer;
+pub mod modules;
 pub mod parser;
+pub mod resolve;
 pub mod types;
 pub mod value;
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 
-use diag::{Code, Diagnostic, Severity};
+use diag::{Code, Diagnostic, Severity, Sources};
+use modules::{Loaded, MemFiles};
+
+pub use modules::Files;
 
 pub enum Outcome {
     Finished,
@@ -23,37 +29,30 @@ pub struct Report {
     pub outcome: Outcome,
     pub diagnostics: Vec<Diagnostic>,
     pub panic_text: Option<String>,
+    pub sources: Sources,
 }
-
-pub const LIBRARY: &[&str] = &[
-    include_str!("../../../lib/std/core.check"),
-    include_str!("../../../lib/std/text.check"),
-    include_str!("../../../lib/std/numbers.check"),
-    include_str!("../../../lib/cli/io.check"),
-];
 
 pub struct Checked {
     pub program: Vec<ast::Stmt>,
     pub library: Vec<ast::Stmt>,
     pub info: checker::Info,
     pub diagnostics: Vec<Diagnostic>,
+    pub sources: Sources,
 }
 
-pub fn check_source(src: &str) -> Checked {
-    let mut diags = Vec::new();
-    let mut next_id = 0;
-    let mut library = Vec::new();
-    for file in LIBRARY {
-        let tokens = lexer::lex(file, &mut diags);
-        library.extend(parser::parse_program(tokens, &mut next_id, &mut diags));
-    }
-    let tokens = lexer::lex(src, &mut diags);
-    let program = parser::parse_program(tokens, &mut next_id, &mut diags);
+pub fn check_program(entry: &str, files: &dyn Files, allow_private: bool) -> Checked {
+    let Loaded {
+        program,
+        library,
+        sources,
+        diagnostics,
+    } = modules::load(entry, files, allow_private);
     let mut checked = Checked {
         program,
         library,
         info: checker::Info::default(),
-        diagnostics: diags,
+        diagnostics,
+        sources,
     };
     if checked
         .diagnostics
@@ -68,9 +67,27 @@ pub fn check_source(src: &str) -> Checked {
     checked
 }
 
+fn one_file(path: &str, src: &str) -> MemFiles {
+    MemFiles(HashMap::from([(path.to_string(), src.to_string())]))
+}
+
+pub fn check_source(path: &str, src: &str) -> Checked {
+    check_program(path, &one_file(path, src), false)
+}
+
 pub fn run_source(
     path: &str,
     src: &str,
+    input: &mut dyn BufRead,
+    output: &mut dyn Write,
+) -> Report {
+    run_program(path, &one_file(path, src), false, input, output)
+}
+
+pub fn run_program(
+    entry: &str,
+    files: &dyn Files,
+    allow_private: bool,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Report {
@@ -79,46 +96,38 @@ pub fn run_source(
         library,
         info,
         diagnostics,
-    } = check_source(src);
-    if diagnostics.iter().any(|d| d.severity == Severity::Error) {
-        return Report {
-            outcome: Outcome::CheckFailed,
-            diagnostics,
-            panic_text: None,
-        };
-    }
-    match interp::run(&program, &library, &info, input, output) {
-        Ok(None) => Report {
-            outcome: Outcome::Finished,
-            diagnostics,
-            panic_text: None,
-        },
-        Ok(Some(span)) => {
-            let (line, col, _) = diag::locate(src, span.start);
-            let text = format!("{} at {path}:{line}:{col}\n", Code::try_stopped.message());
-            Report {
-                outcome: Outcome::Stopped,
-                diagnostics,
-                panic_text: Some(text),
+        sources,
+    } = check_program(entry, files, allow_private);
+    let (outcome, panic_text) = if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+        (Outcome::CheckFailed, None)
+    } else {
+        match interp::run(&program, &library, &info, input, output) {
+            Ok(None) => (Outcome::Finished, None),
+            Ok(Some(span)) => {
+                let (path, line, col, _) = sources.locate(span.start);
+                let text = format!("{} at {path}:{line}:{col}\n", Code::try_stopped.message());
+                (Outcome::Stopped, Some(text))
+            }
+            Err(p) => {
+                let (path, line, col, _) = sources.locate(p.span.start);
+                let reason = p.reason.map(|r| format!(": {r}")).unwrap_or_default();
+                let mut text = format!(
+                    "panic[{}]: {}{reason}\n --> {path}:{line}:{col}\n",
+                    p.code,
+                    p.code.message()
+                );
+                for call in &p.stack {
+                    let (path, line, col, _) = sources.locate(call.start);
+                    text.push_str(&format!("    at {path}:{line}:{col}\n"));
+                }
+                (Outcome::Panicked(p.code), Some(text))
             }
         }
-        Err(p) => {
-            let (line, col, _) = diag::locate(src, p.span.start);
-            let reason = p.reason.map(|r| format!(": {r}")).unwrap_or_default();
-            let mut text = format!(
-                "panic[{}]: {}{reason}\n --> {path}:{line}:{col}\n",
-                p.code,
-                p.code.message()
-            );
-            for call in &p.stack {
-                let (line, col, _) = diag::locate(src, call.start);
-                text.push_str(&format!("    at {path}:{line}:{col}\n"));
-            }
-            Report {
-                outcome: Outcome::Panicked(p.code),
-                diagnostics,
-                panic_text: Some(text),
-            }
-        }
+    };
+    Report {
+        outcome,
+        diagnostics,
+        panic_text,
+        sources,
     }
 }

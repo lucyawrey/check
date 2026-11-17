@@ -950,7 +950,7 @@ impl Interpreter<'_> {
         let fixed: Vec<usize> = params
             .iter()
             .enumerate()
-            .filter(|(_, p)| !p.is_rest)
+            .filter(|(_, p)| !p.is_rest && !p.is_private)
             .map(|(i, _)| i)
             .collect();
         let mut k = 0;
