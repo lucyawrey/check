@@ -1,0 +1,6 @@
+class Package(
+  version: String = ""
+  entry: String? = None
+  hostImport: String? = None
+  imports: String[] = []
+)

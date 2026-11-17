@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::rc::Rc;
 
@@ -49,6 +49,7 @@ pub struct Interpreter<'a> {
     enums: HashMap<String, Rc<EnumDecl>>,
     consts: HashMap<String, ConstDecl>,
     const_values: HashMap<String, Value>,
+    building: HashSet<String>,
     globals: HashMap<String, Value>,
     frames: Vec<Frame>,
     depth: usize,
@@ -72,12 +73,15 @@ pub fn run(
         enums: HashMap::new(),
         consts: HashMap::new(),
         const_values: HashMap::new(),
+        building: HashSet::new(),
         globals: HashMap::new(),
         frames: vec![Frame { scopes: Vec::new() }],
         depth: 0,
         input,
         output,
     };
+    // Data values are built in load order, after member consts.
+    let mut data = Vec::new();
     for stmt in library.iter().chain(program) {
         match stmt {
             Stmt::Func(decl) => interp.add_func(decl),
@@ -93,12 +97,24 @@ pub fn run(
                 interp.add_members(&e.name, &e.members);
                 interp.enums.insert(e.name.clone(), Rc::new(e.clone()));
             }
+            Stmt::Data(d) => {
+                let decl = ConstDecl {
+                    name: d.name.clone(),
+                    span: d.span,
+                    ty: None,
+                    value: d.value.clone(),
+                    is_private: false,
+                };
+                interp.consts.insert(d.name.clone(), decl);
+                data.push(d.name.clone());
+            }
             _ => {}
         }
     }
     let mut consts: Vec<String> = interp.consts.keys().cloned().collect();
+    consts.retain(|k| !data.contains(k));
     consts.sort();
-    for key in consts {
+    for key in consts.into_iter().chain(data) {
         if let Err(Flow::Panic(p)) = interp.resolved(&Resolved::Const(key), &[], Span::default()) {
             return Err(p);
         }
@@ -226,8 +242,13 @@ impl Interpreter<'_> {
                 if let Some(v) = self.const_values.get(key) {
                     return Ok(v.clone());
                 }
+                // A data value can reach itself through a call the checker doesn't follow.
+                if !self.building.insert(key.clone()) {
+                    return panic(Code::const_cycle, span);
+                }
                 let value = self.consts[key].value.clone();
                 let v = self.expr(&value)?;
+                self.building.remove(key);
                 self.const_values.insert(key.clone(), v.clone());
                 Ok(v)
             }
@@ -545,7 +566,9 @@ impl Interpreter<'_> {
                     }
                 }
             }
-            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) => Ok(Value::Void),
+            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) | Stmt::Data(_) => {
+                Ok(Value::Void)
+            }
             Stmt::Expr(e) => self.scoped(|i| i.expr(e)),
         }
     }

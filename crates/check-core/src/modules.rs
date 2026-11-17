@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::ast::{File, NodeId, Stmt};
+use crate::ast::{DataDecl, DataFile, Expr, ExprKind, File, NodeId, Stmt, StrSeg, TypeExpr};
 use crate::diag::{Code, Diagnostic, Sources, Span};
 use crate::resolve::{SourceFile, resolve};
 use crate::{lexer, parser};
@@ -36,38 +36,78 @@ impl Files for MemFiles {
     }
 }
 
-pub const LIBRARY: &[(&str, &str, &str)] = &[
+/// The built-in units' code and manifests, which ship inside the toolchain.
+const LIBRARY: &[(usize, &str, &str)] = &[
     (
-        "check.std",
+        STD,
         "lib/std/core.check",
         include_str!("../../../lib/std/core.check"),
     ),
     (
-        "check.std",
+        STD,
         "lib/std/text.check",
         include_str!("../../../lib/std/text.check"),
     ),
     (
-        "check.std",
+        STD,
         "lib/std/numbers.check",
         include_str!("../../../lib/std/numbers.check"),
     ),
     (
-        "check.cli",
+        STD,
+        "lib/std/package.check",
+        include_str!("../../../lib/std/package.check"),
+    ),
+    (
+        CLI,
         "lib/cli/io.check",
         include_str!("../../../lib/cli/io.check"),
+    ),
+];
+
+const MANIFESTS: &[(usize, &str, &str)] = &[
+    (
+        STD,
+        "lib/std/package.con",
+        include_str!("../../../lib/std/package.con"),
+    ),
+    (
+        CLI,
+        "lib/cli/package.con",
+        include_str!("../../../lib/cli/package.con"),
     ),
 ];
 
 const STD: usize = 0;
 const CLI: usize = 1;
 const ENTRY: usize = 2;
+const HOST: &str = "check:cli";
+const MANIFEST: &str = "package.con";
 
 pub struct Loaded {
     pub program: Vec<Stmt>,
     pub library: Vec<Stmt>,
     pub sources: Sources,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// The entry file a folder's manifest names.
+pub fn entry_of(folder: &str, files: &dyn Files) -> Result<String, Code> {
+    let folder = if folder.is_empty() || folder.ends_with('/') {
+        folder.to_string()
+    } else {
+        format!("{folder}/")
+    };
+    let text = files
+        .read(&format!("{folder}{MANIFEST}"))
+        .ok_or(Code::missing_manifest)?;
+    let mut ignored = Vec::new();
+    let tokens = lexer::lex(&text, 0, &mut ignored);
+    let data = parser::parse_data(tokens, &mut 0, &mut ignored);
+    let entry = Manifest::read(&data).entry.ok_or(Code::no_entry)?.0;
+    let path = normalize(&format!("{folder}{entry}"));
+    files.read(&path).ok_or(Code::missing_entry)?;
+    Ok(path)
 }
 
 /// Loads the entry file and the units it imports. `allow_private` lets it use `import private`.
@@ -80,58 +120,59 @@ pub fn load(entry: &str, files: &dyn Files, allow_private: bool) -> Loaded {
         entry: normalize(entry),
         owners: HashMap::new(),
         units: HashMap::new(),
+        loading: Vec::new(),
+        access: Vec::new(),
+        labels: Vec::new(),
+        parsed: Vec::new(),
     };
-    let mut parsed = Vec::new();
-    for (ns, path, text) in LIBRARY {
-        let file = loader.parse(path, text);
-        let unit = if *ns == "check.std" { STD } else { CLI };
-        parsed.push((unit, ns.to_string(), file.stmts));
+    for label in ["check:std", "check:cli", entry] {
+        loader.new_unit(label);
+    }
+    loader.loading.clear();
+    for (unit, path, text) in MANIFESTS {
+        let data = loader.parse_data(path, text);
+        let ns = data.namespace.map(|(n, _)| n).unwrap_or_default();
+        for (u, path, text) in LIBRARY.iter().filter(|(u, ..)| u == unit) {
+            let file = loader.parse(path, text);
+            loader.push(*u, ns.clone(), file.stmts);
+        }
     }
     let text = files.read(entry).unwrap_or_default();
     let entry_file = loader.parse(entry, &text);
-    let mut access = vec![
-        vec![(STD, true), (CLI, false)],
-        vec![(STD, false), (CLI, true)],
-        vec![(STD, false), (CLI, false), (ENTRY, true)],
-    ];
+    let mut host_imports = 0;
     for import in &entry_file.imports {
+        if import.is_host {
+            host_imports += 1;
+            let beside_manifest = files
+                .list(dir_of(entry))
+                .is_some_and(|n| n.iter().any(|n| n == MANIFEST));
+            if host_imports > 1 || beside_manifest {
+                loader.error(Code::misplaced_host_import, import.span, None);
+            } else if import.path != HOST {
+                loader.error(Code::unknown_host, import.span, None);
+            }
+            continue;
+        }
         if import.is_private && !allow_private {
             loader.error(Code::private_import_in_run, import.span, None);
         }
-        let Some((unit_files, unit)) =
-            loader.unit(dir_of(entry), &import.path, import.span, access.len())
-        else {
-            continue;
-        };
-        if unit == access.len() {
-            access.push(vec![(STD, false), (CLI, false), (unit, true)]);
-            for file in unit_files {
-                let ns = file.namespace.map(|(n, _)| n).unwrap_or_default();
-                parsed.push((unit, ns, file.stmts));
-            }
-        }
-        let seen = access[ENTRY].iter_mut().find(|(u, _)| *u == unit);
-        match seen {
-            Some((_, private)) => *private |= import.is_private,
-            None => access[ENTRY].push((unit, import.is_private)),
+        if let Some(unit) = loader.import(dir_of(entry), &import.path, import.span) {
+            loader.grant(ENTRY, unit, import.is_private);
         }
     }
     let entry_ns = entry_file.namespace.map(|(n, _)| n).unwrap_or_default();
-    parsed.push((ENTRY, entry_ns, entry_file.stmts));
-    let mut sources: Vec<SourceFile> = parsed
-        .into_iter()
-        .map(|(unit, namespace, stmts)| SourceFile {
-            unit,
-            is_library: unit == STD || unit == CLI,
-            namespace,
-            stmts,
-        })
-        .collect();
-    resolve(&mut sources, &access, &mut loader.diags);
+    loader.push(ENTRY, entry_ns, entry_file.stmts);
+    let mut sources = std::mem::take(&mut loader.parsed);
+    resolve(
+        &mut sources,
+        &loader.access,
+        &loader.labels,
+        &mut loader.diags,
+    );
     let mut program = Vec::new();
     let mut library = Vec::new();
     for file in sources {
-        if file.unit == STD || file.unit == CLI {
+        if file.is_library {
             library.extend(file.stmts);
         } else {
             program.extend(file.stmts);
@@ -145,6 +186,46 @@ pub fn load(entry: &str, files: &dyn Files, allow_private: bool) -> Loaded {
     }
 }
 
+/// The fields of a `package.con` the loader needs before checking, with their spans. Values
+/// that aren't plain strings are skipped here; the checker reports them against `Package`.
+#[derive(Default)]
+struct Manifest {
+    imports: Vec<(String, Span)>,
+    entry: Option<(String, Span)>,
+    host: Option<(String, Span)>,
+}
+
+impl Manifest {
+    fn read(data: &DataFile) -> Manifest {
+        let mut m = Manifest::default();
+        let ExprKind::Record(args) = &data.value.kind else {
+            return m;
+        };
+        for arg in args {
+            match (arg.name.as_deref(), &arg.value.kind) {
+                (Some("imports"), ExprKind::List(items)) => {
+                    m.imports = items.iter().filter_map(plain_string).collect();
+                }
+                (Some("entry"), _) => m.entry = plain_string(&arg.value),
+                (Some("hostImport"), _) => m.host = plain_string(&arg.value),
+                _ => {}
+            }
+        }
+        m
+    }
+}
+
+fn plain_string(e: &Expr) -> Option<(String, Span)> {
+    match &e.kind {
+        ExprKind::Str(segs) => match segs.as_slice() {
+            [StrSeg::Text(t)] => Some((t.clone(), e.span)),
+            [] => Some((String::new(), e.span)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 struct Loader<'a> {
     files: &'a dyn Files,
     sources: Sources,
@@ -154,6 +235,11 @@ struct Loader<'a> {
     /// Which import each loaded file belongs to, to catch two imports covering one file.
     owners: HashMap<String, String>,
     units: HashMap<String, usize>,
+    /// The units being loaded, innermost last, to catch import cycles.
+    loading: Vec<String>,
+    access: Vec<Vec<(usize, bool, Option<usize>)>>,
+    labels: Vec<String>,
+    parsed: Vec<SourceFile>,
 }
 
 impl Loader<'_> {
@@ -176,92 +262,300 @@ impl Loader<'_> {
         parser::parse_program(tokens, &mut self.next_id, diags)
     }
 
-    /// The files of the unit `import` names and its index; the index is `next` if it's new.
-    fn unit(
-        &mut self,
-        dir: &str,
-        import: &str,
-        span: Span,
-        next: usize,
-    ) -> Option<(Vec<File>, usize)> {
-        let (folder, deep) = match import.strip_suffix("/...") {
-            Some(f) => (Some(format!("{f}/")), true),
-            None => (import.ends_with('/').then(|| import.to_string()), false),
-        };
-        let key = normalize(&format!("{dir}{import}"));
-        if let Some(&unit) = self.units.get(&key) {
-            return Some((Vec::new(), unit));
-        }
-        let mut paths = Vec::new();
-        match folder {
-            Some(folder) => {
-                let folder = normalize(&format!("{dir}{folder}"));
-                if self.files.list(&folder).is_none() {
-                    self.error(Code::missing_import, span, None);
-                    return None;
-                }
-                self.folder_files(&folder, deep, &mut paths);
-            }
-            None => {
-                let path = normalize(&format!("{dir}{import}"));
-                if self.files.list(&format!("{path}/")).is_some() {
-                    self.error(Code::folder_without_slash, span, None);
-                    return None;
-                }
-                if self.files.read(&path).is_none() {
-                    self.error(Code::missing_import, span, None);
-                    return None;
-                }
-                paths.push(path);
-            }
-        }
-        let mut unit_files = Vec::new();
-        for path in paths {
-            if path == self.entry {
-                if !import.ends_with('/') && !deep {
-                    self.error(Code::imported_entry_file, span, None);
-                }
-                continue;
-            }
-            let text = self.files.read(&path).unwrap_or_default();
-            let mut diags = Vec::new();
-            let file = self.parse_into(&path, &text, &mut diags);
-            if is_entry(&file) {
-                if !import.ends_with('/') && !deep {
-                    self.error(Code::imported_entry_file, span, None);
-                }
-                continue;
-            }
-            if let Some(owner) = self.owners.get(&path) {
-                let detail = format!("{path} is also in \"{owner}\"");
-                self.error(Code::overlapping_imports, span, Some(detail));
-                continue;
-            }
-            self.owners.insert(path, import.to_string());
-            self.diags.extend(diags);
-            unit_files.push(file);
-        }
-        self.units.insert(key, next);
-        Some((unit_files, next))
+    fn parse_data(&mut self, path: &str, text: &str) -> DataFile {
+        let base = self.sources.add(path, text);
+        let tokens = lexer::lex(text, base, &mut self.diags);
+        parser::parse_data(tokens, &mut self.next_id, &mut self.diags)
     }
 
-    fn folder_files(&self, folder: &str, deep: bool, paths: &mut Vec<String>) {
+    fn push(&mut self, unit: usize, namespace: String, stmts: Vec<Stmt>) {
+        self.parsed.push(SourceFile {
+            unit,
+            is_library: unit == STD || unit == CLI,
+            namespace,
+            stmts,
+        });
+    }
+
+    fn new_unit(&mut self, label: &str) -> usize {
+        let id = self.access.len();
+        let mut access = vec![(id, true, None)];
+        access.extend(
+            [STD, CLI]
+                .into_iter()
+                .filter(|u| *u < id)
+                .map(|u| (u, false, None)),
+        );
+        if id == STD {
+            access.push((CLI, false, None));
+        }
+        self.access.push(access);
+        self.labels.push(label.to_string());
+        self.loading.push(label.to_string());
+        id
+    }
+
+    /// Lets unit `to` see `unit`, and what `unit` passes on to whoever imports it.
+    fn grant(&mut self, to: usize, unit: usize, private: bool) {
+        let passed: Vec<usize> = self.access[unit]
+            .iter()
+            .map(|(u, ..)| *u)
+            .filter(|u| *u != unit && *u != STD && *u != CLI)
+            .collect();
+        for (u, private, via) in std::iter::once((unit, private, None))
+            .chain(passed.into_iter().map(|u| (u, false, Some(unit))))
+        {
+            match self.access[to].iter_mut().find(|(v, ..)| *v == u) {
+                Some((_, p, _)) => *p |= private,
+                None => self.access[to].push((u, private, via)),
+            }
+        }
+    }
+
+    /// The unit an import names, loading it the first time.
+    fn import(&mut self, dir: &str, import: &str, span: Span) -> Option<usize> {
+        if let Some(name) = import.strip_prefix("check:") {
+            return match name {
+                "std" => Some(STD),
+                "cli" => Some(CLI),
+                _ => {
+                    self.error(Code::missing_import, span, None);
+                    None
+                }
+            };
+        }
+        if import.starts_with("pkg:") || import.contains("://") {
+            self.error(Code::unsupported_import, span, None);
+            return None;
+        }
+        let key = normalize(&format!("{dir}{import}"));
+        if let Some(&unit) = self.units.get(&key) {
+            if let Some(i) = self.loading.iter().position(|k| *k == key) {
+                let cycle = self.loading[i..].join(" -> ");
+                self.error(Code::import_cycle, span, Some(format!("{cycle} -> {key}")));
+            }
+            return Some(unit);
+        }
+        let deep = import.ends_with("/...");
+        let folder = match import.strip_suffix("/...") {
+            Some(f) => Some(normalize(&format!("{dir}{f}/"))),
+            None => import.ends_with('/').then(|| key.clone()),
+        };
+        if let Some(folder) = &folder
+            && self.files.list(folder).is_none()
+        {
+            self.error(Code::missing_import, span, None);
+            return None;
+        }
+        if folder.is_none() {
+            if self.files.list(&format!("{key}/")).is_some() {
+                self.error(Code::folder_without_slash, span, None);
+                return None;
+            }
+            if self.files.read(&key).is_none() {
+                self.error(Code::missing_import, span, None);
+                return None;
+            }
+        }
+        let unit = self.new_unit(&key);
+        self.units.insert(key.clone(), unit);
+        match folder {
+            Some(folder) => self.folder_unit(unit, &folder, deep, span),
+            None if key.rsplit('/').next() == Some(MANIFEST) => {
+                self.manifest_unit(unit, dir_of(&key), false);
+            }
+            None => {
+                if !self.add_file(unit, &key, "", import, span) {
+                    self.error(Code::imported_entry_file, span, None);
+                }
+            }
+        }
+        self.loading.pop();
+        Some(unit)
+    }
+
+    /// A folder import: the folder's own files, plus its manifest's settings and imports.
+    fn folder_unit(&mut self, unit: usize, folder: &str, deep: bool, span: Span) {
+        let has_manifest = self.has_manifest(folder);
+        let namespace = if has_manifest {
+            self.manifest_unit(unit, folder, true)
+        } else {
+            String::new()
+        };
+        for path in self.folder_files(folder, deep, span) {
+            self.add_file(unit, &path, &namespace, folder, span);
+        }
+    }
+
+    /// Reads `folder`'s manifest into `unit`: its `package` const, host and the units it imports.
+    /// Listed paths inside the folder are the unit's own code, which a folder import already
+    /// has (`has_code`); otherwise they're loaded here. Returns the package's namespace.
+    fn manifest_unit(&mut self, unit: usize, folder: &str, has_code: bool) -> String {
+        let path = format!("{folder}{MANIFEST}");
+        let text = self.files.read(&path).unwrap_or_default();
+        let data = self.parse_data(&path, &text);
+        let manifest = Manifest::read(&data);
+        let namespace = data
+            .namespace
+            .as_ref()
+            .map(|(n, _)| n.clone())
+            .unwrap_or_default();
+        if let Some((host, span)) = &manifest.host
+            && host != HOST
+        {
+            self.error(Code::unknown_host, *span, None);
+        }
+        let package = DataDecl {
+            name: "package".to_string(),
+            span: data.value.span,
+            ty: Some(TypeExpr::Name(
+                "check.std.Package".to_string(),
+                data.value.span,
+            )),
+            value: data.value,
+            is_pure: true,
+            is_private: namespace.is_empty(),
+        };
+        self.push(unit, namespace.clone(), vec![Stmt::Data(package)]);
+        for (import, span) in &manifest.imports {
+            let target = normalize(&format!("{folder}{}", import.trim_end_matches("...")));
+            let is_folder = import.ends_with('/') || import.ends_with("/...");
+            let sub_package = if is_folder {
+                target != folder && self.has_manifest(&target)
+            } else {
+                target.rsplit('/').next() == Some(MANIFEST)
+            };
+            let inside = !import.contains(':')
+                && target.starts_with(folder)
+                && !target.starts_with("../")
+                && !sub_package;
+            if !inside {
+                if let Some(dep) = self.import(folder, import, *span) {
+                    self.grant(unit, dep, false);
+                }
+            } else if !has_code {
+                let deep = import.ends_with("/...");
+                let files = if is_folder {
+                    self.folder_files(&target, deep, *span)
+                } else {
+                    vec![target]
+                };
+                for file in files {
+                    self.add_file(unit, &file, &namespace, folder, *span);
+                }
+            }
+        }
+        namespace
+    }
+
+    fn has_manifest(&self, folder: &str) -> bool {
+        self.files
+            .list(folder)
+            .is_some_and(|n| n.iter().any(|n| n == MANIFEST))
+    }
+
+    /// Adds one file to `unit`. Returns false for an entry file, which isn't added.
+    fn add_file(
+        &mut self,
+        unit: usize,
+        path: &str,
+        package_ns: &str,
+        label: &str,
+        span: Span,
+    ) -> bool {
+        if path == self.entry {
+            return false;
+        }
+        let text = self.files.read(path).unwrap_or_default();
+        let (namespace, stmts) = if path.ends_with(".con") || path.ends_with(".conx") {
+            let data = self.parse_data(path, &text);
+            let file_name = path.rsplit('/').next().unwrap_or(path);
+            let (stem, is_pure) = match file_name.strip_suffix(".con") {
+                Some(stem) => (stem, true),
+                None => (file_name.trim_end_matches(".conx"), false),
+            };
+            if !is_name(stem) {
+                self.error(Code::bad_data_name, data.value.span, None);
+            }
+            let decl = DataDecl {
+                name: stem.to_string(),
+                span: data.value.span,
+                ty: None,
+                value: data.value,
+                is_pure,
+                is_private: false,
+            };
+            (data.namespace, vec![Stmt::Data(decl)])
+        } else {
+            let mut diags = Vec::new();
+            let file = self.parse_into(path, &text, &mut diags);
+            if is_entry(&file) {
+                return false;
+            }
+            self.diags.extend(diags);
+            (file.namespace, file.stmts)
+        };
+        if let Some(owner) = self.owners.get(path) {
+            let detail = format!("{path} is also in \"{owner}\"");
+            self.error(Code::overlapping_imports, span, Some(detail));
+            return true;
+        }
+        self.owners.insert(path.to_string(), label.to_string());
+        let namespace = match namespace {
+            Some((ns, ns_span)) if !package_ns.is_empty() => {
+                if ns == package_ns {
+                    self.diags
+                        .push(Diagnostic::warning(Code::repeated_namespace, ns_span));
+                } else if !ns.starts_with(&format!("{package_ns}.")) {
+                    self.error(Code::namespace_outside_package, ns_span, None);
+                }
+                ns
+            }
+            Some((ns, _)) => ns,
+            None => package_ns.to_string(),
+        };
+        self.push(unit, namespace, stmts);
+        true
+    }
+
+    /// The code and data files of a folder, and its subfolders if `deep`. A folder with data
+    /// files and no code is one map of them, which waits for `Map`, so it's an error for now.
+    fn folder_files(&mut self, folder: &str, deep: bool, span: Span) -> Vec<String> {
         let names = self.files.list(folder).unwrap_or_default();
+        let mut paths = Vec::new();
+        let mut has_code = false;
+        let mut has_data = false;
         for name in &names {
             if name.ends_with(".check") {
+                has_code = true;
+                paths.push(format!("{folder}{name}"));
+            } else if name.ends_with(".con") && name != MANIFEST || name.ends_with(".conx") {
+                has_data = true;
                 paths.push(format!("{folder}{name}"));
             } else if deep && name.ends_with('/') {
                 let sub = format!("{folder}{name}");
-                let has_manifest = self
-                    .files
-                    .list(&sub)
-                    .is_some_and(|n| n.iter().any(|n| n == "package.con"));
-                if !has_manifest {
-                    self.folder_files(&sub, true, paths);
+                if !self.has_manifest(&sub) {
+                    paths.extend(self.folder_files(&sub, true, span));
                 }
             }
         }
+        if has_data && !has_code {
+            self.error(Code::data_folder, span, Some(folder.to_string()));
+            paths.retain(|p| !p.starts_with(folder) || p[folder.len()..].contains('/'));
+        }
+        paths
     }
+}
+
+/// A data file's name: a valid name that isn't a keyword or one of the reserved type names.
+fn is_name(stem: &str) -> bool {
+    let mut chars = stem.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !lexer::RESERVED.contains(&stem)
+        && !crate::checker::RESERVED_NAMES.contains(&stem)
 }
 
 /// An entry file has imports or top-level statements; it's never part of a folder's unit.
@@ -270,7 +564,7 @@ fn is_entry(file: &File) -> bool {
         || file.stmts.iter().any(|s| {
             !matches!(
                 s,
-                Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_)
+                Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) | Stmt::Data(_)
             )
         })
 }

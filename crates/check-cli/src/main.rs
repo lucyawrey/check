@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use check_core::diag::Severity;
+use check_core::modules::entry_of;
 use check_core::{Files, Outcome, Report, check_program, run_program};
 
 const STACK_SIZE: usize = 1 << 30;
@@ -57,6 +58,20 @@ impl Files for Disk {
     }
 }
 
+/// The file to run: `path` itself, or the entry file a folder's manifest names.
+fn entry(path: &str) -> Option<String> {
+    if !Path::new(path).is_dir() {
+        return read(path).map(|_| path.to_string());
+    }
+    match entry_of(path, &Disk) {
+        Ok(entry) => Some(entry),
+        Err(code) => {
+            eprintln!("error[{code}]: {}\n --> {path}", code.message());
+            None
+        }
+    }
+}
+
 fn read(path: &str) -> Option<String> {
     match fs::read_to_string(path) {
         Ok(src) => Some(src),
@@ -81,13 +96,13 @@ fn render(report: &Report, errors_only: bool) -> String {
 }
 
 fn run(path: &str) -> ExitCode {
-    if read(path).is_none() {
+    let Some(path) = entry(path) else {
         return ExitCode::FAILURE;
-    }
+    };
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut output = io::stdout();
-    let report = run_program(path, &Disk, false, &mut input, &mut output);
+    let report = run_program(&path, &Disk, false, &mut input, &mut output);
     eprint!("{}", render(&report, false));
     match report.outcome {
         Outcome::Finished => ExitCode::SUCCESS,
@@ -96,10 +111,10 @@ fn run(path: &str) -> ExitCode {
 }
 
 fn check(path: &str) -> ExitCode {
-    if read(path).is_none() {
+    let Some(path) = entry(path) else {
         return ExitCode::FAILURE;
-    }
-    let checked = check_program(path, &Disk, true);
+    };
+    let checked = check_program(&path, &Disk, true);
     for d in &checked.diagnostics {
         eprint!("{}", d.render(&checked.sources));
     }
@@ -115,6 +130,12 @@ fn check(path: &str) -> ExitCode {
 }
 
 fn test_file(dir: &Path) -> Result<PathBuf, String> {
+    if dir.join("package.con").exists() {
+        let dir = format!("{}/", dir.display());
+        return entry_of(&dir, &Disk)
+            .map(PathBuf::from)
+            .map_err(|code| code.message().to_string());
+    }
     let checks: Vec<PathBuf> = fs::read_dir(dir)
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok().map(|e| e.path()))

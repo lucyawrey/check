@@ -20,10 +20,12 @@ struct Decl {
     is_library: bool,
 }
 
-/// `access[u]` lists the units code in unit `u` sees, and whether it sees their private names.
+/// `access[u]` lists the units code in unit `u` sees, whether it sees their private names, and
+/// the unit that passed each one on, if any. `labels[u]` is how unit `u` was imported.
 pub fn resolve(
     files: &mut [SourceFile],
-    access: &[Vec<(usize, bool)>],
+    access: &[Vec<(usize, bool, Option<usize>)>],
+    labels: &[String],
     diags: &mut Vec<Diagnostic>,
 ) {
     let mut decls: HashMap<String, Vec<Decl>> = HashMap::new();
@@ -46,6 +48,7 @@ pub fn resolve(
             let (name, is_private, is_type) = match stmt {
                 Stmt::Func(d) => (&d.name, d.is_private, false),
                 Stmt::Class(d) => (&d.name, d.is_private, true),
+                Stmt::Data(d) => (&d.name, d.is_private, false),
                 Stmt::Enum(d) => {
                     for v in &d.variants {
                         let list = variants.entry(file.namespace.clone()).or_default();
@@ -78,7 +81,7 @@ pub fn resolve(
         }
     }
     for file in files.iter_mut() {
-        let sees_unit = |u: &usize| access[file.unit].iter().any(|(v, _)| v == u);
+        let sees_unit = |u: &usize| access[file.unit].iter().any(|(v, ..)| v == u);
         let own_variants = variants
             .get(&file.namespace)
             .into_iter()
@@ -98,6 +101,7 @@ pub fn resolve(
             user_roots,
             own_variants,
             access: &access[file.unit],
+            labels,
             unit: file.unit,
             namespace: &file.namespace,
             scopes: vec![top_level_names(&file.stmts)],
@@ -169,7 +173,8 @@ struct Resolver<'a> {
     user_roots: HashSet<String>,
     /// Variants of enums in this file's namespace, which count as its own names.
     own_variants: HashSet<String>,
-    access: &'a [(usize, bool)],
+    access: &'a [(usize, bool, Option<usize>)],
+    labels: &'a [String],
     unit: usize,
     namespace: &'a str,
     scopes: Vec<HashSet<String>>,
@@ -219,7 +224,7 @@ impl Resolver<'_> {
             .iter()
             .filter(|d| !types_only || d.is_type)
         {
-            let Some((_, private)) = self.access.iter().find(|(u, _)| *u == d.unit) else {
+            let Some((_, private, _)) = self.access.iter().find(|(u, ..)| *u == d.unit) else {
                 continue;
             };
             let usable = !d.is_private || *private;
@@ -261,7 +266,7 @@ impl Resolver<'_> {
         }
         if let Some(span) = span {
             if found.len() > 1 {
-                let mut names: Vec<&str> = found.iter().map(|d| d.key.as_str()).collect();
+                let mut names: Vec<String> = found.iter().map(|d| self.described(d)).collect();
                 names.sort();
                 self.error(Code::ambiguous_name, span, Some(names.join(", ")));
             } else if hidden {
@@ -271,6 +276,19 @@ impl Resolver<'_> {
             }
         }
         None
+    }
+
+    /// A declaration's name, and the import that passed its unit on, if one did.
+    fn described(&self, d: &Decl) -> String {
+        let via = self
+            .access
+            .iter()
+            .find(|(u, ..)| *u == d.unit)
+            .and_then(|a| a.2);
+        match via {
+            Some(v) => format!("{} (via {})", d.key, self.labels[v]),
+            None => d.key.clone(),
+        }
     }
 
     /// The key of a qualified name (`geo.Point`), checked against what this file sees.
@@ -338,6 +356,13 @@ impl Resolver<'_> {
                 self.members(&e.name, &key, &mut e.members);
                 self.scopes.pop();
                 e.name = key;
+            }
+            Stmt::Data(d) => {
+                d.name = self.own_key(&d.name);
+                if let Some(t) = &mut d.ty {
+                    self.type_expr(t);
+                }
+                self.expr(&mut d.value);
             }
             Stmt::Implement(i) => {
                 let key = self
@@ -495,7 +520,7 @@ impl Resolver<'_> {
                 self.expr(value);
             }
             Stmt::Expr(e) => self.expr(e),
-            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) => {
+            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) | Stmt::Data(_) => {
                 self.declaration(stmt)
             }
         }

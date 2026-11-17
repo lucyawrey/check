@@ -24,7 +24,7 @@ pub struct Token {
     pub span: Span,
 }
 
-const RESERVED: &[&str] = &[
+pub(crate) const RESERVED: &[&str] = &[
     "func",
     "let",
     "var",

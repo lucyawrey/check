@@ -87,7 +87,10 @@ enum TypeDef {
 
 struct ConstEntry {
     decl: ConstDecl,
-    owner: String,
+    /// The type a member const belongs to, or `None` for a data file.
+    owner: Option<String>,
+    /// For a data file, whether it's a `.con` file, which holds only literals.
+    pure: bool,
     ty: Ty,
     state: FuncState,
 }
@@ -176,7 +179,7 @@ pub struct Checker {
     in_library: bool,
 }
 
-const RESERVED_NAMES: &[&str] = &["Maybe", "Some", "None", "Result", "Ok", "Err"];
+pub(crate) const RESERVED_NAMES: &[&str] = &["Maybe", "Some", "None", "Result", "Ok", "Err"];
 const MUTATING: &[&str] = &["push", "pop", "removeAt"];
 const BUILT_IN_TYPES: &[&str] = &["String", "Int", "Float", "Bool"];
 
@@ -219,7 +222,7 @@ impl Checker {
     }
 
     fn program(&mut self, program: &[Stmt], library: &[Stmt]) {
-        for stmt in program {
+        for stmt in library.iter().chain(program) {
             let (name, span) = match stmt {
                 Stmt::Class(c) => (&c.name, c.span),
                 Stmt::Enum(e) => (&e.name, e.span),
@@ -231,7 +234,7 @@ impl Checker {
                 self.error(Code::duplicate_name, span);
             }
         }
-        for stmt in program {
+        for stmt in library.iter().chain(program) {
             match stmt {
                 Stmt::Class(c) => self.declare_class(c),
                 Stmt::Enum(e) => self.declare_enum(e),
@@ -241,7 +244,8 @@ impl Checker {
         for stmt in program {
             match stmt {
                 Stmt::Func(decl) => {
-                    if self.type_names.contains(&decl.name) {
+                    if self.type_names.contains(&decl.name) || self.consts.contains_key(&decl.name)
+                    {
                         self.error(Code::duplicate_name, decl.span);
                     }
                     self.declare_func(decl, None, None);
@@ -250,6 +254,7 @@ impl Checker {
                     self.top_level_names.insert(name.clone());
                 }
                 Stmt::Implement(i) => self.declare_implement(i),
+                Stmt::Data(d) => self.declare_data(d),
                 _ => {}
             }
         }
@@ -405,7 +410,8 @@ impl Checker {
                 key,
                 ConstEntry {
                     decl: c.clone(),
-                    owner: owner.to_string(),
+                    owner: Some(owner.to_string()),
+                    pure: false,
                     ty: Ty::Error,
                     state: FuncState::Unchecked,
                 },
@@ -492,12 +498,14 @@ impl Checker {
             }
             FuncState::Unchecked => entry.state = FuncState::InProgress,
         }
-        let (decl, owner) = (entry.decl.clone(), entry.owner.clone());
-        if let Some(bad) = self.non_constant(&decl.value, &owner) {
+        let (decl, owner, pure) = (entry.decl.clone(), entry.owner.clone(), entry.pure);
+        if let Some(owner) = &owner
+            && let Some(bad) = self.non_constant(&decl.value, owner)
+        {
             self.error(Code::const_not_constant, bad.span);
         }
         let saved_scopes = std::mem::replace(&mut self.scopes, vec![HashMap::new()]);
-        let saved_type = self.current_type.replace(owner);
+        let saved_type = std::mem::replace(&mut self.current_type, owner);
         let declared = decl.ty.as_ref().map(|t| self.type_from(t));
         let actual = self.expr(&decl.value, declared.as_ref());
         let ty = match declared {
@@ -509,10 +517,72 @@ impl Checker {
         };
         self.scopes = saved_scopes;
         self.current_type = saved_type;
+        // Runs after typing, which records what each call and name resolved to.
+        if pure && let Some(bad) = self.non_literal(&decl.value) {
+            self.error(Code::code_in_pure_data, bad.span);
+        }
         let entry = self.consts.get_mut(key).expect("const");
         entry.ty = ty.clone();
         entry.state = FuncState::Done;
         ty
+    }
+
+    fn declare_data(&mut self, d: &DataDecl) {
+        if self.funcs.contains_key(&d.name)
+            || self.type_names.contains(&d.name)
+            || self.consts.contains_key(&d.name)
+        {
+            self.error(Code::duplicate_name, d.span);
+            return;
+        }
+        let decl = ConstDecl {
+            name: d.name.clone(),
+            span: d.span,
+            ty: d.ty.clone(),
+            value: d.value.clone(),
+            is_private: d.is_private,
+        };
+        self.consts.insert(
+            d.name.clone(),
+            ConstEntry {
+                decl,
+                owner: None,
+                pure: d.is_pure,
+                ty: Ty::Error,
+                state: FuncState::Unchecked,
+            },
+        );
+    }
+
+    /// The first part of a `.con` value that isn't a literal: only constructor and variant
+    /// calls, record literals, variants, lists, strings without interpolation, numbers and
+    /// `Bool` are.
+    fn non_literal<'e>(&self, e: &'e Expr) -> Option<&'e Expr> {
+        let made = matches!(
+            self.info.resolved.get(&e.id),
+            Some(Resolved::Construct(_) | Resolved::Variant(..))
+        );
+        let args = |args: &'e [Arg]| args.iter().find_map(|a| self.non_literal(&a.value));
+        match &e.kind {
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => None,
+            ExprKind::Str(segs) if segs.iter().all(|s| matches!(s, StrSeg::Text(_))) => None,
+            ExprKind::Unary(UnOp::Neg, x)
+                if matches!(x.kind, ExprKind::Int(_) | ExprKind::Float(_)) =>
+            {
+                None
+            }
+            ExprKind::List(items) => items.iter().find_map(|x| self.non_literal(x)),
+            ExprKind::Record(a) => args(a),
+            ExprKind::Call(callee, a)
+                if made || matches!(&callee.kind, ExprKind::Name(n) if n == "Some") =>
+            {
+                args(a)
+            }
+            ExprKind::Method(_, _, a) if made => args(a),
+            ExprKind::Name(n) if made || n == "None" => None,
+            ExprKind::Field(..) if made => None,
+            _ => Some(e),
+        }
     }
 
     fn non_constant<'e>(&self, e: &'e Expr, owner: &str) -> Option<&'e Expr> {
@@ -891,7 +961,9 @@ impl Checker {
                 }
                 Ty::Void
             }
-            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) => Ty::Void,
+            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) | Stmt::Data(_) => {
+                Ty::Void
+            }
             Stmt::Expr(e) => self.unused(e),
         }
     }
@@ -1526,6 +1598,12 @@ impl Checker {
                 self.info.resolved.insert(id, Resolved::Const(key.clone()));
                 return self.const_type(&key);
             }
+        }
+        if self.consts.get(name).is_some_and(|c| c.owner.is_none()) {
+            self.info
+                .resolved
+                .insert(id, Resolved::Const(name.to_string()));
+            return self.const_type(name);
         }
         if let Some(e) = self.expected_variant(expected, name) {
             return self.unit_variant(id, &e, name, span);
@@ -2800,7 +2878,9 @@ fn mutates(expr: &Expr, list: &str) -> bool {
             Stmt::Let { value, .. } => mutates(value, list),
             Stmt::Expr(e) => mutates(e, list),
             Stmt::LetPattern { value, .. } => mutates(value, list),
-            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) => false,
+            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) | Stmt::Data(_) => {
+                false
+            }
         }),
         ExprKind::Str(segs) => segs
             .iter()
