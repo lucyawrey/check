@@ -72,6 +72,17 @@
 - `private_member` a `private` field or method used outside its type, or passed to its constructor
 - `readonly_field` a `readonly var` set outside its class, including by `...` copying
 - `private_field_without_default` a `private` field with no default, which the constructor can't set
+- `code_in_pure_data` something other than a literal in a `.con` file (use `.conx` for computed values)
+- `bad_data_name` a data file whose name isn't a valid name, or is a keyword or reserved name (`class.con`, `Ok.con`)
+- `data_folder` a folder of data files with no code, which will be one map once `Map` exists
+- `namespace_outside_package` a file's namespace that doesn't start with its package's
+- `import_cycle` units whose manifests import each other in a loop
+- `unsupported_import` a `pkg:` or URL import, which isn't supported yet
+- `unknown_host` a host other than `check:cli`, in `hostImport` or `import host`
+- `misplaced_host_import` `import host` written twice, or in an entry file beside a `package.con`
+- `missing_manifest` a folder run with no `package.con`
+- `no_entry` a folder run whose `package.con` names no `entry`
+- `missing_entry` a `package.con` `entry` file that doesn't exist
 
 ## Stops
 - `try_stopped` a top-level `try` found `None`, so the program stopped (not a panic; exit status 1)
@@ -86,10 +97,12 @@
 - `round_out_of_range` rounding `NaN`, `Infinity` or a `Float` too big for an `Int`
 - `stack_overflow` more than 10,000 nested calls
 - `index_out_of_range` writing to a list index that doesn't exist (`list[9] = x`)
+- `const_cycle` a `.conx` value that reaches itself through a function call while it's being built
 
 ## Warnings
 - `unused_var` a `var` that's never reassigned
 - `shadowed_name` a local that shadows a function or type
+- `repeated_namespace` a `namespace` line that only repeats its package's, which the manifest already sets
 - `interpolated_maybe` interpolating a `T?`
 - `nested_maybe` an `if` or loop value that is a `T??`
 - `let_else_some` `let Some(x) = e else { ... }`, which `let x = e ?? ...` replaces
