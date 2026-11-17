@@ -2,11 +2,16 @@ use std::io::Cursor;
 
 use check_core::ast::Stmt;
 use check_core::diag::Severity;
-use check_core::{Outcome, run_source};
+use check_core::modules::MemFiles;
+use check_core::{Outcome, Report, run_program, run_source};
 
 fn output(src: &str) -> String {
     let mut out = Vec::new();
     let report = run_source("test.check", src, &mut Cursor::new(Vec::new()), &mut out);
+    finished(report, out, src)
+}
+
+fn finished(report: Report, out: Vec<u8>, src: &str) -> String {
     let errors: Vec<String> = report
         .diagnostics
         .iter()
@@ -413,7 +418,7 @@ fn consts_are_computed_before_the_program_runs() {
 
 #[test]
 fn library_files_hold_only_declarations_that_match_the_rust_bodies() {
-    let checked = check_core::check_source("");
+    let checked = check_core::check_source("test.check", "");
     assert!(checked.diagnostics.is_empty());
     let mut declared = Vec::new();
     for stmt in &checked.library {
@@ -786,4 +791,342 @@ fn a_list_type_can_be_written_with_brackets_read_left_to_right() {
         ),
         "[]\n[Some(1), None]\nNone\n[[1], []]"
     );
+}
+
+#[test]
+fn branches_whose_value_is_unused_may_have_different_types() {
+    assert_eq!(
+        output(
+            "enum E {\n  A\n  B\n}\nfor x in [E.A, E.B] {\n  match x {\n    A => print(\"a\")\n    _ => 5\n  }\n  if x == E.A { 1 } else { \"b\" }\n}"
+        ),
+        "a"
+    );
+    assert_eq!(
+        first_error("let v = match 1 {\n  1 => \"a\"\n  _ => 5\n}"),
+        "branch_type_mismatch"
+    );
+}
+
+/// Runs `files[0]` as the entry file, the others beside it.
+fn run_files(files: &[(&str, &str)], allow_private: bool) -> (Report, Vec<u8>) {
+    let mem = MemFiles(
+        files
+            .iter()
+            .map(|(p, s)| (p.to_string(), s.to_string()))
+            .collect(),
+    );
+    let mut out = Vec::new();
+    let report = run_program(
+        files[0].0,
+        &mem,
+        allow_private,
+        &mut Cursor::new(Vec::new()),
+        &mut out,
+    );
+    (report, out)
+}
+
+fn files_output(files: &[(&str, &str)]) -> String {
+    let (report, out) = run_files(files, false);
+    finished(report, out, files[0].1)
+}
+
+fn files_error(files: &[(&str, &str)]) -> String {
+    let (report, _) = run_files(files, false);
+    report
+        .diagnostics
+        .iter()
+        .find(|d| d.severity == Severity::Error)
+        .map(|d| d.code.to_string())
+        .unwrap_or_default()
+}
+
+const GEO: (&str, &str) = (
+    "geo/point.check",
+    "namespace geo\n\nclass Point(x: Int, y: Int)\nfunc origin() -> Point { Point(0, 0) }\nprivate func secret() -> Int { 1 }\nfunc one() -> Int { secret() }",
+);
+const ART: (&str, &str) = (
+    "art/point.check",
+    "namespace art\n\nclass Point(name: String)\nfunc origin() -> Point { Point(\"o\") }",
+);
+
+#[test]
+fn an_imported_name_works_unqualified_until_it_clashes() {
+    assert_eq!(
+        files_output(&[
+            (
+                "main.check",
+                "import \"geo/\"\nprint(origin())\nprint(one())"
+            ),
+            GEO
+        ]),
+        "geo.Point(x = 0, y = 0)\n1"
+    );
+    assert_eq!(
+        files_error(&[
+            (
+                "main.check",
+                "import \"geo/\"\nimport \"art/\"\nprint(origin())"
+            ),
+            GEO,
+            ART
+        ]),
+        "ambiguous_name"
+    );
+    assert_eq!(
+        files_output(&[
+            (
+                "main.check",
+                "import \"geo/\"\nimport \"art/\"\nlet p: art.Point = art.origin()\nprint(p)\nprint(geo.origin() == geo.Point(0, 0))"
+            ),
+            GEO,
+            ART
+        ]),
+        "art.Point(name = \"o\")\ntrue"
+    );
+}
+
+#[test]
+fn the_files_own_namespace_wins_a_clash() {
+    assert_eq!(
+        files_output(&[
+            (
+                "main.check",
+                "import \"geo/\"\nfunc origin() -> Int { 7 }\nprint(origin())"
+            ),
+            GEO
+        ]),
+        "7"
+    );
+}
+
+#[test]
+fn a_private_name_is_only_visible_inside_its_unit() {
+    let main = ("main.check", "import \"geo/\"\nprint(secret())");
+    assert_eq!(files_error(&[main, GEO]), "private_name");
+    let main = ("main.check", "import private \"geo/\"\nprint(secret())");
+    assert_eq!(files_error(&[main, GEO]), "private_import_in_run");
+    let (report, out) = run_files(&[main, GEO], true);
+    assert_eq!(finished(report, out, main.1), "1");
+}
+
+#[test]
+fn a_unit_only_sees_its_own_files_and_the_library() {
+    let other = ("other/a.check", "func f() -> Int { one() }");
+    let main = ("main.check", "import \"geo/\"\nimport \"other/\"\nprint(1)");
+    assert_eq!(files_error(&[main, GEO, other]), "unknown_name");
+}
+
+#[test]
+fn a_local_named_like_a_namespace_wins_with_a_warning() {
+    let main = (
+        "main.check",
+        "import \"geo/\"\nlet geo = (origin = 5)\nprint(geo.origin)",
+    );
+    let (report, out) = run_files(&[main, GEO], false);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code.to_string() == "shadowed_name")
+    );
+    assert_eq!(finished(report, out, main.1), "5");
+}
+
+#[test]
+fn folder_imports_are_shallow_unless_they_end_in_dots() {
+    let deep = ("lib/more/b.check", "func b() -> Int { 2 }");
+    let top = ("lib/a.check", "func a() -> Int { 1 }");
+    let tool = ("lib/tool.check", "print(\"never part of the unit\")");
+    assert_eq!(
+        files_error(&[
+            ("main.check", "import \"lib/\"\nprint(b())"),
+            top,
+            deep,
+            tool
+        ]),
+        "unknown_name"
+    );
+    assert_eq!(
+        files_output(&[
+            ("main.check", "import \"lib/...\"\nprint(a() + b())"),
+            top,
+            deep,
+            tool
+        ]),
+        "3"
+    );
+}
+
+#[test]
+fn imports_must_name_one_existing_unit() {
+    let a = ("lib/a.check", "func a() -> Int { 1 }");
+    let entry = ("lib/run.check", "print(1)");
+    assert_eq!(
+        files_error(&[("main.check", "import \"lib\""), a]),
+        "folder_without_slash"
+    );
+    assert_eq!(
+        files_error(&[("main.check", "import \"nope/\""), a]),
+        "missing_import"
+    );
+    assert_eq!(
+        files_error(&[("main.check", "import \"lib/run.check\""), a, entry]),
+        "imported_entry_file"
+    );
+    assert_eq!(
+        files_error(&[("main.check", "import \"lib/\"\nimport \"lib/a.check\""), a]),
+        "overlapping_imports"
+    );
+}
+
+#[test]
+fn a_namespace_line_must_come_first() {
+    assert_eq!(
+        first_error("func f() {}\nnamespace late"),
+        "misplaced_namespace"
+    );
+}
+
+const COUNTER: &str = "ref class Counter {\n  readonly var count: Int = 0\n  private var step: Int = 1\n  private let log: String[] = []\n}\nimplement Counter {\n  func tick() { this.count += this.step }\n  private func reset() { this.count = 0 }\n}\n";
+
+#[test]
+fn a_private_field_or_method_is_only_usable_inside_its_type() {
+    assert_eq!(
+        output(&format!(
+            "{COUNTER}var c = Counter()\nc.tick()\nc.tick()\nprint(c.count)"
+        )),
+        "2"
+    );
+    for (code, src) in [
+        ("private_member", "let c = Counter()\nprint(c.step)"),
+        ("private_member", "var c = Counter()\nc.reset()"),
+        ("private_member", "let c = Counter(step = 2)"),
+        ("private_member", "let c = (...Counter(), step = 2)"),
+    ] {
+        assert_eq!(first_error(&format!("{COUNTER}{src}")), code, "{src}");
+    }
+    assert_eq!(
+        first_error("class P {\n  private let x: Int\n}"),
+        "private_field_without_default"
+    );
+}
+
+#[test]
+fn a_readonly_var_is_set_at_construction_and_changed_only_by_its_class() {
+    assert_eq!(
+        output(&format!("{COUNTER}print(Counter(count = 5).count)")),
+        "5"
+    );
+    assert_eq!(output(&format!("{COUNTER}print(Counter(5).count)")), "5");
+    for src in [
+        "var c = Counter()\nc.count = 3",
+        "let c = (...Counter(), count = 2)",
+    ] {
+        assert_eq!(
+            first_error(&format!("{COUNTER}{src}")),
+            "readonly_field",
+            "{src}"
+        );
+    }
+}
+
+#[test]
+fn modifiers_are_ordinary_names_outside_declarations() {
+    assert_eq!(
+        output("let private = 1\nlet readonly = 2\nprint(private + readonly)"),
+        "3"
+    );
+}
+
+#[test]
+fn private_names_in_two_units_dont_clash_but_public_ones_do() {
+    let a = (
+        "a/a.check",
+        "private func helper() -> Int { 1 }\nfunc fromA() -> Int { helper() }",
+    );
+    let b = (
+        "b/b.check",
+        "private func helper() -> Int { 2 }\nfunc fromB() -> Int { helper() }",
+    );
+    let main = (
+        "main.check",
+        "import \"a/\"\nimport \"b/\"\nprint(fromA() + fromB())",
+    );
+    assert_eq!(files_output(&[main, a, b]), "3");
+    let c = ("c/c.check", "func fromA() -> Int { 9 }");
+    let main = ("main.check", "import \"a/\"\nimport \"c/\"\nprint(1)");
+    assert_eq!(files_error(&[main, a, c]), "duplicate_name");
+}
+
+#[test]
+fn a_variant_of_the_files_own_enum_wins_over_an_imported_type() {
+    let shapes = ("shapes/s.check", "namespace shapes\n\nclass Circle(r: Int)");
+    let main = (
+        "main.check",
+        "import \"shapes/\"\nenum Shape {\n  Circle(r: Int)\n  Dot\n}\nlet s: Shape = Circle(2)\nmatch s {\n  Circle(r) => print(r)\n  Dot => print(0)\n}\nprint(shapes.Circle(3).r)",
+    );
+    assert_eq!(files_output(&[main, shapes]), "2\n3");
+}
+
+#[test]
+fn a_class_pattern_can_be_qualified_by_its_namespace() {
+    let main = (
+        "main.check",
+        "import \"geo/\"\nimport \"art/\"\nmatch geo.origin() {\n  geo.Point(x, y) => print(x + y)\n}",
+    );
+    assert_eq!(files_output(&[main, GEO, ART]), "0");
+    let main = (
+        "main.check",
+        "import \"geo/\"\nimport \"art/\"\nmatch geo.origin() {\n  Point(x, y) => print(x + y)\n}",
+    );
+    assert_eq!(files_error(&[main, GEO, ART]), "ambiguous_name");
+}
+
+#[test]
+fn a_private_const_is_only_readable_inside_its_type() {
+    let src = "class P {\n  let x: Int = 1\n  private const secret: Int = 42\n}\n";
+    assert_eq!(
+        first_error(&format!("{src}print(P.secret)")),
+        "private_member"
+    );
+}
+
+#[test]
+fn field_modifiers_are_errors_elsewhere() {
+    for src in [
+        "func f(private var x: Int) -> Int { x }",
+        "class P {\n  readonly let x: Int = 1\n}",
+        "class P(x: Int)\nprivate implement P {\n  func f() {}\n}",
+    ] {
+        assert_eq!(first_error(src), "unexpected_token", "{src}");
+    }
+}
+
+#[test]
+fn changing_a_readonly_list_from_outside_is_a_readonly_error() {
+    let src =
+        "ref class Bag {\n  readonly var items: Int[] = []\n}\nlet b = Bag()\nb.items.push(1)";
+    assert_eq!(first_error(src), "readonly_field");
+}
+
+#[test]
+fn an_entry_file_cant_import_itself() {
+    assert_eq!(
+        files_error(&[("main.check", "import \"main.check\"\nprint(1)")]),
+        "imported_entry_file"
+    );
+}
+
+#[test]
+fn library_files_dont_warn_about_a_users_namespace() {
+    let text = (
+        "text/t.check",
+        "namespace text\n\nfunc hi() -> String { \"hi\" }",
+    );
+    let (report, _) = run_files(
+        &[("main.check", "import \"text/\"\nprint(hi())"), text],
+        false,
+    );
+    assert!(report.diagnostics.is_empty());
 }

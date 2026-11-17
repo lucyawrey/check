@@ -1,0 +1,9 @@
+import "shapes/"
+import "art/"
+
+let corner = shapes.Point(3, 4)
+let dot: art.Point = art.origin()
+print(describe(corner))
+print(describe(shapes.origin()))
+print(dot)
+print(corner == shapes.Point(3, 4))

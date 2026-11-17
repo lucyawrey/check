@@ -1,0 +1,4 @@
+(3, 4)
+(0, 0)
+art.Point(label = "origin", size = 1)
+true

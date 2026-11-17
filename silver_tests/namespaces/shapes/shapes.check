@@ -1,0 +1,7 @@
+namespace shapes
+
+class Point(x: Int, y: Int)
+
+func origin() -> Point { Point(0, 0) }
+
+func describe(p: Point) -> String { "({p.x}, {p.y})" }
