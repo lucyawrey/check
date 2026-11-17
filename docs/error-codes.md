@@ -72,6 +72,16 @@
 - `private_member` a `private` field or method used outside its type, or passed to its constructor
 - `readonly_field` a `readonly var` set outside its class, including by `...` copying
 - `private_field_without_default` a `private` field with no default, which the constructor can't set
+- `wrong_type_arguments` a generic type with the wrong number of type arguments (`Box` or `Box<Int, Int>` for `Box<T>`)
+- `not_an_interface` a type named after `:` in a type's header, or before `for` in `implement`, that isn't an interface
+- `unmet_constraint` a type argument that doesn't implement the interfaces its parameter needs (`<T: Shape>`)
+- `missing_implementation` a type missing a method or field an interface it implements requires
+- `wrong_implementation` a method whose parameter or return types don't match its interface's
+- `conflicting_defaults` two interfaces with defaults for the same method, which the type doesn't override
+- `field_requirement_needs_class` an interface that requires fields, implemented by an enum or built-in type
+- `implement_for_specific_arguments` an interface implemented for some of a generic type's arguments (`implement Shape for Box<Int>`), since they're erased at run time
+- `list_needs_type` a list of values of different types with no declared element type (`let xs: Shape[] = ...`)
+- `interface_field_extras` an interface field with a default, `private` or `readonly`, which only an implementing class can give it
 - `code_in_pure_data` something other than a literal in a `.con` file (use `.conx` for computed values)
 - `bad_data_name` a data file whose name isn't a valid name, or is a keyword or reserved name (`class.con`, `Ok.con`)
 - `data_folder` a folder of data files with no code, which will be one map once `Map` exists
