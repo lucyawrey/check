@@ -61,6 +61,17 @@
 - `const_not_constant` a `const` whose value isn't a constant expression
 - `const_cycle` consts defined in terms of each other
 - `external_outside_library` an `external` function outside a library package
+- `misplaced_namespace` a `namespace` line that isn't the first line of the file
+- `missing_import` an import of a file or folder that doesn't exist
+- `folder_without_slash` a folder import without its trailing `/` (`import "lib"`)
+- `imported_entry_file` an import of a file that has imports or top-level statements
+- `overlapping_imports` two imports that cover the same file (`import "lib/"` and `import "lib/a.check"`)
+- `private_import_in_run` `import private` in a program being run, not tested
+- `ambiguous_name` a name found in more than one namespace in scope, with no qualification
+- `private_name` a `private` declaration used outside its unit
+- `private_member` a `private` field or method used outside its type, or passed to its constructor
+- `readonly_field` a `readonly var` set outside its class, including by `...` copying
+- `private_field_without_default` a `private` field with no default, which the constructor can't set
 
 ## Stops
 - `try_stopped` a top-level `try` found `None`, so the program stopped (not a panic; exit status 1)
