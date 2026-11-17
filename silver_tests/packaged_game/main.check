@@ -1,0 +1,6 @@
+import "package.con"
+
+print("{settings.playerName} has {settings.startingGold} gold (game {game.package.version})")
+for item in stock {
+  print("{item.name}: {canBuy(settings.startingGold, item)}")
+}

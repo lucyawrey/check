@@ -1,0 +1,4 @@
+[
+  Item("sword", settings.startingGold + 5)
+  Item("apple", 1)
+]

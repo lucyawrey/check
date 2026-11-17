@@ -1,0 +1,3 @@
+Ana has 10 gold (game 1.0.0)
+sword: false
+apple: true
