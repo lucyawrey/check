@@ -1,0 +1,54 @@
+ref class Stack<T> {
+  var items: T[] = []
+
+  func push(item: T) { this.items.push(item) }
+  func peek() -> T? { this.items.last() }
+}
+
+implement Stack<T> {
+  func size() -> Int { this.items.length() }
+}
+
+enum Tree<T> {
+  Leaf
+  Node(Tree<T>, T, Tree<T>)
+}
+
+func insert<T: Ordered<T>>(tree: Tree<T>, value: T) -> Tree<T> {
+  match tree {
+    Leaf => Node(Leaf, value, Leaf)
+    Node(l, v, r) => if value.before(v) { Node(insert(l, value), v, r) } else { Node(l, v, insert(r, value)) }
+  }
+}
+
+func inOrder<T>(tree: Tree<T>) -> T[] {
+  match tree {
+    Leaf => []
+    Node(l, v, r) => {
+      var out = inOrder(l)
+      out.push(v)
+      for x in inOrder(r) { out.push(x) }
+      out
+    }
+  }
+}
+
+interface Ordered<T> {
+  func before(other: T) -> Bool
+}
+
+class Score: Ordered<Score> + Printable {
+  let points: Int
+  func before(other: Score) -> Bool { this.points < other.points }
+  func toString() -> String { "{this.points} pts" }
+}
+
+let stack: Stack<String> = Stack()
+stack.push("a")
+stack.push("b")
+print(stack.peek())
+print(stack.size())
+
+var tree: Tree<Score> = Leaf
+for p in [5, 2, 8, 1] { tree = insert(tree, Score(p)) }
+print(inOrder(tree))

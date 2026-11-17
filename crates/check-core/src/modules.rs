@@ -564,7 +564,12 @@ fn is_entry(file: &File) -> bool {
         || file.stmts.iter().any(|s| {
             !matches!(
                 s,
-                Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) | Stmt::Data(_)
+                Stmt::Func(_)
+                    | Stmt::Class(_)
+                    | Stmt::Enum(_)
+                    | Stmt::Implement(_)
+                    | Stmt::Interface(_)
+                    | Stmt::Data(_)
             )
         })
 }

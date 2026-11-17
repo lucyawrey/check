@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
+use crate::checker::BUILT_IN_TYPES;
 use crate::diag::{Code, Diagnostic, Span};
 
 pub struct SourceFile {
@@ -48,6 +49,7 @@ pub fn resolve(
             let (name, is_private, is_type) = match stmt {
                 Stmt::Func(d) => (&d.name, d.is_private, false),
                 Stmt::Class(d) => (&d.name, d.is_private, true),
+                Stmt::Interface(d) => (&d.name, d.is_private, true),
                 Stmt::Data(d) => (&d.name, d.is_private, false),
                 Stmt::Enum(d) => {
                     for v in &d.variants {
@@ -105,10 +107,36 @@ pub fn resolve(
             unit: file.unit,
             namespace: &file.namespace,
             scopes: vec![top_level_names(&file.stmts)],
+            type_params: HashSet::new(),
             diags,
         };
         for stmt in &mut file.stmts {
             r.declaration(stmt);
+        }
+    }
+}
+
+/// A type as the checker shows it, such as `Box<Int>` or `Int?`.
+fn type_text(t: &TypeExpr) -> String {
+    let list = |ts: &[TypeExpr]| ts.iter().map(type_text).collect::<Vec<_>>().join(", ");
+    match t {
+        TypeExpr::Name(n, _) => n.clone(),
+        TypeExpr::Generic(n, args, _) => format!("{n}<{}>", list(args)),
+        TypeExpr::Maybe(inner) => format!("{}?", type_text(inner)),
+        TypeExpr::Func(params, ret) => {
+            let ret = ret.as_ref().map(|r| format!(" -> {}", type_text(r)));
+            format!("func({}){}", list(params), ret.unwrap_or_default())
+        }
+        TypeExpr::Record(names, types, _) => {
+            let fields: Vec<String> = types
+                .iter()
+                .enumerate()
+                .map(|(i, t)| match names.get(i) {
+                    Some(n) => format!("{n}: {}", type_text(t)),
+                    None => type_text(t),
+                })
+                .collect();
+            format!("({})", fields.join(", "))
         }
     }
 }
@@ -178,6 +206,8 @@ struct Resolver<'a> {
     unit: usize,
     namespace: &'a str,
     scopes: Vec<HashSet<String>>,
+    /// Type parameters in scope, which hide types of the same name.
+    type_params: HashSet<String>,
     diags: &'a mut Vec<Diagnostic>,
 }
 
@@ -331,6 +361,8 @@ impl Resolver<'_> {
             }
             Stmt::Class(c) => {
                 let key = self.own_key(&c.name);
+                let saved = self.enter_type_params(&mut c.type_params);
+                self.type_exprs(&mut c.interfaces);
                 let consts = c.members.consts.iter().map(|k| k.name.clone()).collect();
                 self.scopes.push(consts);
                 for field in &mut c.fields {
@@ -342,10 +374,24 @@ impl Resolver<'_> {
                 }
                 self.members(&c.name, &key, &mut c.members);
                 self.scopes.pop();
+                self.type_params = saved;
                 c.name = key;
+            }
+            Stmt::Interface(i) => {
+                let key = self.own_key(&i.name);
+                let saved = self.enter_type_params(&mut i.type_params);
+                self.type_exprs(&mut i.parents);
+                for field in &mut i.fields {
+                    self.param(field);
+                }
+                self.members(&i.name, &key, &mut i.members);
+                self.type_params = saved;
+                i.name = key;
             }
             Stmt::Enum(e) => {
                 let key = self.own_key(&e.name);
+                let saved = self.enter_type_params(&mut e.type_params);
+                self.type_exprs(&mut e.interfaces);
                 for v in &mut e.variants {
                     for t in &mut v.fields {
                         self.type_expr(t);
@@ -355,6 +401,7 @@ impl Resolver<'_> {
                 self.scopes.push(consts);
                 self.members(&e.name, &key, &mut e.members);
                 self.scopes.pop();
+                self.type_params = saved;
                 e.name = key;
             }
             Stmt::Data(d) => {
@@ -368,10 +415,38 @@ impl Resolver<'_> {
                 let key = self
                     .lookup(&i.target, true, Some(i.span))
                     .map_or_else(|| i.target.clone(), |d| d.key);
+                if let Some(iface) = &mut i.interface {
+                    self.type_expr(iface);
+                }
+                // A name in `Box<T>` that isn't a type introduces a parameter.
+                let saved = self.type_params.clone();
+                for a in &mut i.target_args {
+                    match a {
+                        TypeExpr::Name(n, _)
+                            if !BUILT_IN_TYPES.contains(&n.as_str())
+                                && self.lookup(n, true, None).is_none() =>
+                        {
+                            self.type_params.insert(n.clone());
+                        }
+                        _ => self.type_expr(a),
+                    }
+                }
+                // Methods for some type arguments only are keyed by them: `Box<Int>.get`.
+                let specific = i
+                    .target_args
+                    .iter()
+                    .any(|a| !matches!(a, TypeExpr::Name(n, _) if self.type_params.contains(n)));
+                let owner = if specific {
+                    let args: Vec<String> = i.target_args.iter().map(type_text).collect();
+                    format!("{key}<{}>", args.join(", "))
+                } else {
+                    key.clone()
+                };
                 let consts = i.members.consts.iter().map(|k| k.name.clone()).collect();
                 self.scopes.push(consts);
-                self.members(&i.target.clone(), &key, &mut i.members);
+                self.members(&i.target.clone(), &owner, &mut i.members);
                 self.scopes.pop();
+                self.type_params = saved;
                 i.target = key;
             }
             _ => self.stmt(stmt),
@@ -394,7 +469,25 @@ impl Resolver<'_> {
         }
     }
 
+    /// Resolves the bounds of `params` and brings them into scope, returning the ones before.
+    fn enter_type_params(&mut self, params: &mut [TypeParam]) -> HashSet<String> {
+        let saved = self.type_params.clone();
+        self.type_params
+            .extend(params.iter().map(|p| p.name.clone()));
+        for p in params {
+            self.type_exprs(&mut p.bounds);
+        }
+        saved
+    }
+
+    fn type_exprs(&mut self, types: &mut [TypeExpr]) {
+        for t in types {
+            self.type_expr(t);
+        }
+    }
+
     fn func(&mut self, d: &mut FuncDecl, extra: &HashSet<String>) {
+        let saved = self.enter_type_params(&mut d.type_params);
         self.scopes.push(extra.clone());
         for p in &mut d.params {
             self.param(p);
@@ -407,6 +500,7 @@ impl Resolver<'_> {
             self.expr(body);
         }
         self.scopes.pop();
+        self.type_params = saved;
     }
 
     fn param(&mut self, p: &mut Param) {
@@ -420,6 +514,7 @@ impl Resolver<'_> {
 
     fn type_expr(&mut self, t: &mut TypeExpr) {
         match t {
+            TypeExpr::Name(n, _) if self.type_params.contains(n) => {}
             TypeExpr::Name(n, span) | TypeExpr::Generic(n, _, span) => {
                 if n.contains('.') {
                     *n = self.qualified(&n.clone(), *span);
@@ -520,9 +615,12 @@ impl Resolver<'_> {
                 self.expr(value);
             }
             Stmt::Expr(e) => self.expr(e),
-            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) | Stmt::Data(_) => {
-                self.declaration(stmt)
-            }
+            Stmt::Func(_)
+            | Stmt::Class(_)
+            | Stmt::Enum(_)
+            | Stmt::Implement(_)
+            | Stmt::Interface(_)
+            | Stmt::Data(_) => self.declaration(stmt),
         }
     }
 

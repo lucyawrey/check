@@ -1,1 +1,17 @@
 external func panic(reason: String? = None) -> Never
+
+enum Maybe<T> {
+  Some(T)
+  None
+}
+
+enum Result<T, E> {
+  Ok(T)
+  Err(E)
+}
+
+interface Printable {
+  func toString() -> String
+}
+
+interface Eq {}

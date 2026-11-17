@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -12,7 +13,9 @@ pub enum Ty {
     List(Box<Ty>),
     Maybe(Box<Ty>),
     Func(Vec<Ty>, Box<Ty>),
-    Named(String),
+    Named(String, Vec<Ty>),
+    /// A type parameter inside its own declaration, equal only to itself.
+    Param(String),
     Record(Vec<String>, Vec<Ty>),
     Var(usize),
     Error,
@@ -27,8 +30,29 @@ impl Ty {
         Ty::Maybe(Box::new(inner))
     }
 
+    pub fn named(name: &str) -> Ty {
+        Ty::Named(name.to_string(), Vec::new())
+    }
+
     pub fn is_numeric(&self) -> bool {
         matches!(self, Ty::Int | Ty::Float)
+    }
+
+    /// Replaces the type parameters `map` names.
+    pub fn substitute(&self, map: &HashMap<String, Ty>) -> Ty {
+        if map.is_empty() {
+            return self.clone();
+        }
+        let each = |tys: &[Ty]| tys.iter().map(|t| t.substitute(map)).collect();
+        match self {
+            Ty::Param(p) => map.get(p).cloned().unwrap_or_else(|| self.clone()),
+            Ty::List(e) => Ty::list(e.substitute(map)),
+            Ty::Maybe(e) => Ty::maybe(e.substitute(map)),
+            Ty::Func(params, ret) => Ty::Func(each(params), Box::new(ret.substitute(map))),
+            Ty::Named(n, args) => Ty::Named(n.clone(), each(args)),
+            Ty::Record(names, fields) => Ty::Record(names.clone(), each(fields)),
+            other => other.clone(),
+        }
     }
 }
 
@@ -65,6 +89,7 @@ impl Subst {
             Ty::Record(names, fields) => {
                 Ty::Record(names, fields.iter().map(|f| self.resolve(f)).collect())
             }
+            Ty::Named(n, args) => Ty::Named(n, args.iter().map(|a| self.resolve(a)).collect()),
             other => other,
         }
     }
@@ -76,7 +101,9 @@ impl Subst {
             Ty::Func(params, ret) => {
                 params.iter().any(|p| self.occurs(v, p)) || self.occurs(v, &ret)
             }
-            Ty::Record(_, fields) => fields.iter().any(|f| self.occurs(v, f)),
+            Ty::Record(_, fields) | Ty::Named(_, fields) => {
+                fields.iter().any(|f| self.occurs(v, f))
+            }
             _ => false,
         }
     }
@@ -99,6 +126,9 @@ impl Subst {
                     && p1.iter().zip(p2).all(|(x, y)| self.unify(x, y))
                     && self.unify(r1, r2)
             }
+            (Ty::Named(n1, a1), Ty::Named(n2, a2)) => {
+                n1 == n2 && a1.len() == a2.len() && a1.iter().zip(a2).all(|(x, y)| self.unify(x, y))
+            }
             (Ty::Record(n1, f1), Ty::Record(n2, f2)) => {
                 n1 == n2 && f1.len() == f2.len() && f1.iter().zip(f2).all(|(x, y)| self.unify(x, y))
             }
@@ -119,7 +149,15 @@ impl fmt::Display for Show<'_> {
             Ty::Void => f.write_str("Void"),
             Ty::Never => f.write_str("Never"),
             Ty::Range => f.write_str("Range<Int>"),
-            Ty::Named(name) => f.write_str(name),
+            Ty::Named(name, args) => {
+                f.write_str(name)?;
+                if !args.is_empty() {
+                    let args: Vec<String> = args.iter().map(|a| Show(a).to_string()).collect();
+                    write!(f, "<{}>", args.join(", "))?;
+                }
+                Ok(())
+            }
+            Ty::Param(name) => f.write_str(name),
             Ty::List(e) => write!(f, "List<{}>", Show(e)),
             Ty::Maybe(e) => write!(f, "{}?", Show(e)),
             Ty::Func(params, ret) => {
