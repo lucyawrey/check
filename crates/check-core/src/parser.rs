@@ -11,6 +11,20 @@ pub struct Parser<'a> {
 
 type PResult<T> = Result<T, ()>;
 
+pub fn parse_data(
+    tokens: Vec<Token>,
+    next_id: &mut NodeId,
+    diags: &mut Vec<Diagnostic>,
+) -> DataFile {
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        next_id,
+        diags,
+    };
+    parser.data_file()
+}
+
 pub fn parse_program(
     tokens: Vec<Token>,
     next_id: &mut NodeId,
@@ -172,6 +186,57 @@ impl Parser<'_> {
         file
     }
 
+    fn data_file(&mut self) -> DataFile {
+        self.skip_newlines();
+        let mut namespace = None;
+        if self.is_kw("namespace") {
+            let span = self.span();
+            match self.namespace() {
+                Ok(ns) => namespace = Some((ns, span.to(self.prev_span()))),
+                Err(()) => self.recover(),
+            }
+            self.end_statement(false);
+            self.skip_newlines();
+        }
+        let start = self.span();
+        if *self.peek() == Tok::Eof {
+            let value = self.expr_node(start, ExprKind::Record(Vec::new()));
+            return DataFile { namespace, value };
+        }
+        let value = match self.data_value() {
+            Ok(value) => value,
+            Err(()) => self.expr_node(start, ExprKind::Record(Vec::new())),
+        };
+        self.skip_newlines();
+        if *self.peek() != Tok::Eof {
+            self.diags
+                .push(Diagnostic::error(Code::unexpected_token, self.span()));
+        }
+        DataFile { namespace, value }
+    }
+
+    /// A field list without its outer `( )` is a record literal; anything else is one expression.
+    fn data_value(&mut self) -> PResult<Expr> {
+        let is_field_list = matches!(self.peek(), Tok::Ident(_) | Tok::Kw(_))
+            && matches!(self.peek_at(1), Tok::Sym("="));
+        if !is_field_list {
+            return self.expr();
+        }
+        let start = self.span();
+        let mut args = Vec::new();
+        while matches!(self.peek(), Tok::Ident(_) | Tok::Kw(_)) {
+            let (name, _) = self.field_name()?;
+            self.expect_sym("=")?;
+            args.push(Arg {
+                name: Some(name),
+                value: self.expr()?,
+            });
+            self.end_statement(false);
+            self.skip_newlines();
+        }
+        Ok(self.expr_node(start.to(self.prev_span()), ExprKind::Record(args)))
+    }
+
     fn namespace(&mut self) -> PResult<String> {
         self.advance();
         let (mut name, _) = self.ident()?;
@@ -183,8 +248,10 @@ impl Parser<'_> {
 
     fn import(&mut self) -> PResult<Import> {
         let start = self.advance().span;
-        let is_private = self.is_soft("private") && matches!(self.peek_at(1), Tok::Str(_));
-        if is_private {
+        let modifier = |p: &Self, word| p.is_soft(word) && matches!(p.peek_at(1), Tok::Str(_));
+        let is_private = modifier(self, "private");
+        let is_host = modifier(self, "host");
+        if is_private || is_host {
             self.advance();
         }
         match self.peek().clone() {
@@ -194,6 +261,7 @@ impl Parser<'_> {
                     Ok(Import {
                         path: path.clone(),
                         is_private,
+                        is_host,
                         span,
                     })
                 }

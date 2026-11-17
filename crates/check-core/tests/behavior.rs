@@ -2,7 +2,7 @@ use std::io::Cursor;
 
 use check_core::ast::Stmt;
 use check_core::diag::Severity;
-use check_core::modules::MemFiles;
+use check_core::modules::{MemFiles, entry_of};
 use check_core::{Outcome, Report, run_program, run_source};
 
 fn output(src: &str) -> String {
@@ -427,6 +427,7 @@ fn library_files_hold_only_declarations_that_match_the_rust_bodies() {
             Stmt::Implement(i) => {
                 declared.extend(i.members.methods.iter().chain(&i.members.statics))
             }
+            Stmt::Class(c) => declared.extend(c.members.methods.iter().chain(&c.members.statics)),
             _ => panic!("a library file holds something other than a declaration"),
         }
     }
@@ -1129,4 +1130,399 @@ fn library_files_dont_warn_about_a_users_namespace() {
         false,
     );
     assert!(report.diagnostics.is_empty());
+}
+
+const BLOCK: &str = "enum Sound {\n  Stone\n  Wood\n}\nclass BlockDef(hardness: Float, sound: Sound = Sound.Wood, drops: String[] = [])\n";
+
+#[test]
+fn a_data_file_is_a_const_named_after_the_file() {
+    let settings = ("game/settings.con", "volume = 0.8\nshowFps = true");
+    let stone = (
+        "game/stone.con",
+        "BlockDef(\n  hardness = 1.5\n  sound = Stone\n)",
+    );
+    let code = ("game/blocks.check", BLOCK);
+    let main = (
+        "main.check",
+        "import \"game/\"\nprint(settings.volume)\nprint(stone)",
+    );
+    assert_eq!(
+        files_output(&[main, settings, stone, code]),
+        "0.8\nBlockDef(hardness = 1.5, sound = Stone, drops = [])"
+    );
+}
+
+#[test]
+fn a_con_file_holds_only_literals() {
+    let code = (
+        "game/blocks.check",
+        "func half(x: Float) -> Float { x / 2.0 }",
+    );
+    for value in ["half(3.0)", "half", "\"a{1}\"", "[1 + 2]"] {
+        let data = ("game/bad.con", value);
+        let main = ("main.check", "import \"game/\"\nprint(1)");
+        assert_eq!(
+            files_error(&[main, data, code]),
+            "code_in_pure_data",
+            "{value}"
+        );
+    }
+    let data = ("game/ok.con", "[(a = -1, b = 2.5, c = \"x\", d = true)]");
+    let main = ("main.check", "import \"game/\"\nprint(ok)");
+    assert_eq!(
+        files_output(&[main, data, code]),
+        "[(a = -1, b = 2.5, c = \"x\", d = true)]"
+    );
+}
+
+#[test]
+fn a_conx_file_can_compute_its_value_from_its_unit() {
+    let code = (
+        "game/blocks.check",
+        "func half(x: Float) -> Float { x / 2.0 }",
+    );
+    let base = ("game/base.con", "hardness = 3.0");
+    let soft = ("game/soft.conx", "hardness = half(base.hardness)");
+    let main = ("main.check", "import \"game/\"\nprint(soft.hardness)");
+    assert_eq!(files_output(&[main, code, base, soft]), "1.5");
+}
+
+#[test]
+fn data_values_cant_depend_on_each_other_in_a_loop() {
+    let code = ("game/blocks.check", "func f() -> Int { a }");
+    let a = ("game/a.conx", "b + 1");
+    let b = ("game/b.conx", "a + 1");
+    let main = ("main.check", "import \"game/\"\nprint(1)");
+    assert_eq!(files_error(&[main, code, a, b]), "const_cycle");
+    let c = ("game/c.conx", "f() + 1");
+    let a = ("game/a.conx", "c + 1");
+    let (report, _) = run_files(&[main, code, a, c], false);
+    assert!(
+        matches!(report.outcome, Outcome::Panicked(_)),
+        "a cycle through a call"
+    );
+}
+
+#[test]
+fn data_files_need_valid_names_and_code_beside_them() {
+    let code = ("game/blocks.check", "func f() -> Int { 1 }");
+    let main = ("main.check", "import \"game/\"\nprint(1)");
+    for name in ["game/my-file.con", "game/class.con", "game/Ok.con"] {
+        assert_eq!(
+            files_error(&[main, code, (name, "1")]),
+            "bad_data_name",
+            "{name}"
+        );
+    }
+    let only_data = ("blocks/stone.con", "1");
+    let main = ("main.check", "import \"blocks/\"\nprint(1)");
+    assert_eq!(files_error(&[main, only_data]), "data_folder");
+    let main = ("main.check", "import \"blocks/stone.con\"\nprint(stone)");
+    assert_eq!(files_output(&[main, only_data]), "1");
+}
+
+#[test]
+fn a_data_file_can_be_imported_from_another_namespace() {
+    let data = ("conf/settings.con", "namespace conf\n\nvolume = 3");
+    let main = (
+        "main.check",
+        "import \"conf/settings.con\"\nprint(conf.settings.volume)\nprint(settings.volume)",
+    );
+    assert_eq!(files_output(&[main, data]), "3\n3");
+}
+
+const GAME_MANIFEST: (&str, &str) = (
+    "game/package.con",
+    "namespace game\n\nversion = \"0.1.0\"\nentry = \"main.check\"\nimports = [\"src/\", \"../vectors/\"]",
+);
+const VECTORS: (&str, &str) = (
+    "vectors/vec.check",
+    "namespace vectors\n\nclass Vec(x: Int, y: Int)\nfunc add(a: Vec, b: Vec) -> Vec { Vec(a.x + b.x, a.y + b.y) }",
+);
+
+#[test]
+fn a_manifest_names_the_namespace_and_the_units_its_code_sees() {
+    let src = (
+        "game/src/play.check",
+        "func start() -> vectors.Vec { add(Vec(1, 2), Vec(3, 4)) }\nprivate func secret() -> Int { 1 }",
+    );
+    let main = (
+        "main.check",
+        "import \"game/package.con\"\nprint(game.start())\nprint(game.package.version)",
+    );
+    assert_eq!(
+        files_output(&[main, GAME_MANIFEST, src, VECTORS]),
+        "vectors.Vec(x = 4, y = 6)\n0.1.0"
+    );
+    let main = ("main.check", "import \"game/package.con\"\nprint(secret())");
+    assert_eq!(
+        files_error(&[main, GAME_MANIFEST, src, VECTORS]),
+        "private_name"
+    );
+}
+
+#[test]
+fn a_folder_import_passes_on_its_manifests_imports() {
+    let lib = ("game/play.check", "func start() -> Int { 1 }");
+    let manifest = (
+        "game/package.con",
+        "namespace game\n\nimports = [\"../vectors/\"]",
+    );
+    let main = (
+        "main.check",
+        "import \"game/\"\nprint(add(Vec(1, 1), Vec(2, 2)).x)\nprint(start())",
+    );
+    assert_eq!(files_output(&[main, manifest, lib, VECTORS]), "3\n1");
+    let other = ("other/v.check", "namespace other\n\nclass Vec(z: Int)");
+    let main = (
+        "main.check",
+        "import \"game/\"\nimport \"other/\"\nprint(Vec(1))",
+    );
+    let (report, _) = run_files(&[main, manifest, lib, VECTORS, other], false);
+    let clash = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.to_string() == "ambiguous_name")
+        .expect("a clash");
+    assert_eq!(
+        clash.detail.as_deref(),
+        Some("other.Vec, vectors.Vec (via game/)")
+    );
+}
+
+#[test]
+fn a_package_namespace_rules_its_files() {
+    let manifest = ("game/package.con", "namespace game");
+    let main = ("main.check", "import \"game/\"\nprint(game.f())");
+    assert_eq!(
+        files_output(&[main, manifest, ("game/a.check", "func f() -> Int { 1 }")]),
+        "1"
+    );
+    assert_eq!(
+        files_error(&[
+            main,
+            manifest,
+            ("game/a.check", "namespace other\n\nfunc f() -> Int { 1 }")
+        ]),
+        "namespace_outside_package"
+    );
+    let (report, _) = run_files(
+        &[
+            main,
+            manifest,
+            ("game/a.check", "namespace game\n\nfunc f() -> Int { 1 }"),
+        ],
+        false,
+    );
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code.to_string() == "repeated_namespace")
+    );
+}
+
+#[test]
+fn manifests_are_checked_as_packages() {
+    let main = ("main.check", "import \"game/\"\nprint(1)");
+    let code = ("game/a.check", "func f() -> Int { 1 }");
+    for (manifest, expected) in [
+        ("imports = 3", "type_mismatch"),
+        ("imprts = [\"x/\"]", "wrong_arguments"),
+        ("imports = [1]", "type_mismatch"),
+    ] {
+        let m = ("game/package.con", manifest);
+        assert_eq!(files_error(&[main, m, code]), expected, "{manifest}");
+    }
+    let m = ("game/package.con", "hostImport = \"check:playground\"");
+    assert_eq!(files_error(&[main, m, code]), "unknown_host");
+    let m = ("game/package.con", "imports = [\"../nope/\"]");
+    assert_eq!(files_error(&[main, m, code]), "missing_import");
+}
+
+#[test]
+fn units_load_once_and_cant_import_each_other_in_a_loop() {
+    let a = ("a/package.con", "namespace a\n\nimports = [\"../b/\"]");
+    let b = ("b/package.con", "namespace b\n\nimports = [\"../a/\"]");
+    let code_a = ("a/a.check", "func fa() -> Int { 1 }");
+    let code_b = ("b/b.check", "func fb() -> Int { 2 }");
+    let main = ("main.check", "import \"a/\"\nprint(1)");
+    assert_eq!(files_error(&[main, a, b, code_a, code_b]), "import_cycle");
+    let c = ("c/package.con", "namespace c\n\nimports = [\"../d/\"]");
+    let code_c = ("c/c.check", "func fc() -> Int { d.fd() }");
+    let d = ("d/d.check", "namespace d\n\nfunc fd() -> Int { 4 }");
+    let main = (
+        "main.check",
+        "import \"c/\"\nimport \"d/\"\nprint(fc() + fd())",
+    );
+    assert_eq!(files_output(&[main, c, code_c, d]), "8");
+}
+
+#[test]
+fn packages_without_a_namespace_keep_their_package_const_to_themselves() {
+    let a = ("a/package.con", "version = \"1\"");
+    let b = ("b/package.con", "version = \"2\"");
+    let main = (
+        "main.check",
+        "import \"a/\"\nimport \"b/\"\nprint(fa() + fb())",
+    );
+    let code_a = ("a/a.check", "func fa() -> String { package.version }");
+    let code_b = ("b/b.check", "func fb() -> String { package.version }");
+    assert_eq!(files_output(&[main, a, b, code_a, code_b]), "12");
+}
+
+#[test]
+fn only_path_and_built_in_imports_are_supported() {
+    let main = ("main.check", "import \"pkg:geometry@1.2\"\nprint(1)");
+    assert_eq!(files_error(&[main]), "unsupported_import");
+    let main = (
+        "main.check",
+        "import \"check:std\"\nimport \"check:cli\"\nprint(1)",
+    );
+    assert_eq!(files_output(&[main]), "1");
+    let main = ("main.check", "import \"check:http\"\nprint(1)");
+    assert_eq!(files_error(&[main]), "missing_import");
+    let main = ("main.check", "import host \"check:cli\"\nprint(1)");
+    assert_eq!(files_output(&[main]), "1");
+    let main = ("main.check", "import host \"check:playground\"\nprint(1)");
+    assert_eq!(files_error(&[main]), "unknown_host");
+}
+
+#[test]
+fn deep_imports_skip_subfolders_with_their_own_manifest() {
+    let top = ("lib/a.check", "func a() -> Int { 1 }");
+    let sub = ("lib/inner/b.check", "func b() -> Int { 2 }");
+    let manifest = ("lib/inner/package.con", "namespace inner");
+    let main = ("main.check", "import \"lib/...\"\nprint(b())");
+    assert_eq!(files_error(&[main, top, sub, manifest]), "unknown_name");
+}
+
+#[test]
+fn a_folder_runs_its_manifests_entry_file() {
+    let mem = |files: &[(&str, &str)]| {
+        MemFiles(
+            files
+                .iter()
+                .map(|(p, s)| (p.to_string(), s.to_string()))
+                .collect(),
+        )
+    };
+    let ok = mem(&[
+        ("game/package.con", "entry = \"main.check\""),
+        ("game/main.check", "print(1)"),
+    ]);
+    assert_eq!(entry_of("game", &ok), Ok("game/main.check".to_string()));
+    let no_entry = mem(&[("game/package.con", "version = \"1\"")]);
+    assert_eq!(
+        entry_of("game/", &no_entry).map_err(|c| c.to_string()),
+        Err("no_entry".to_string())
+    );
+    let missing = mem(&[("game/package.con", "entry = \"run.check\"")]);
+    assert_eq!(
+        entry_of("game/", &missing).map_err(|c| c.to_string()),
+        Err("missing_entry".to_string())
+    );
+}
+
+#[test]
+fn a_manifest_at_the_root_can_list_its_own_folder() {
+    let manifest = (
+        "package.con",
+        "entry = \"main.check\"\nimports = [\"./\", \"src/\"]",
+    );
+    let main = ("main.check", "import \"package.con\"\nprint(f() + g())");
+    let top = ("a.check", "func f() -> Int { 1 }");
+    let src = ("src/b.check", "func g() -> Int { 2 }");
+    assert_eq!(files_output(&[main, manifest, top, src]), "3");
+}
+
+#[test]
+fn a_listed_sub_package_manifest_is_its_own_unit() {
+    let game = (
+        "game/package.con",
+        "namespace game\n\nimports = [\"tools/package.con\"]",
+    );
+    let tools = (
+        "game/tools/package.con",
+        "namespace tools\n\nimports = [\"./\"]",
+    );
+    let t = ("game/tools/t.check", "func t() -> Int { 1 }");
+    let main = ("main.check", "import \"game/\"\nprint(t())");
+    assert_eq!(files_output(&[main, game, tools, t]), "1");
+}
+
+#[test]
+fn a_data_file_and_a_function_cant_share_a_name_in_either_order() {
+    let main = ("main.check", "import \"game/\"\nprint(1)");
+    let data = ("game/a.con", "1");
+    let func = ("game/b.check", "func a() -> Int { 2 }");
+    assert_eq!(files_error(&[main, data, func]), "duplicate_name");
+    let data = ("game/z.con", "1");
+    let func = ("game/b.check", "func z() -> Int { 2 }");
+    assert_eq!(files_error(&[main, data, func]), "duplicate_name");
+}
+
+#[test]
+fn a_types_own_const_wins_over_a_data_file_inside_the_type() {
+    let data = ("game/max.con", "\"data\"");
+    let code = (
+        "game/b.check",
+        "class Foo {\n  let x: Int = 0\n  const max = 5\n  const twice = max * 2\n}",
+    );
+    let main = (
+        "main.check",
+        "import \"game/\"\nprint(Foo.twice)\nprint(max)",
+    );
+    assert_eq!(files_output(&[main, data, code]), "10\ndata");
+}
+
+#[test]
+fn a_con_file_cant_call_a_static_method() {
+    let code = (
+        "game/b.check",
+        "class Item(n: Int)\nimplement Item {\n  static func make() -> Item { Item(1) }\n}",
+    );
+    let data = ("game/x.con", "Item.make()");
+    let main = ("main.check", "import \"game/\"\nprint(1)");
+    assert_eq!(files_error(&[main, code, data]), "code_in_pure_data");
+}
+
+#[test]
+fn data_values_are_built_in_load_order() {
+    let say = (
+        "x/say.check",
+        "func say(s: String) -> Int {\n  print(s)\n  1\n}",
+    );
+    let tell = (
+        "y/tell.check",
+        "func tell(s: String) -> Int {\n  print(s)\n  1\n}",
+    );
+    let b = ("x/b.conx", "say(\"b\")");
+    let a = ("y/a.conx", "tell(\"a\")");
+    let main = (
+        "main.check",
+        "import \"x/\"\nimport \"y/\"\nprint(\"main\")",
+    );
+    assert_eq!(files_output(&[main, say, b, tell, a]), "b\na\nmain");
+}
+
+#[test]
+fn import_host_is_written_once_and_only_without_a_manifest() {
+    let twice = (
+        "main.check",
+        "import host \"check:cli\"\nimport host \"check:cli\"\nprint(1)",
+    );
+    assert_eq!(files_error(&[twice]), "misplaced_host_import");
+    let main = ("game/main.check", "import host \"check:cli\"\nprint(1)");
+    let manifest = ("game/package.con", "entry = \"main.check\"");
+    assert_eq!(files_error(&[main, manifest]), "misplaced_host_import");
+}
+
+#[test]
+fn running_a_folder_needs_a_manifest() {
+    let files = MemFiles([("game/main.check".to_string(), "print(1)".to_string())].into());
+    assert_eq!(
+        entry_of("game", &files).map_err(|c| c.to_string()),
+        Err("missing_manifest".to_string())
+    );
 }

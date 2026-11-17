@@ -1,0 +1,3 @@
+class Item(name: String, price: Int)
+
+func canBuy(gold: Int, item: Item) -> Bool { gold >= item.price }

@@ -89,7 +89,25 @@ pub struct EnumDecl {
 pub struct Import {
     pub path: String,
     pub is_private: bool,
+    pub is_host: bool,
     pub span: Span,
+}
+
+/// A data file's value, a const of its unit named after the file.
+#[derive(Debug, Clone)]
+pub struct DataDecl {
+    pub name: String,
+    pub span: Span,
+    pub ty: Option<TypeExpr>,
+    pub value: Expr,
+    /// A `.con` file, which holds only literals.
+    pub is_pure: bool,
+    pub is_private: bool,
+}
+
+pub struct DataFile {
+    pub namespace: Option<(String, Span)>,
+    pub value: Expr,
 }
 
 pub struct File {
@@ -152,6 +170,7 @@ pub enum Stmt {
     Class(ClassDecl),
     Enum(EnumDecl),
     Implement(ImplementDecl),
+    Data(DataDecl),
     Expr(Expr),
 }
 
