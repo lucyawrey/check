@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use check_core::diag::Severity;
-use check_core::{Outcome, Report, check_source, run_source};
+use check_core::{Files, Outcome, Report, check_program, run_program};
 
 const STACK_SIZE: usize = 1 << 30;
 
@@ -31,6 +31,32 @@ fn dispatch(args: &[String]) -> ExitCode {
     }
 }
 
+struct Disk;
+
+impl Files for Disk {
+    fn read(&self, path: &str) -> Option<String> {
+        fs::read_to_string(path).ok()
+    }
+
+    fn list(&self, dir: &str) -> Option<Vec<String>> {
+        let dir = if dir.is_empty() { "." } else { dir };
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if e.path().is_dir() {
+                    format!("{name}/")
+                } else {
+                    name
+                }
+            })
+            .collect();
+        names.sort();
+        Some(names)
+    }
+}
+
 fn read(path: &str) -> Option<String> {
     match fs::read_to_string(path) {
         Ok(src) => Some(src),
@@ -41,11 +67,11 @@ fn read(path: &str) -> Option<String> {
     }
 }
 
-fn render(path: &str, src: &str, report: &Report, errors_only: bool) -> String {
+fn render(report: &Report, errors_only: bool) -> String {
     let mut out = String::new();
     for d in &report.diagnostics {
         if !errors_only || d.severity == Severity::Error {
-            out.push_str(&d.render(path, src));
+            out.push_str(&d.render(&report.sources));
         }
     }
     if let Some(text) = &report.panic_text {
@@ -55,14 +81,14 @@ fn render(path: &str, src: &str, report: &Report, errors_only: bool) -> String {
 }
 
 fn run(path: &str) -> ExitCode {
-    let Some(src) = read(path) else {
+    if read(path).is_none() {
         return ExitCode::FAILURE;
-    };
+    }
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut output = io::stdout();
-    let report = run_source(path, &src, &mut input, &mut output);
-    eprint!("{}", render(path, &src, &report, false));
+    let report = run_program(path, &Disk, false, &mut input, &mut output);
+    eprint!("{}", render(&report, false));
     match report.outcome {
         Outcome::Finished => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
@@ -70,14 +96,18 @@ fn run(path: &str) -> ExitCode {
 }
 
 fn check(path: &str) -> ExitCode {
-    let Some(src) = read(path) else {
+    if read(path).is_none() {
         return ExitCode::FAILURE;
-    };
-    let diags = check_source(&src).diagnostics;
-    for d in &diags {
-        eprint!("{}", d.render(path, &src));
     }
-    if diags.iter().any(|d| d.severity == Severity::Error) {
+    let checked = check_program(path, &Disk, true);
+    for d in &checked.diagnostics {
+        eprint!("{}", d.render(&checked.sources));
+    }
+    if checked
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == Severity::Error)
+    {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -104,12 +134,11 @@ fn strip_final_break(text: &str) -> &str {
 
 fn run_test(dir: &Path) -> Result<(), String> {
     let file = test_file(dir)?;
-    let src = fs::read_to_string(&file).map_err(|e| e.to_string())?;
     let input = fs::read_to_string(dir.join("input.txt")).unwrap_or_default();
     let mut reader = BufReader::new(Cursor::new(input.into_bytes()));
     let mut output = Vec::new();
     let path = file.display().to_string();
-    let report = run_source(&path, &src, &mut reader, &mut output);
+    let report = run_program(&path, &Disk, true, &mut reader, &mut output);
     let stdout = String::from_utf8_lossy(&output).to_string();
     let first_error = report
         .diagnostics
@@ -128,14 +157,14 @@ fn run_test(dir: &Path) -> Result<(), String> {
             Some(code) if code == expected => Ok(()),
             Some(code) => Err(format!(
                 "expected error {expected}, got {code}\n{}",
-                render(&path, &src, &report, true)
+                render(&report, true)
             )),
             None => Err(format!("expected error {expected}, but it ran without one")),
         };
     }
     let mut problems = String::new();
     if error_code.is_some() && !matches!(report.outcome, Outcome::Stopped) {
-        problems.push_str(&render(&path, &src, &report, true));
+        problems.push_str(&render(&report, true));
     }
     let expected =
         fs::read_to_string(dir.join("expected.txt")).map_err(|e| format!("expected.txt: {e}"))?;

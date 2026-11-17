@@ -19,6 +19,8 @@ pub struct Param {
     pub default: Option<Expr>,
     pub is_var: bool,
     pub is_rest: bool,
+    pub is_private: bool,
+    pub is_readonly: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +31,7 @@ pub struct FuncDecl {
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
     pub body: Option<Expr>,
+    pub is_private: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -37,6 +40,7 @@ pub struct ConstDecl {
     pub span: Span,
     pub ty: Option<TypeExpr>,
     pub value: Expr,
+    pub is_private: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -51,6 +55,7 @@ pub struct ClassDecl {
     pub name: String,
     pub span: Span,
     pub is_ref: bool,
+    pub is_private: bool,
     pub fields: Vec<Param>,
     pub init: Option<FuncDecl>,
     pub members: Members,
@@ -77,6 +82,20 @@ pub struct EnumDecl {
     pub span: Span,
     pub variants: Vec<VariantDecl>,
     pub members: Members,
+    pub is_private: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub path: String,
+    pub is_private: bool,
+    pub span: Span,
+}
+
+pub struct File {
+    pub namespace: Option<(String, Span)>,
+    pub imports: Vec<Import>,
+    pub stmts: Vec<Stmt>,
 }
 
 #[derive(Debug, Clone)]

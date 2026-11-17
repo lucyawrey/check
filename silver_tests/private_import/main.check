@@ -1,0 +1,6 @@
+import private "bank/"
+
+let account = Account()
+account.deposit(10)
+print(account.balance)
+print(fee(5))

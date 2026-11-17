@@ -97,6 +97,17 @@ codes! {
     let_else_can_finish => "[a let-else whose else can finish]",
     const_not_constant => "[a const whose value isn't a constant expression]",
     const_cycle => "[consts defined in terms of each other]",
+    missing_import => "[an import of a file or folder that doesn't exist]",
+    folder_without_slash => "[a folder import without a trailing /]",
+    imported_entry_file => "[an import of a file that has imports or top-level statements]",
+    overlapping_imports => "[two imports that cover the same file]",
+    private_import_in_run => "[import private in a program being run, not tested]",
+    ambiguous_name => "[a name found in more than one namespace]",
+    private_name => "[a private name used outside its unit]",
+    private_member => "[a private field or method used outside its type]",
+    readonly_field => "[a readonly var set outside its class]",
+    private_field_without_default => "[a private field with no default]",
+    misplaced_namespace => "[a namespace line that isn't the first line of the file]",
     external_outside_library => "[an external function outside a library package]",
     try_stopped => "[a top-level try found no value, so the program stopped]",
     panic_called => "[panic was called]",
@@ -149,8 +160,8 @@ impl Diagnostic {
         }
     }
 
-    pub fn render(&self, path: &str, src: &str) -> String {
-        let (line, col, text) = locate(src, self.span.start);
+    pub fn render(&self, sources: &Sources) -> String {
+        let (path, line, col, text) = sources.locate(self.span.start);
         let width = (self
             .span
             .end
@@ -177,7 +188,43 @@ impl Diagnostic {
     }
 }
 
-pub fn locate(src: &str, offset: usize) -> (usize, usize, &str) {
+pub struct Source {
+    pub path: String,
+    pub text: String,
+    base: usize,
+}
+
+/// Every file gets its own range of offsets, so a span alone says which file it's in.
+#[derive(Default)]
+pub struct Sources {
+    files: Vec<Source>,
+}
+
+impl Sources {
+    /// Returns the base offset to lex the file at.
+    pub fn add(&mut self, path: &str, text: &str) -> usize {
+        let base = self.files.last().map_or(0, |f| f.base + f.text.len() + 1);
+        self.files.push(Source {
+            path: path.to_string(),
+            text: text.to_string(),
+            base,
+        });
+        base
+    }
+
+    pub fn file(&self, offset: usize) -> &Source {
+        let i = self.files.partition_point(|f| f.base <= offset);
+        &self.files[i.saturating_sub(1)]
+    }
+
+    pub fn locate(&self, offset: usize) -> (&str, usize, usize, &str) {
+        let file = self.file(offset);
+        let (line, col, text) = locate(&file.text, offset - file.base);
+        (&file.path, line, col, text)
+    }
+}
+
+fn locate(src: &str, offset: usize) -> (usize, usize, &str) {
     let offset = offset.min(src.len());
     let line_start = src[..offset].rfind('\n').map_or(0, |i| i + 1);
     let line_end = src[offset..].find('\n').map_or(src.len(), |i| offset + i);

@@ -13,8 +13,8 @@ pub struct Io<'a> {
 pub type HostFn = fn(&mut Io, Vec<Value>, Span) -> Result<Value, Flow>;
 
 pub const FUNCTIONS: &[(&str, HostFn)] = &[
-    ("panic", stop),
-    ("input", input),
+    ("check.std.panic", stop),
+    ("check.cli.input", input),
     ("String.upper", |_, a, _| {
         Ok(Value::Str(text(&a[0]).to_uppercase().into()))
     }),

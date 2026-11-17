@@ -15,7 +15,7 @@ pub fn parse_program(
     tokens: Vec<Token>,
     next_id: &mut NodeId,
     diags: &mut Vec<Diagnostic>,
-) -> Vec<Stmt> {
+) -> File {
     let mut parser = Parser {
         tokens,
         pos: 0,
@@ -136,20 +136,85 @@ impl Parser<'_> {
         }
     }
 
-    fn program(&mut self) -> Vec<Stmt> {
-        let mut stmts = Vec::new();
+    fn program(&mut self) -> File {
+        let mut file = File {
+            namespace: None,
+            imports: Vec::new(),
+            stmts: Vec::new(),
+        };
+        let mut first = true;
         loop {
             self.skip_newlines();
             if *self.peek() == Tok::Eof {
                 break;
             }
-            match self.statement() {
-                Ok(stmt) => stmts.push(stmt),
-                Err(()) => self.recover(),
+            let result = if self.is_kw("namespace") {
+                let span = self.span();
+                match self.namespace() {
+                    Ok(ns) if first => {
+                        file.namespace = Some((ns, span.to(self.prev_span())));
+                        Ok(())
+                    }
+                    Ok(_) => self.error(Code::misplaced_namespace, span),
+                    Err(()) => Err(()),
+                }
+            } else if self.is_kw("import") {
+                self.import().map(|i| file.imports.push(i))
+            } else {
+                self.statement().map(|s| file.stmts.push(s))
+            };
+            if result.is_err() {
+                self.recover();
             }
+            first = false;
             self.end_statement(false);
         }
-        stmts
+        file
+    }
+
+    fn namespace(&mut self) -> PResult<String> {
+        self.advance();
+        let (mut name, _) = self.ident()?;
+        while self.eat_sym(".") {
+            name = format!("{name}.{}", self.ident()?.0);
+        }
+        Ok(name)
+    }
+
+    fn import(&mut self) -> PResult<Import> {
+        let start = self.advance().span;
+        let is_private = self.is_soft("private") && matches!(self.peek_at(1), Tok::Str(_));
+        if is_private {
+            self.advance();
+        }
+        match self.peek().clone() {
+            Tok::Str(parts) => match parts.as_slice() {
+                [StrPart::Text(path)] => {
+                    let span = start.to(self.advance().span);
+                    Ok(Import {
+                        path: path.clone(),
+                        is_private,
+                        span,
+                    })
+                }
+                _ => self.error(Code::unexpected_token, self.span()),
+            },
+            _ => self.error(Code::unexpected_token, self.span()),
+        }
+    }
+
+    /// Eats a leading `private`, a soft keyword only in front of a declaration.
+    fn private(&mut self) -> bool {
+        let before_decl = match self.peek_at(1) {
+            Tok::Kw("func" | "class" | "enum" | "let" | "var" | "const") => true,
+            Tok::Ident(w) => matches!(w.as_str(), "ref" | "static" | "external"),
+            _ => false,
+        };
+        let is_private = self.is_soft("private") && before_decl;
+        if is_private {
+            self.advance();
+        }
+        is_private
     }
 
     fn recover(&mut self) {
@@ -198,6 +263,21 @@ impl Parser<'_> {
     }
 
     fn statement(&mut self) -> PResult<Stmt> {
+        let is_private = self.private();
+        if is_private && !(self.is_kw("enum") || self.is_kw("func") || self.is_type_decl()) {
+            return self.error(Code::unexpected_token, self.span());
+        }
+        let mut stmt = self.declaration()?;
+        match &mut stmt {
+            Stmt::Func(d) => d.is_private = is_private,
+            Stmt::Class(d) => d.is_private = is_private,
+            Stmt::Enum(d) => d.is_private = is_private,
+            _ => {}
+        }
+        Ok(stmt)
+    }
+
+    fn declaration(&mut self) -> PResult<Stmt> {
         if self.is_kw("enum") {
             return Ok(Stmt::Enum(self.enum_decl()?));
         }
@@ -332,6 +412,24 @@ impl Parser<'_> {
     }
 
     fn member(&mut self, members: &mut Members, owner: &str) -> PResult<bool> {
+        if self.is_soft("private") && matches!(self.peek_at(1), Tok::Kw("let" | "var")) {
+            return Ok(false);
+        }
+        let start = self.pos;
+        let is_private = self.private();
+        let found = self.member_decl(members, owner, is_private)?;
+        if !found {
+            self.pos = start;
+        }
+        Ok(found)
+    }
+
+    fn member_decl(
+        &mut self,
+        members: &mut Members,
+        owner: &str,
+        is_private: bool,
+    ) -> PResult<bool> {
         let is_external = self.is_external();
         if is_external {
             self.advance();
@@ -340,10 +438,12 @@ impl Parser<'_> {
             self.advance();
             let mut decl = self.func_decl(is_external)?;
             decl.name = format!("{owner}.{}", decl.name);
+            decl.is_private = is_private;
             members.statics.push(decl);
         } else if self.is_kw("func") {
             let mut decl = self.func_decl(is_external)?;
             decl.name = format!("{owner}.{}", decl.name);
+            decl.is_private = is_private;
             members.methods.push(decl);
         } else if self.eat_kw("const") {
             let (name, span) = self.ident()?;
@@ -359,6 +459,7 @@ impl Parser<'_> {
                 span,
                 ty,
                 value,
+                is_private,
             });
         } else {
             return Ok(false);
@@ -378,7 +479,7 @@ impl Parser<'_> {
         let mut init = None;
         let mut members = Members::default();
         if self.is_sym("(") {
-            fields = self.params()?;
+            fields = self.params(true)?;
         } else {
             let owner = name.clone();
             self.body(|p| {
@@ -395,9 +496,11 @@ impl Parser<'_> {
                         params: Vec::new(),
                         ret: None,
                         body: Some(body),
+                        is_private: false,
                     });
                     return Ok(());
                 }
+                let (is_private, is_readonly) = p.field_modifiers()?;
                 let is_var = p.is_kw("var");
                 if !is_var && !p.is_kw("let") {
                     return p.error(Code::unexpected_token, p.span());
@@ -421,11 +524,14 @@ impl Parser<'_> {
                     default,
                     is_var,
                     is_rest: false,
+                    is_private,
+                    is_readonly,
                 });
                 Ok(())
             })?;
         }
         Ok(ClassDecl {
+            is_private: false,
             name,
             span: start.to(self.prev_span()),
             is_ref,
@@ -463,6 +569,7 @@ impl Parser<'_> {
             span: start.to(self.prev_span()),
             variants,
             members,
+            is_private: false,
         })
     }
 
@@ -646,7 +753,7 @@ impl Parser<'_> {
     fn func_decl(&mut self, is_external: bool) -> PResult<FuncDecl> {
         let start = self.advance().span;
         let (name, _) = self.ident()?;
-        let params = self.params()?;
+        let params = self.params(false)?;
         let ret = if self.eat_sym("->") {
             Some(self.type_expr()?)
         } else {
@@ -664,6 +771,7 @@ impl Parser<'_> {
             params,
             ret,
             body,
+            is_private: false,
         })
     }
 
@@ -680,10 +788,16 @@ impl Parser<'_> {
         self.expr()
     }
 
-    fn params(&mut self) -> PResult<Vec<Param>> {
+    /// `fields` allows `private` and `readonly`, as in a class header.
+    fn params(&mut self, fields: bool) -> PResult<Vec<Param>> {
         self.expect_sym("(")?;
         let mut params = Vec::new();
         self.list_items(")", |p| {
+            let (is_private, is_readonly) = if fields {
+                p.field_modifiers()?
+            } else {
+                (false, false)
+            };
             let is_var = p.eat_kw("var");
             let is_rest = p.eat_sym("...");
             let (name, span) = p.ident()?;
@@ -704,10 +818,26 @@ impl Parser<'_> {
                 default,
                 is_var,
                 is_rest,
+                is_private,
+                is_readonly,
             });
             Ok(())
         })?;
         Ok(params)
+    }
+
+    /// Eats `private` or `readonly` in front of `let` or `var`.
+    fn field_modifiers(&mut self) -> PResult<(bool, bool)> {
+        let modifies = matches!(self.peek_at(1), Tok::Kw("let" | "var"));
+        let is_private = modifies && self.is_soft("private");
+        let is_readonly = modifies && self.is_soft("readonly");
+        if is_private || is_readonly {
+            self.advance();
+        }
+        if is_readonly && self.is_kw("let") {
+            return self.error(Code::unexpected_token, self.span());
+        }
+        Ok((is_private, is_readonly))
     }
 
     fn list_items(
@@ -770,7 +900,11 @@ impl Parser<'_> {
                 TypeExpr::Record(names, types, span)
             }
         } else {
-            let (name, span) = self.ident()?;
+            let (mut name, span) = self.ident()?;
+            while self.is_sym(".") && matches!(self.peek_at(1), Tok::Ident(_)) {
+                self.advance();
+                name = format!("{name}.{}", self.ident()?.0);
+            }
             if self.eat_sym("<") {
                 let mut args = vec![self.type_expr()?];
                 while self.eat_sym(",") {
@@ -1133,7 +1267,7 @@ impl Parser<'_> {
             Tok::Kw("func") => {
                 self.pos -= 1;
                 self.advance();
-                let params = self.params()?;
+                let params = self.params(false)?;
                 let ret = if self.eat_sym("->") {
                     Some(self.type_expr()?)
                 } else {

@@ -1,0 +1,9 @@
+ref class Account {
+  readonly var balance: Int = 0
+}
+
+implement Account {
+  func deposit(amount: Int) { this.balance += fee(amount) }
+}
+
+private func fee(amount: Int) -> Int { amount - 1 }

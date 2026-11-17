@@ -1,0 +1,5 @@
+namespace art
+
+class Point(label: String, size: Int = 1)
+
+func origin() -> Point { Point("origin") }

@@ -63,6 +63,16 @@ struct ClassDef {
     is_ref: bool,
     fields: Vec<ParamSig>,
     mutable: Vec<bool>,
+    private: Vec<bool>,
+    readonly: Vec<bool>,
+}
+
+struct FieldInfo {
+    ty: Ty,
+    mutable: bool,
+    is_ref: bool,
+    private: bool,
+    readonly: bool,
 }
 
 struct VariantDef {
@@ -315,12 +325,19 @@ impl Checker {
         self.current_type = None;
         self.check_unique(c.fields.iter().map(|f| (&f.name, f.span)));
         let mutable = c.fields.iter().map(|f| f.is_var).collect();
+        for f in &c.fields {
+            if f.is_private && f.default.is_none() {
+                self.error(Code::private_field_without_default, f.span);
+            }
+        }
         self.types.insert(
             c.name.clone(),
             TypeDef::Class(ClassDef {
                 is_ref: c.is_ref,
                 fields,
                 mutable,
+                private: c.fields.iter().map(|f| f.is_private).collect(),
+                readonly: c.fields.iter().map(|f| f.is_readonly).collect(),
             }),
         );
         if let Some(init) = &c.init {
@@ -875,7 +892,7 @@ impl Checker {
                 Ty::Void
             }
             Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) => Ty::Void,
-            Stmt::Expr(e) => self.expr(e, None),
+            Stmt::Expr(e) => self.unused(e),
         }
     }
 
@@ -918,10 +935,18 @@ impl Checker {
             ExprKind::Field(base, name) if self.type_ref(base).is_none() => {
                 let (bt, base_err) = self.place(base);
                 match self.subst.shallow(&bt) {
-                    Ty::Named(class) => match self.field(&class, name) {
-                        Some((ty, mutable, is_ref)) => {
+                    Ty::Named(class) => match self.visible_field(&class, name, target.span) {
+                        Some(f) => {
+                            let FieldInfo {
+                                ty,
+                                mutable,
+                                is_ref,
+                                ..
+                            } = f;
                             let err = if !mutable {
                                 Some(Code::assign_to_let)
+                            } else if f.readonly && !self.inside(&class) {
+                                Some(Code::readonly_field)
                             } else if is_ref {
                                 None
                             } else {
@@ -962,14 +987,59 @@ impl Checker {
         }
     }
 
-    fn field(&self, type_name: &str, field: &str) -> Option<(Ty, bool, bool)> {
+    fn field(&self, type_name: &str, field: &str) -> Option<FieldInfo> {
         let c = self.class(type_name)?;
         let i = c.fields.iter().position(|f| f.name == field)?;
         let ty = match &c.fields[i] {
             f if f.is_rest => Ty::list(f.ty.clone()),
             f => f.ty.clone(),
         };
-        Some((ty, c.mutable[i], c.is_ref))
+        Some(FieldInfo {
+            ty,
+            mutable: c.mutable[i],
+            is_ref: c.is_ref,
+            private: c.private[i],
+            readonly: c.readonly[i],
+        })
+    }
+
+    fn check_private_method(&mut self, key: &str, type_name: &str, span: Span) {
+        if self.funcs[key].decl.is_private && !self.inside(type_name) {
+            self.error(Code::private_member, span);
+        }
+    }
+
+    fn inside(&self, type_name: &str) -> bool {
+        self.current_type.as_deref() == Some(type_name)
+    }
+
+    /// A field read from code outside its class, which can't see private fields.
+    fn visible_field(&mut self, type_name: &str, field: &str, span: Span) -> Option<FieldInfo> {
+        let f = self.field(type_name, field)?;
+        if f.private && !self.inside(type_name) {
+            self.error(Code::private_member, span);
+        }
+        Some(f)
+    }
+
+    /// The constructor takes every field but the private ones.
+    fn construct(&mut self, class: &str, args: &[Arg], span: Span) {
+        for a in args {
+            if let Some(name) = &a.name
+                && self.field(class, name).is_some_and(|f| f.private)
+            {
+                self.error(Code::private_member, a.value.span);
+            }
+        }
+        let c = self.class(class).expect("class");
+        let params: Vec<ParamSig> = c
+            .fields
+            .iter()
+            .zip(&c.private)
+            .filter(|(_, private)| !**private)
+            .map(|(f, _)| f.clone())
+            .collect();
+        self.match_args(&params, args, span);
     }
 
     fn type_ref(&self, e: &Expr) -> Option<String> {
@@ -1085,6 +1155,34 @@ impl Checker {
         last
     }
 
+    // Branches whose value is never used don't need matching types (design.md, Syntax).
+    fn unused(&mut self, expr: &Expr) -> Ty {
+        match &expr.kind {
+            ExprKind::Block(stmts) => {
+                self.scopes.push(HashMap::new());
+                for stmt in stmts {
+                    self.stmt(stmt);
+                }
+                self.finish_scope();
+            }
+            ExprKind::If(cond, then, otherwise) => {
+                let c = self.expr(cond, Some(&Ty::Bool));
+                self.expect(cond, &c, &Ty::Bool);
+                self.push_bindings(self.exports(cond));
+                self.unused(then);
+                self.scopes.pop();
+                if let Some(other) = otherwise {
+                    self.unused(other);
+                }
+            }
+            ExprKind::Match(scrutinee, arms) => {
+                self.match_expr(expr, scrutinee, arms, None, false);
+            }
+            _ => return self.expr(expr, None),
+        }
+        Ty::Void
+    }
+
     pub fn expr(&mut self, expr: &Expr, expected: Option<&Ty>) -> Ty {
         match &expr.kind {
             ExprKind::Int(_) => Ty::Int,
@@ -1107,7 +1205,9 @@ impl Checker {
                 None => self.error(Code::this_outside_method, expr.span),
             },
             ExprKind::Field(base, name) => self.field_expr(expr.id, base, name, expr.span),
-            ExprKind::Match(scrutinee, arms) => self.match_expr(expr, scrutinee, arms, expected),
+            ExprKind::Match(scrutinee, arms) => {
+                self.match_expr(expr, scrutinee, arms, expected, true)
+            }
             ExprKind::Is(lhs, pattern) => {
                 let t = self.expr(lhs, None);
                 let mut binds = Vec::new();
@@ -1157,7 +1257,7 @@ impl Checker {
                     kind: LoopKind::Loop,
                     break_ty: None,
                 });
-                self.expr(body, None);
+                self.unused(body);
                 let ctx = self.loops.pop().expect("loop context");
                 ctx.break_ty.unwrap_or(Ty::Never)
             }
@@ -1271,10 +1371,9 @@ impl Checker {
             e => e,
         });
         if let Some(Ty::Named(class)) = &expected
-            && let Some(c) = self.class(class)
+            && self.class(class).is_some()
         {
-            let params = c.fields.clone();
-            self.match_args(&params, args, expr.span);
+            self.construct(class, args, expr.span);
             self.info
                 .resolved
                 .insert(expr.id, Resolved::Construct(class.clone()));
@@ -1338,7 +1437,18 @@ impl Checker {
                 continue;
             }
             let field = match (&change.name, self.subst.shallow(&t)) {
-                (Some(name), Ty::Named(class)) => self.field(&class, name).map(|f| f.0),
+                (Some(name), Ty::Named(class)) => match self.field(&class, name) {
+                    Some(f) if (f.private || f.readonly) && !self.inside(&class) => {
+                        let code = if f.private {
+                            Code::private_member
+                        } else {
+                            Code::readonly_field
+                        };
+                        self.error(code, change.value.span);
+                        Some(f.ty)
+                    }
+                    f => f.map(|f| f.ty),
+                },
                 (Some(name), Ty::Record(names, fields)) if !names.is_empty() => {
                     record_field(&names, &fields, name)
                 }
@@ -1369,6 +1479,9 @@ impl Checker {
         if let Some(t) = self.type_ref(base) {
             let key = format!("{t}.{name}");
             if self.consts.contains_key(&key) {
+                if self.consts[&key].decl.is_private && !self.inside(&t) {
+                    self.error(Code::private_member, span);
+                }
                 self.info.resolved.insert(id, Resolved::Const(key.clone()));
                 return self.const_type(&key);
             }
@@ -1379,8 +1492,8 @@ impl Checker {
         }
         let bt = self.expr(base, None);
         match self.subst.shallow(&bt) {
-            Ty::Named(class) => match self.field(&class, name) {
-                Some((ty, ..)) => ty,
+            Ty::Named(class) => match self.visible_field(&class, name, span) {
+                Some(f) => f.ty,
                 None => self.error(Code::unknown_field, span),
             },
             Ty::Record(names, fields) => match record_field(&names, &fields, name) {
@@ -1734,9 +1847,8 @@ impl Checker {
                 }
                 _ => {}
             }
-            if let Some(TypeDef::Class(c)) = self.types.get(name) {
-                let params = c.fields.clone();
-                self.match_args(&params, args, span);
+            if let Some(TypeDef::Class(_)) = self.types.get(name) {
+                self.construct(name, args, span);
                 self.info
                     .resolved
                     .insert(id, Resolved::Construct(name.clone()));
@@ -1845,6 +1957,7 @@ impl Checker {
             }
             let key = format!("{t}.{name}");
             if self.funcs.get(&key).is_some_and(|f| f.this.is_none()) {
+                self.check_private_method(&key, &t, span);
                 self.info.resolved.insert(id, Resolved::Static(key.clone()));
                 return self.call_named(&key, args, span);
             }
@@ -1859,8 +1972,15 @@ impl Checker {
         );
         let recv_ty = if MUTATING.contains(&name) && is_place {
             let (t, err) = self.place(recv);
-            if err.is_some() && matches!(self.subst.shallow(&t), Ty::List(_)) {
-                self.error(Code::change_let_list, recv.span);
+            if let Some(code) = err
+                && matches!(self.subst.shallow(&t), Ty::List(_))
+            {
+                let code = if code == Code::readonly_field {
+                    code
+                } else {
+                    Code::change_let_list
+                };
+                self.error(code, recv.span);
             }
             t
         } else {
@@ -1871,6 +1991,7 @@ impl Checker {
             t @ (Ty::Named(_) | Ty::Str | Ty::Int | Ty::Float | Ty::Bool) => {
                 let key = format!("{}.{name}", Show(&t));
                 if self.funcs.get(&key).is_some_and(|f| f.this.is_some()) {
+                    self.check_private_method(&key, &Show(&t).to_string(), span);
                     self.info.resolved.insert(id, Resolved::Method(key.clone()));
                     return self.call_named(&key, args, span);
                 }
@@ -2073,6 +2194,7 @@ impl Checker {
         scrutinee: &Expr,
         arms: &[Arm],
         expected: Option<&Ty>,
+        used: bool,
     ) -> Ty {
         let st = self.expr(scrutinee, None);
         let mut bodies = Vec::new();
@@ -2084,7 +2206,11 @@ impl Checker {
                 let g = self.expr(guard, Some(&Ty::Bool));
                 self.expect(guard, &g, &Ty::Bool);
             }
-            let t = self.expr(&arm.body, expected);
+            let t = if used {
+                self.expr(&arm.body, expected)
+            } else {
+                self.unused(&arm.body)
+            };
             self.scopes.pop();
             bodies.push((&arm.body, t));
         }
@@ -2094,6 +2220,9 @@ impl Checker {
             .map(|a| vec![Cell::Pat(&a.pattern)])
             .collect();
         self.report_missing(rows, &st, scrutinee.span);
+        if !used {
+            return Ty::Void;
+        }
         let mut target = Ty::Never;
         for (_, t) in &bodies {
             target = match (self.subst.shallow(&target), self.subst.shallow(t)) {
@@ -2582,7 +2711,7 @@ impl Checker {
             kind: LoopKind::Valued,
             break_ty: None,
         });
-        self.expr(body, None);
+        self.unused(body);
         let ctx = self.loops.pop().expect("loop context");
         debug_assert!(ctx.kind == LoopKind::Valued);
         match ctx.break_ty.map(|t| self.subst.shallow(&t)) {
