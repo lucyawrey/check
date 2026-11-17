@@ -1,0 +1,5 @@
+circle with area 3.0
+rectangle with area 6.0
+square with area 4.0
+largest: rectangle with area 6.0
+Some(circle with area 12.0)

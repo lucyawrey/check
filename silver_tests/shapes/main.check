@@ -1,0 +1,36 @@
+interface Shape: Printable {
+  func area() -> Float
+  func name() -> String
+  func toString() -> String { "{this.name()} with area {this.area()}" }
+}
+
+class Circle: Shape {
+  let r: Float
+  func area() -> Float { 3.0 * this.r * this.r }
+  func name() -> String { "circle" }
+}
+
+class Rect: Shape {
+  let w: Float
+  let h: Float
+  func area() -> Float { this.w * this.h }
+  func name() -> String { if this.w == this.h { "square" } else { "rectangle" } }
+}
+
+func largest(shapes: Shape[]) -> Shape? {
+  var best: Shape? = None
+  for s in shapes {
+    let bigger = match best {
+      Some(b) => s.area() > b.area()
+      None => true
+    }
+    if bigger { best = Some(s) }
+  }
+  best
+}
+
+let shapes: Shape[] = [Circle(1.0), Rect(2.0, 3.0), Rect(2.0, 2.0)]
+for s in shapes { print(s) }
+print("largest: {largest(shapes) ?? Circle(0.0)}")
+let circles = [Circle(0.5), Circle(2.0)]
+print(largest(circles))

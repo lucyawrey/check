@@ -428,6 +428,9 @@ fn library_files_hold_only_declarations_that_match_the_rust_bodies() {
                 declared.extend(i.members.methods.iter().chain(&i.members.statics))
             }
             Stmt::Class(c) => declared.extend(c.members.methods.iter().chain(&c.members.statics)),
+            Stmt::Enum(e) => declared.extend(e.members.methods.iter().chain(&e.members.statics)),
+            // An interface's methods without bodies are requirements, not host functions.
+            Stmt::Interface(_) => {}
             _ => panic!("a library file holds something other than a declaration"),
         }
     }
@@ -1525,4 +1528,394 @@ fn running_a_folder_needs_a_manifest() {
         entry_of("game", &files).map_err(|c| c.to_string()),
         Err("missing_manifest".to_string())
     );
+}
+
+const SHAPE_INTERFACE: &str = "interface Shape {
+  func area() -> Float
+  func describe() -> String { \"area {this.area()}\" }
+}
+class Circle: Shape {
+  let r: Float
+  func area() -> Float { 3.0 * this.r * this.r }
+}
+class Square(side: Float)
+implement Shape for Square {
+  func area() -> Float { this.side * this.side }
+  func describe() -> String { \"square\" }
+}
+";
+
+fn shapes_output(src: &str) -> String {
+    output(&format!("{SHAPE_INTERFACE}{src}"))
+}
+
+fn shapes_error(src: &str) -> String {
+    first_error(&format!("{SHAPE_INTERFACE}{src}"))
+}
+
+#[test]
+fn a_generic_function_infers_its_type_from_the_arguments_or_the_expected_type() {
+    let src = "func first<T>(xs: T[]) -> T? { if xs.isEmpty() { None } else { xs[0] } }
+func none<T>() -> T? { None }
+print(first([\"a\", \"b\"]))
+let n: Int? = none()
+print(n ?? 7)";
+    assert_eq!(output(src), "Some(\"a\")\n7");
+    assert_eq!(
+        first_error("func empty<T>() -> T[] { [] }\nlet e = empty()"),
+        "type_needed"
+    );
+}
+
+#[test]
+fn a_generic_class_and_enum_work_through_construction_fields_methods_and_patterns() {
+    let src = "class Box<T>(value: T)
+implement Box<T> { func get() -> T { this.value } }
+implement Box<Int> { func doubled() -> Int { this.value * 2 } }
+enum Tree<T> {
+  Leaf
+  Node(Tree<T>, T, Tree<T>)
+}
+func size<T>(t: Tree<T>) -> Int {
+  match t {
+    Leaf => 0
+    Node(l, _, r) => size(l) + 1 + size(r)
+  }
+}
+let b = Box(Box(4))
+print(b.value.get())
+print(Box(5).doubled())
+let Box(inner) = Box(\"hi\")
+print(inner)
+let boxes: Box<Int>[] = [Box(1), Box(2)]
+print(boxes.map(func(x) x.get()))
+let t: Tree<String> = Node(Leaf, \"a\", Node(Leaf, \"b\", Leaf))
+print(size(t))";
+    assert_eq!(output(src), "4\n10\nhi\n[1, 2]\n2");
+    let added = "class Box<T>(value: T)\nimplement Box<Int> { func doubled() -> Int { 2 } }\n";
+    assert_eq!(
+        first_error(&format!("{added}print(Box(\"a\").doubled())")),
+        "unknown_method"
+    );
+    assert_eq!(
+        first_error("class Box<T>(value: T)\nlet b: Box = Box(1)"),
+        "wrong_type_arguments"
+    );
+}
+
+#[test]
+fn a_type_argument_must_implement_every_interface_its_parameter_names() {
+    let src = "func show<T: Shape + Printable>(x: T) -> String { \"{x.toString()} {x.area()}\" }
+class Dot: Shape + Printable {
+  let r: Float
+  func area() -> Float { 0.0 }
+  func toString() -> String { \"dot\" }
+}
+print(show(Dot(1.0)))";
+    assert_eq!(shapes_output(src), "dot 0.0");
+    assert_eq!(
+        shapes_error(
+            "func show<T: Shape + Printable>(x: T) -> Float { x.area() }\nshow(Circle(1.0))"
+        ),
+        "unmet_constraint"
+    );
+    assert_eq!(
+        first_error("func f<T>(x: T) -> Int { x.size() }"),
+        "unknown_method"
+    );
+    assert_eq!(
+        first_error("func f<T>(x: T) -> Int { T.zero() }"),
+        "unknown_name"
+    );
+}
+
+#[test]
+fn an_interface_type_holds_different_classes_and_calls_each_ones_method() {
+    let src = "let shapes: Shape[] = [Circle(1.0), Square(2.0)]
+for s in shapes { print(s.describe()) }
+func total(xs: Shape[]) -> Float {
+  var sum = 0.0
+  for x in xs { sum += x.area() }
+  sum
+}
+let circles = [Circle(1.0), Circle(1.0)]
+print(total(circles))";
+    assert_eq!(shapes_output(src), "area 3.0\nsquare\n6.0");
+    assert_eq!(
+        shapes_error("let xs = [Circle(1.0), Square(2.0)]"),
+        "list_needs_type"
+    );
+}
+
+#[test]
+fn a_callee_changing_an_interface_list_leaves_the_callers_list_alone() {
+    let src = "func grow(var xs: Shape[]) -> Int {
+  xs.push(Square(1.0))
+  xs.length()
+}
+let circles = [Circle(1.0)]
+print(grow(circles))
+print(circles.length())";
+    assert_eq!(shapes_output(src), "2\n1");
+}
+
+#[test]
+fn an_interface_can_require_fields_that_its_defaults_use() {
+    let src = "interface Named {
+  let name: String
+  func greet() -> String { \"hi {this.name}\" }
+}
+class Player: Named { let name: String }
+func hello(n: Named) -> String { n.name }
+print(Player(\"ana\").greet())
+print(hello(Player(\"bo\")))";
+    assert_eq!(output(src), "hi ana\nbo");
+    let named = "interface Named { let name: String }\n";
+    assert_eq!(
+        first_error(&format!("{named}enum E: Named {{ A }}")),
+        "field_requirement_needs_class"
+    );
+    assert_eq!(
+        first_error(&format!(
+            "{named}class P: Named {{ private let name: String = \"x\" }}"
+        )),
+        "missing_implementation"
+    );
+}
+
+#[test]
+fn a_type_must_provide_what_its_interfaces_require_with_matching_types() {
+    assert_eq!(
+        shapes_error("class Blob: Shape { let r: Float }"),
+        "missing_implementation"
+    );
+    assert_eq!(
+        shapes_error("class Blob: Shape {\n  let r: Int\n  func area() -> Int { this.r }\n}"),
+        "wrong_implementation"
+    );
+    assert_eq!(
+        first_error("class A(x: Int)\nclass B: A { let y: Int }"),
+        "not_an_interface"
+    );
+    assert_eq!(
+        shapes_error("interface Round: Shape {}\nimplement Shape for Round {}"),
+        "unknown_name"
+    );
+}
+
+#[test]
+fn two_parents_defaults_conflict_until_the_type_overrides_them() {
+    let parents = "interface A { func hi() -> String { \"a\" } }
+interface B { func hi() -> String { \"b\" } }
+";
+    assert_eq!(
+        first_error(&format!("{parents}class C: A + B {{ let x: Int }}")),
+        "conflicting_defaults"
+    );
+    let src = format!(
+        "{parents}class C: A + B {{\n  let x: Int\n  func hi() -> String {{ \"c\" }}\n}}\nprint(C(1).hi())"
+    );
+    assert_eq!(output(&src), "c");
+}
+
+#[test]
+fn a_built_in_type_can_implement_an_interface() {
+    let src = "implement Shape for Int { func area() -> Float { this.toFloat() } }
+let shapes: Shape[] = [3, Circle(1.0)]
+for s in shapes { print(s.describe()) }";
+    assert_eq!(shapes_output(src), "area 3.0\narea 3.0");
+}
+
+#[test]
+fn an_interface_is_implemented_only_for_a_whole_generic_type() {
+    let src = "class Box<T>(v: T)
+implement Shape for Box<T> { func area() -> Float { 1.5 } }
+let shapes: Shape[] = [Box(1), Box(\"a\")]
+for s in shapes { print(s.area()) }";
+    assert_eq!(shapes_output(src), "1.5\n1.5");
+    assert_eq!(
+        shapes_error(
+            "class Box<T>(v: T)\nimplement Shape for Box<Int> { func area() -> Float { 1.0 } }"
+        ),
+        "implement_for_specific_arguments"
+    );
+}
+
+#[test]
+fn printable_values_print_and_interpolate_through_to_string() {
+    let src = "class P: Printable {
+  let n: Int
+  func toString() -> String { \"P{this.n}\" }
+}
+print(P(1))
+print(\"got {P(2)}\")
+print([P(3), P(4)])
+let m: P? = Some(P(5))
+print(m)";
+    assert_eq!(output(src), "P1\ngot P2\n[P3, P4]\nSome(P5)");
+}
+
+#[test]
+fn eq_lets_a_ref_class_or_a_t_use_double_equals() {
+    let src = "ref class Q: Eq { let x: Int }
+func same<T: Eq>(a: T, b: T) -> Bool { a == b }
+print(Q(1) == Q(1))
+print(Q(1) == Q(2))
+print(same(Q(3), Q(3)))
+print(same(\"a\", \"b\"))";
+    assert_eq!(output(src), "true\nfalse\ntrue\nfalse");
+    assert_eq!(
+        first_error("ref class P { let x: Int }\nprint(P(1) == P(1))"),
+        "invalid_operand_types"
+    );
+    assert_eq!(
+        first_error("func f<T>(a: T, b: T) -> Bool { a == b }"),
+        "invalid_operand_types"
+    );
+    assert_eq!(
+        first_error("ref class P { let x: Int }\nfunc f<T: Eq>(a: T) -> Bool { a == a }\nf(P(1))"),
+        "unmet_constraint"
+    );
+}
+
+#[test]
+fn maybe_and_result_are_generic_enums_from_the_standard_library() {
+    let src = "func orDefault<T>(x: T?, d: T) -> T { x ?? d }
+implement Maybe<T> { func isSet() -> Bool { this is Some(_) } }
+func double(n: Int) -> Result<Int, String> {
+  if n < 5 { Ok(n * 2) } else { Err(\"too big\") }
+}
+print(orDefault(None, 3))
+let m: Int? = Some(4)
+print(m.isSet())
+for n in [4, 5] {
+  match double(n) {
+    Ok(v) => print(\"ok {v}\")
+    Err(e) => print(\"err {e}\")
+  }
+}";
+    assert_eq!(output(src), "3\ntrue\nok 8\nerr too big");
+}
+
+#[test]
+fn one_interface_implemented_for_one_type_in_two_units_is_an_error() {
+    let other = (
+        "other/impl.check",
+        "namespace other\n\nimplement Printable for vectors.Vec { func toString() -> String { \"a\" } }",
+    );
+    let manifest = (
+        "other/package.con",
+        "namespace other\n\nimports = [\"../vectors/\"]",
+    );
+    let main = (
+        "main.check",
+        "import \"other/\"\nimport \"vectors/\"\nimplement Printable for Vec { func toString() -> String { \"b\" } }",
+    );
+    assert_eq!(
+        files_error(&[main, manifest, other, VECTORS]),
+        "duplicate_name"
+    );
+}
+
+#[test]
+fn any_method_or_field_default_can_call_an_interface_default() {
+    let src = "interface Named {
+  func id() -> String
+  func label() -> String { \"<{this.id()}>\" }
+}
+class A: Named {
+  func id() -> String { \"a\" }
+  func shown() -> String { this.label() }
+}
+class Holder { let text: String = A().label() }
+print(A().shown())
+print(Holder().text)";
+    assert_eq!(output(src), "<a>\n<a>");
+}
+
+#[test]
+fn an_implement_can_name_the_types_parameters_its_own_way() {
+    let src = "interface Container<E> { func get() -> E }
+class Box<T> { let v: T }
+implement Container<U> for Box<U> { func get() -> U { this.v } }
+func unwrap(c: Container<Int>) -> Int { c.get() }
+print(unwrap(Box(3)))";
+    assert_eq!(output(src), "3");
+    let twice = "interface Container<E> { func get() -> E }
+class Box<T>: Container<T> {
+  let v: T
+  func get() -> T { this.v }
+}
+implement Container<U> for Box<U> {}";
+    assert_eq!(first_error(twice), "duplicate_name");
+}
+
+#[test]
+fn methods_added_for_different_type_arguments_can_share_a_name() {
+    let src = "class Box<T>(v: T)
+implement Box<T> { func describe() -> String { \"any\" } }
+implement Box<Int> { func describe() -> String { \"int {this.v}\" } }
+implement Box<String> { func describe() -> String { \"text {this.v}\" } }
+print(Box(1).describe())
+print(Box(\"a\").describe())
+print(Box(true).describe())";
+    assert_eq!(output(src), "int 1\ntext a\nany");
+}
+
+#[test]
+fn double_equals_looks_through_nested_generics_for_ref_classes() {
+    let src = "ref class Node { let x: Int }\nclass Box<T>(v: T)\nlet n = Node(1)\n";
+    assert_eq!(
+        first_error(&format!("{src}print(Box(Box(n)) == Box(Box(n)))")),
+        "invalid_operand_types"
+    );
+}
+
+#[test]
+fn eq_objects_that_reach_themselves_compare_without_looping() {
+    let src = "ref class Node: Eq {
+  let id: Int
+  var next: Node? = None
+}
+let a = Node(1)
+let b = Node(1)
+a.next = Some(a)
+b.next = Some(b)
+print(a == b)
+print(a == Node(1))";
+    assert_eq!(output(src), "true\nfalse");
+}
+
+#[test]
+fn a_declared_maybe_list_can_hold_different_classes() {
+    assert_eq!(
+        shapes_output("let xs: Shape[]? = [Circle(1.0), Square(2.0)]\nprint((xs ?? []).length())"),
+        "2"
+    );
+}
+
+#[test]
+fn an_interface_field_has_only_a_name_and_a_type() {
+    assert_eq!(
+        first_error("interface Named { let name: String = \"x\" }"),
+        "interface_field_extras"
+    );
+    assert_eq!(
+        first_error("interface Named { private let name: String }"),
+        "interface_field_extras"
+    );
+}
+
+#[test]
+fn printable_values_print_through_to_string_inside_other_values() {
+    let src = "class P: Printable {
+  let n: Int
+  func toString() -> String { \"P{this.n}\" }
+}
+class Box(v: P)
+enum E { Has(P) }
+print(Box(P(1)))
+print(E.Has(P(2)))
+print((a = P(3), b = \"s\"))";
+    assert_eq!(output(src), "Box(v = P1)\nHas(P2)\n(a = P3, b = \"s\")");
 }
