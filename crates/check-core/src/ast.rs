@@ -23,11 +23,20 @@ pub struct Param {
     pub is_readonly: bool,
 }
 
+/// `T` or `T: Shape + Eq` in a declaration's `<...>`.
+#[derive(Debug, Clone)]
+pub struct TypeParam {
+    pub name: String,
+    pub span: Span,
+    pub bounds: Vec<TypeExpr>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FuncDecl {
     pub id: NodeId,
     pub name: String,
     pub span: Span,
+    pub type_params: Vec<TypeParam>,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
     pub body: Option<Expr>,
@@ -56,6 +65,8 @@ pub struct ClassDecl {
     pub span: Span,
     pub is_ref: bool,
     pub is_private: bool,
+    pub type_params: Vec<TypeParam>,
+    pub interfaces: Vec<TypeExpr>,
     pub fields: Vec<Param>,
     pub init: Option<FuncDecl>,
     pub members: Members,
@@ -64,8 +75,23 @@ pub struct ClassDecl {
 #[derive(Debug, Clone)]
 pub struct ImplementDecl {
     pub target: String,
+    /// `Box<T>` or `Box<Int>`; a name that isn't a type introduces a parameter.
+    pub target_args: Vec<TypeExpr>,
+    pub interface: Option<TypeExpr>,
     pub span: Span,
     pub members: Members,
+}
+
+/// Required methods have no body.
+#[derive(Debug, Clone)]
+pub struct InterfaceDecl {
+    pub name: String,
+    pub span: Span,
+    pub type_params: Vec<TypeParam>,
+    pub parents: Vec<TypeExpr>,
+    pub fields: Vec<Param>,
+    pub members: Members,
+    pub is_private: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +106,8 @@ pub struct VariantDecl {
 pub struct EnumDecl {
     pub name: String,
     pub span: Span,
+    pub type_params: Vec<TypeParam>,
+    pub interfaces: Vec<TypeExpr>,
     pub variants: Vec<VariantDecl>,
     pub members: Members,
     pub is_private: bool,
@@ -170,6 +198,7 @@ pub enum Stmt {
     Class(ClassDecl),
     Enum(EnumDecl),
     Implement(ImplementDecl),
+    Interface(InterfaceDecl),
     Data(DataDecl),
     Expr(Expr),
 }

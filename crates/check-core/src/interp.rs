@@ -5,7 +5,7 @@ use std::io::{BufRead, Write};
 use std::rc::Rc;
 
 use crate::ast::*;
-use crate::checker::{Info, Resolved};
+use crate::checker::{EQ, Info, PRINTABLE, Resolved};
 use crate::diag::{Code, Span};
 use crate::host::{self, Io};
 use crate::value::{Callable, Record, Value};
@@ -53,6 +53,8 @@ pub struct Interpreter<'a> {
     globals: HashMap<String, Value>,
     frames: Vec<Frame>,
     depth: usize,
+    /// The `ref class` objects being printed, by address, to stop at a cycle.
+    printing: Vec<usize>,
     input: &'a mut dyn BufRead,
     output: &'a mut dyn Write,
 }
@@ -77,6 +79,7 @@ pub fn run(
         globals: HashMap::new(),
         frames: vec![Frame { scopes: Vec::new() }],
         depth: 0,
+        printing: Vec::new(),
         input,
         output,
     };
@@ -86,6 +89,11 @@ pub fn run(
         match stmt {
             Stmt::Func(decl) => interp.add_func(decl),
             Stmt::Implement(i) => interp.add_members(&i.target, &i.members),
+            Stmt::Interface(i) => {
+                for m in i.members.methods.iter().filter(|m| m.body.is_some()) {
+                    interp.add_func(m);
+                }
+            }
             Stmt::Class(c) => {
                 if let Some(init) = &c.init {
                     interp.add_func(init);
@@ -267,6 +275,8 @@ impl Interpreter<'_> {
                 }
                 Ok(Value::Variant(Rc::new(Record {
                     name: name.as_str().into(),
+                    ty: enum_name.as_str().into(),
+                    by_fields: false,
                     field_names: names.map(|n| n.iter().map(|f| f.as_str().into()).collect()),
                     fields,
                 })))
@@ -280,6 +290,7 @@ impl Interpreter<'_> {
                 self.depth -= 1;
                 result
             }
+            Resolved::Dynamic(_) => unreachable!("only method calls dispatch at run time"),
             Resolved::Static(key) | Resolved::Method(key) => {
                 let decl = self.funcs[key].clone();
                 self.call_named(&decl, args, span, None)
@@ -287,11 +298,66 @@ impl Interpreter<'_> {
         }
     }
 
+    fn implements(&self, tag: &str, iface: &str) -> bool {
+        self.info
+            .implements
+            .get(tag)
+            .is_some_and(|i| i.contains(iface))
+    }
+
+    /// The method `name` of `this`'s type, its own or an interface default.
+    fn find_method(&self, this: &Value, name: &str) -> Rc<FuncDecl> {
+        let key = format!("{}.{name}", this.tag());
+        let key = self.info.aliases.get(&key).unwrap_or(&key);
+        self.funcs[key].clone()
+    }
+
+    /// How `print` and interpolation show a value, through `toString()` where it's `Printable`.
+    fn text(&mut self, v: &Value, quoted: bool, span: Span) -> Result<String, Flow> {
+        if self.implements(&v.tag(), PRINTABLE) {
+            let decl = self.find_method(v, "toString");
+            return Ok(self
+                .run_decl(&decl, Vec::new(), Some(v.clone()), span)?
+                .display());
+        }
+        Ok(match v {
+            Value::List(items) => {
+                let mut parts = Vec::with_capacity(items.len());
+                for item in items.iter() {
+                    parts.push(self.text(item, true, span)?);
+                }
+                format!("[{}]", parts.join(", "))
+            }
+            Value::Some(inner) if !matches!(**inner, Value::Void) => {
+                format!("Some({})", self.text(inner, true, span)?)
+            }
+            Value::Object(r) | Value::Record(r) => {
+                r.code_with(true, |f| self.text(f, true, span))?
+            }
+            Value::Variant(r) => r.code_with(false, |f| self.text(f, true, span))?,
+            Value::Shared(r) => {
+                let address = Rc::as_ptr(r) as usize;
+                if self.printing.contains(&address) {
+                    return Ok("...".to_string());
+                }
+                let record = r.borrow().clone();
+                self.printing.push(address);
+                let text = record.code_with(true, |f| self.text(f, true, span));
+                self.printing.pop();
+                text?
+            }
+            Value::Str(_) if !quoted => v.display(),
+            _ => v.code(),
+        })
+    }
+
     fn construct(&mut self, class_name: &str, args: &[Arg], span: Span) -> Eval {
         let class = self.classes[class_name].clone();
         let fields = self.bind_args(&class.fields, args)?;
         let record = Record {
             name: class_name.into(),
+            ty: class_name.into(),
+            by_fields: self.implements(class_name, EQ),
             field_names: Some(
                 class
                     .fields
@@ -566,9 +632,12 @@ impl Interpreter<'_> {
                     }
                 }
             }
-            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) | Stmt::Data(_) => {
-                Ok(Value::Void)
-            }
+            Stmt::Func(_)
+            | Stmt::Class(_)
+            | Stmt::Enum(_)
+            | Stmt::Implement(_)
+            | Stmt::Interface(_)
+            | Stmt::Data(_) => Ok(Value::Void),
             Stmt::Expr(e) => self.scoped(|i| i.expr(e)),
         }
     }
@@ -614,7 +683,10 @@ impl Interpreter<'_> {
                 for seg in segs {
                     match seg {
                         StrSeg::Text(t) => out.push_str(t),
-                        StrSeg::Expr(e) => out.push_str(&self.expr(e)?.display()),
+                        StrSeg::Expr(e) => {
+                            let v = self.expr(e)?;
+                            out.push_str(&self.text(&v, false, e.span)?);
+                        }
                     }
                 }
                 Ok(Value::Str(out.into()))
@@ -903,7 +975,8 @@ impl Interpreter<'_> {
             match name.as_str() {
                 "print" => {
                     let v = self.expr(&args[0].value)?;
-                    writeln!(self.output, "{}", v.display()).ok();
+                    let text = self.text(&v, false, span)?;
+                    writeln!(self.output, "{text}").ok();
                     return Ok(Value::Void);
                 }
                 "Some" => {
@@ -1056,6 +1129,11 @@ impl Interpreter<'_> {
             Some(Resolved::Method(key)) => {
                 let this = self.expr(recv)?;
                 let decl = self.funcs[key].clone();
+                return self.call_named(&decl, args, span, Some(this));
+            }
+            Some(Resolved::Dynamic(name)) => {
+                let this = self.expr(recv)?;
+                let decl = self.find_method(&this, name);
                 return self.call_named(&decl, args, span, Some(this));
             }
             Some(r) => return self.resolved(r, args, span),

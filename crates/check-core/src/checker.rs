@@ -17,6 +17,8 @@ pub enum Resolved {
     Const(String),
     Static(String),
     Method(String),
+    /// A method found at run time from the receiver's type, for interface and `T` receivers.
+    Dynamic(String),
 }
 
 #[derive(Default)]
@@ -27,6 +29,10 @@ pub struct Info {
     pub unwrapped_index: HashSet<NodeId>,
     pub resolved: HashMap<NodeId, Resolved>,
     pub variant_patterns: HashSet<NodeId>,
+    /// `Circle.describe` to the interface default it runs, `Shape.describe`.
+    pub aliases: HashMap<String, String>,
+    /// Each type's interfaces, their parents included.
+    pub implements: HashMap<String, HashSet<String>>,
 }
 
 #[derive(Clone)]
@@ -57,6 +63,18 @@ struct FuncEntry {
     this: Option<(Ty, bool)>,
     owner: Option<String>,
     library: bool,
+    /// The type parameters it's generic over, its owner's included, and their bounds.
+    bounds: HashMap<String, Vec<Ty>>,
+    renamed: HashMap<String, String>,
+}
+
+struct InterfaceDef {
+    params: Vec<String>,
+    parents: Vec<Ty>,
+    /// Name, type and whether it's a `var`.
+    fields: Vec<(String, Ty, bool)>,
+    /// Name, signature and whether it has a default body.
+    methods: Vec<(String, Sig, bool)>,
 }
 
 struct ClassDef {
@@ -96,6 +114,10 @@ struct ConstEntry {
 }
 
 type Binding = (String, Span, Ty);
+
+/// A type's own method key, with each interface's signature for it and what that
+/// interface's parameters stand for.
+type OwnMethod = (String, Vec<(Sig, HashMap<String, Ty>)>);
 
 enum ArgSource<'a> {
     Expr(&'a Expr),
@@ -177,11 +199,29 @@ pub struct Checker {
     is_bindings: HashMap<NodeId, Vec<Binding>>,
     defaults: Vec<(Expr, Ty, Option<String>)>,
     in_library: bool,
+    /// Each generic type's parameter names.
+    generics: HashMap<String, Vec<String>>,
+    interfaces: HashMap<String, InterfaceDef>,
+    /// The interfaces each type names, in terms of its own parameters.
+    impls: HashMap<String, Vec<Ty>>,
+    /// The type parameters in scope and their bounds.
+    bounds: HashMap<String, Vec<Ty>>,
+    /// A call's type arguments and a bound each must meet, if any, checked once inference
+    /// is done.
+    pending_bounds: Vec<(Ty, Option<Ty>, Span)>,
+    /// Where each type first names an interface, for errors about its implementation.
+    impl_spans: HashMap<String, Span>,
+    /// Parameter names an `implement` uses for its type's own (`U` for `T`).
+    renamed: HashMap<String, String>,
 }
 
 pub(crate) const RESERVED_NAMES: &[&str] = &["Maybe", "Some", "None", "Result", "Ok", "Err"];
 const MUTATING: &[&str] = &["push", "pop", "removeAt"];
-const BUILT_IN_TYPES: &[&str] = &["String", "Int", "Float", "Bool"];
+pub(crate) const BUILT_IN_TYPES: &[&str] = &["String", "Int", "Float", "Bool"];
+pub(crate) const MAYBE: &str = "check.std.Maybe";
+const RESULT: &str = "check.std.Result";
+pub(crate) const PRINTABLE: &str = "check.std.Printable";
+pub(crate) const EQ: &str = "check.std.Eq";
 
 pub fn check(program: &[Stmt], library: &[Stmt]) -> (Info, Vec<Diagnostic>) {
     let mut checker = Checker {
@@ -202,6 +242,13 @@ pub fn check(program: &[Stmt], library: &[Stmt]) -> (Info, Vec<Diagnostic>) {
         is_bindings: HashMap::new(),
         defaults: Vec::new(),
         in_library: false,
+        generics: HashMap::new(),
+        interfaces: HashMap::new(),
+        impls: HashMap::new(),
+        bounds: HashMap::new(),
+        pending_bounds: Vec::new(),
+        impl_spans: HashMap::new(),
+        renamed: HashMap::new(),
     };
     checker.program(program, library);
     (checker.info, checker.diags)
@@ -223,9 +270,10 @@ impl Checker {
 
     fn program(&mut self, program: &[Stmt], library: &[Stmt]) {
         for stmt in library.iter().chain(program) {
-            let (name, span) = match stmt {
-                Stmt::Class(c) => (&c.name, c.span),
-                Stmt::Enum(e) => (&e.name, e.span),
+            let (name, span, params) = match stmt {
+                Stmt::Class(c) => (&c.name, c.span, &c.type_params),
+                Stmt::Enum(e) => (&e.name, e.span, &e.type_params),
+                Stmt::Interface(i) => (&i.name, i.span, &i.type_params),
                 _ => continue,
             };
             if RESERVED_NAMES.contains(&name.as_str()) || BUILT_IN_TYPES.contains(&name.as_str()) {
@@ -233,11 +281,18 @@ impl Checker {
             } else if !self.type_names.insert(name.clone()) {
                 self.error(Code::duplicate_name, span);
             }
+            let names = params.iter().map(|p| p.name.clone()).collect();
+            self.generics.insert(name.clone(), names);
+        }
+        for stmt in library.iter().chain(program) {
+            if let Stmt::Interface(i) = stmt {
+                self.declare_interface(i);
+            }
         }
         for stmt in library.iter().chain(program) {
             match stmt {
                 Stmt::Class(c) => self.declare_class(c),
-                Stmt::Enum(e) => self.declare_enum(e),
+                Stmt::Enum(e) if e.name != MAYBE => self.declare_enum(e),
                 _ => {}
             }
         }
@@ -267,15 +322,19 @@ impl Checker {
             }
         }
         self.in_library = false;
+        // Defaults are linked before any body is checked, since bodies can call them.
+        let own_methods = self.check_impls();
         for (default, ty, owner) in std::mem::take(&mut self.defaults) {
             self.current_type = owner;
             let actual = self.expr(&default, Some(&ty));
             self.subsume(default.id, &actual, &ty);
         }
         self.current_type = None;
+        self.check_signatures(own_methods);
         for stmt in program {
             self.stmt(stmt);
         }
+        self.check_bounds(0);
         let names: Vec<String> = self.funcs.keys().cloned().collect();
         for name in names {
             self.ensure_checked(&name, Span::default());
@@ -324,7 +383,111 @@ impl Checker {
         }
     }
 
+    /// Brings a declaration's type parameters into scope, returning the ones before.
+    fn enter_params(&mut self, params: &[TypeParam]) -> HashMap<String, Vec<Ty>> {
+        let saved = self.bounds.clone();
+        for p in params {
+            self.bounds.insert(p.name.clone(), Vec::new());
+        }
+        for p in params {
+            let bounds = p.bounds.iter().map(|b| self.type_from(b)).collect();
+            self.bounds.insert(p.name.clone(), bounds);
+        }
+        saved
+    }
+
+    /// The type a generic type's own declaration sees: `Box<T>` inside `Box`.
+    fn own_type(&self, name: &str) -> Ty {
+        let params = self.generics.get(name).cloned().unwrap_or_default();
+        Ty::Named(
+            name.to_string(),
+            params.into_iter().map(Ty::Param).collect(),
+        )
+    }
+
+    /// The type `name` with a fresh type variable for each parameter.
+    fn fresh_type(&mut self, name: &str) -> Ty {
+        let params = self.generics.get(name).cloned().unwrap_or_default();
+        let args = params.iter().map(|_| self.subst.fresh()).collect();
+        Ty::Named(name.to_string(), args)
+    }
+
+    /// What each of type `name`'s parameters stands for in `args`.
+    fn args_map(&self, name: &str, args: &[Ty]) -> HashMap<String, Ty> {
+        let params = self.generics.get(name).cloned().unwrap_or_default();
+        params.into_iter().zip(args.iter().cloned()).collect()
+    }
+
+    fn add_impls(&mut self, owner: &str, interfaces: &[TypeExpr]) {
+        for t in interfaces {
+            let ty = self.type_from(t);
+            let span = type_span(t);
+            match &ty {
+                Ty::Named(n, _) if self.interfaces.contains_key(n) => {}
+                Ty::Error => continue,
+                _ => {
+                    self.error(Code::not_an_interface, span);
+                    continue;
+                }
+            }
+            self.impl_spans.entry(owner.to_string()).or_insert(span);
+            let list = self.impls.entry(owner.to_string()).or_default();
+            if list.contains(&ty) {
+                self.error(Code::duplicate_name, span);
+            } else {
+                list.push(ty);
+            }
+        }
+    }
+
+    fn declare_interface(&mut self, i: &InterfaceDecl) {
+        let saved = self.enter_params(&i.type_params);
+        let parents = i.parents.iter().map(|p| self.type_from(p)).collect();
+        let fields = i
+            .fields
+            .iter()
+            .map(|f| {
+                if f.default.is_some() || f.is_private || f.is_readonly {
+                    self.error(Code::interface_field_extras, f.span);
+                }
+                let ty = match &f.ty {
+                    Some(t) => self.type_from(t),
+                    None => self.error(Code::type_needed, f.span),
+                };
+                (f.name.clone(), ty, f.is_var)
+            })
+            .collect();
+        self.check_unique(i.fields.iter().map(|f| (&f.name, f.span)));
+        let this = self.own_type(&i.name);
+        let mut methods = Vec::new();
+        for m in &i.members.methods {
+            let short = m.name.rsplit('.').next().unwrap_or(&m.name).to_string();
+            let inner = self.enter_params(&m.type_params);
+            let params = self.param_sigs(&m.params);
+            let ret = Some(m.ret.as_ref().map_or(Ty::Void, |t| self.type_from(t)));
+            self.bounds = inner;
+            methods.push((short, Sig { params, ret }, m.body.is_some()));
+            if m.body.is_some() {
+                self.declare_func(m, Some((this.clone(), false)), Some(&i.name));
+            }
+        }
+        if !i.members.statics.is_empty() || !i.members.consts.is_empty() {
+            self.error(Code::unexpected_token, i.span);
+        }
+        self.bounds = saved;
+        self.interfaces.insert(
+            i.name.clone(),
+            InterfaceDef {
+                params: i.type_params.iter().map(|p| p.name.clone()).collect(),
+                parents,
+                fields,
+                methods,
+            },
+        );
+    }
+
     fn declare_class(&mut self, c: &ClassDecl) {
+        let saved = self.enter_params(&c.type_params);
         self.current_type = Some(c.name.clone());
         let fields = self.param_sigs(&c.fields);
         self.current_type = None;
@@ -345,28 +508,70 @@ impl Checker {
                 readonly: c.fields.iter().map(|f| f.is_readonly).collect(),
             }),
         );
+        let this = self.own_type(&c.name);
         if let Some(init) = &c.init {
-            self.declare_func(init, Some((Ty::Named(c.name.clone()), true)), Some(&c.name));
+            self.declare_func(init, Some((this.clone(), true)), Some(&c.name));
         }
-        self.declare_members(&c.name, Ty::Named(c.name.clone()), &c.members);
+        self.declare_members(&c.name, this, &c.members);
+        self.add_impls(&c.name, &c.interfaces);
+        self.bounds = saved;
     }
 
     fn declare_implement(&mut self, i: &ImplementDecl) {
+        let arity = self.generics.get(&i.target).map_or(0, Vec::len);
+        let known = BUILT_IN_TYPES.contains(&i.target.as_str())
+            || (self.type_names.contains(&i.target) && !self.interfaces.contains_key(&i.target));
+        if !known {
+            self.error(Code::unknown_name, i.span);
+            return;
+        }
+        if !i.target_args.is_empty() && i.target_args.len() != arity {
+            self.error(Code::wrong_type_arguments, i.span);
+            return;
+        }
+        // A name in `Box<U>` that isn't a type introduces a parameter, which stands for the
+        // type's own (`T`) so every implementation reads alike.
+        let saved = (self.bounds.clone(), self.renamed.clone());
+        let own = self.generics.get(&i.target).cloned().unwrap_or_default();
+        let mut whole = true;
+        for (a, p) in i.target_args.iter().zip(&own) {
+            match a {
+                TypeExpr::Name(n, _)
+                    if !self.type_names.contains(n)
+                        && !BUILT_IN_TYPES.contains(&n.as_str())
+                        && !self.renamed.contains_key(n) =>
+                {
+                    self.renamed.insert(n.clone(), p.clone());
+                    self.bounds.insert(p.clone(), Vec::new());
+                }
+                _ => whole = false,
+            }
+        }
+        let args: Vec<Ty> = i.target_args.iter().map(|a| self.type_from(a)).collect();
         let this = match i.target.as_str() {
             "String" => Ty::Str,
             "Int" => Ty::Int,
             "Float" => Ty::Float,
             "Bool" => Ty::Bool,
-            name if self.type_names.contains(name) => Ty::Named(name.to_string()),
-            _ => {
-                self.error(Code::unknown_name, i.span);
-                return;
-            }
+            MAYBE => Ty::maybe(args.first().cloned().unwrap_or(Ty::Error)),
+            name => Ty::Named(name.to_string(), args.clone()),
         };
+        if let Some(iface) = &i.interface {
+            if !whole || (i.target_args.is_empty() && arity > 0) {
+                self.error(Code::implement_for_specific_arguments, i.span);
+            } else {
+                self.add_impls(&i.target, std::slice::from_ref(iface));
+            }
+        }
+        if i.target_args.is_empty() && arity > 0 && !i.members.methods.is_empty() {
+            self.error(Code::wrong_type_arguments, i.span);
+        }
         self.declare_members(&i.target, this, &i.members);
+        (self.bounds, self.renamed) = saved;
     }
 
     fn declare_enum(&mut self, e: &EnumDecl) {
+        let saved = self.enter_params(&e.type_params);
         self.check_unique(e.variants.iter().map(|v| (&v.name, v.span)));
         let variants = e
             .variants
@@ -390,7 +595,10 @@ impl Checker {
             })
             .collect();
         self.types.insert(e.name.clone(), TypeDef::Enum(variants));
-        self.declare_members(&e.name, Ty::Named(e.name.clone()), &e.members);
+        let this = self.own_type(&e.name);
+        self.declare_members(&e.name, this, &e.members);
+        self.add_impls(&e.name, &e.interfaces);
+        self.bounds = saved;
     }
 
     fn declare_members(&mut self, owner: &str, this: Ty, members: &Members) {
@@ -441,8 +649,10 @@ impl Checker {
         if RESERVED_NAMES.contains(&decl.name.as_str()) {
             self.error(Code::redefined_builtin, decl.span);
         }
+        let saved = self.enter_params(&decl.type_params);
         let params = self.param_sigs(&decl.params);
         let ret = decl.ret.as_ref().map(|t| self.type_from(t));
+        let bounds = std::mem::replace(&mut self.bounds, saved);
         let entry = FuncEntry {
             decl: decl.clone(),
             sig: Sig { params, ret },
@@ -450,6 +660,8 @@ impl Checker {
             this,
             owner: owner.map(str::to_string),
             library: self.in_library,
+            bounds,
+            renamed: self.renamed.clone(),
         };
         self.funcs.insert(decl.name.clone(), entry);
     }
@@ -609,6 +821,11 @@ impl Checker {
     }
 
     fn type_from(&mut self, t: &TypeExpr) -> Ty {
+        if let TypeExpr::Name(n, _) = t
+            && let Some(p) = self.renamed.get(n)
+        {
+            return Ty::Param(p.clone());
+        }
         match t {
             TypeExpr::Name(name, span) => match name.as_str() {
                 "Int" => Ty::Int,
@@ -617,20 +834,25 @@ impl Checker {
                 "String" => Ty::Str,
                 "Void" => Ty::Void,
                 "Never" => Ty::Never,
-                _ if self.type_names.contains(name) => Ty::Named(name.clone()),
+                _ if self.bounds.contains_key(name) => Ty::Param(name.clone()),
+                _ if self.generics.get(name).is_some_and(|g| !g.is_empty()) => {
+                    self.error(Code::wrong_type_arguments, *span)
+                }
+                _ if self.type_names.contains(name) => Ty::named(name),
                 _ => self.error(Code::unknown_name, *span),
             },
-            TypeExpr::Generic(name, args, span) => match (name.as_str(), args.as_slice()) {
-                ("List", [elem]) => {
-                    let elem = self.type_from(elem);
-                    Ty::list(elem)
+            TypeExpr::Generic(name, args, span) => {
+                let args: Vec<Ty> = args.iter().map(|a| self.type_from(a)).collect();
+                match (name.as_str(), args.as_slice()) {
+                    ("List", [elem]) => Ty::list(elem.clone()),
+                    (MAYBE, [inner]) => Ty::maybe(inner.clone()),
+                    _ if !self.type_names.contains(name) => self.error(Code::unknown_name, *span),
+                    _ if self.generics.get(name).map_or(0, Vec::len) != args.len() => {
+                        self.error(Code::wrong_type_arguments, *span)
+                    }
+                    _ => Ty::Named(name.clone(), args),
                 }
-                ("Maybe", [inner]) => {
-                    let inner = self.type_from(inner);
-                    Ty::maybe(inner)
-                }
-                _ => self.error(Code::unknown_name, *span),
-            },
+            }
             TypeExpr::Maybe(inner) => {
                 let inner = self.type_from(inner);
                 Ty::maybe(inner)
@@ -668,6 +890,8 @@ impl Checker {
         let decl = entry.decl.clone();
         let sig = entry.sig.clone();
         let this = entry.this.clone();
+        let saved_bounds = std::mem::replace(&mut self.bounds, entry.bounds.clone());
+        let saved_renamed = std::mem::replace(&mut self.renamed, entry.renamed.clone());
         let saved_type = std::mem::replace(&mut self.current_type, entry.owner.clone());
         let saved_scopes = self.scopes.split_off(1);
         let saved_loops = std::mem::take(&mut self.loops);
@@ -708,6 +932,8 @@ impl Checker {
         let body = decl.body.as_ref().expect("checked functions have bodies");
         let ret = self.function_body(body, sig.ret.clone());
         self.finish_scope();
+        self.bounds = saved_bounds;
+        self.renamed = saved_renamed;
         self.current_type = saved_type;
         self.scopes.truncate(1);
         self.scopes.extend(saved_scopes);
@@ -720,6 +946,7 @@ impl Checker {
     }
 
     fn function_body(&mut self, body: &Expr, declared: Option<Ty>) -> Ty {
+        let pending = self.pending_bounds.len();
         self.fns.push(FnCtx {
             declared: declared.clone(),
             uses_try: false,
@@ -754,7 +981,270 @@ impl Checker {
                 self.error(code, span);
             }
         }
+        self.check_bounds(pending);
         ret
+    }
+
+    /// Checks the bounds calls added since `from`, now that their types are known.
+    fn check_bounds(&mut self, from: usize) {
+        let mut reported = HashSet::new();
+        for (ty, bound, span) in self.pending_bounds.split_off(from) {
+            let ty = self.resolve(&ty);
+            if matches!(ty, Ty::Var(_)) {
+                if reported.insert(span.start) {
+                    self.error(Code::type_needed, span);
+                }
+            } else if let Some(bound) = bound
+                && !self.implements(&ty, &bound)
+            {
+                self.error(Code::unmet_constraint, span);
+            }
+        }
+    }
+
+    /// The name types are known by at run time: `Int`, `List`, a class's key.
+    fn tag(&self, ty: &Ty) -> Option<String> {
+        Some(match ty {
+            Ty::Int => "Int".to_string(),
+            Ty::Float => "Float".to_string(),
+            Ty::Bool => "Bool".to_string(),
+            Ty::Str => "String".to_string(),
+            Ty::List(_) => "List".to_string(),
+            Ty::Maybe(_) => MAYBE.to_string(),
+            Ty::Named(n, _) if !self.interfaces.contains_key(n) => n.clone(),
+            _ => return None,
+        })
+    }
+
+    fn type_args(ty: &Ty) -> Vec<Ty> {
+        match ty {
+            Ty::Named(_, args) => args.clone(),
+            Ty::List(e) | Ty::Maybe(e) => vec![(**e).clone()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The interfaces `ty` is known to implement, with their parents.
+    fn interfaces_of(&self, ty: &Ty) -> Vec<Ty> {
+        let mut stack = match self.subst.shallow(ty) {
+            Ty::Param(p) => self.bounds.get(&p).cloned().unwrap_or_default(),
+            t @ Ty::Named(..) if self.tag(&t).is_none() => vec![t],
+            t => match self.tag(&t) {
+                Some(tag) => {
+                    let map = self.args_map(&tag, &Self::type_args(&t));
+                    let list = self.impls.get(&tag).cloned().unwrap_or_default();
+                    list.iter().map(|i| i.substitute(&map)).collect()
+                }
+                None => Vec::new(),
+            },
+        };
+        let mut all = Vec::new();
+        while let Some(i) = stack.pop() {
+            let Ty::Named(name, args) = &i else {
+                continue;
+            };
+            if let Some(def) = self.interfaces.get(name) {
+                let map: HashMap<String, Ty> = def
+                    .params
+                    .iter()
+                    .cloned()
+                    .zip(args.iter().cloned())
+                    .collect();
+                stack.extend(def.parents.iter().map(|p| p.substitute(&map)));
+            }
+            if !all.contains(&i) {
+                all.push(i);
+            }
+        }
+        all
+    }
+
+    fn implements(&mut self, ty: &Ty, iface: &Ty) -> bool {
+        if matches!(self.subst.shallow(ty), Ty::Error | Ty::Never) {
+            return true;
+        }
+        let Ty::Named(want, want_args) = self.subst.shallow(iface) else {
+            return false;
+        };
+        // Every type `==` works on is `Eq`; a `ref class` has to say so.
+        let ty = self.subst.shallow(ty);
+        if want == EQ
+            && !matches!(ty, Ty::Param(_))
+            && !self.is_interface(&ty)
+            && !self.is_ref_class(&ty)
+        {
+            return !self.holds_ref(&ty, &mut HashSet::new());
+        }
+        for i in self.interfaces_of(&ty) {
+            if let Ty::Named(name, args) = &i
+                && *name == want
+            {
+                return args
+                    .iter()
+                    .zip(&want_args)
+                    .all(|(a, b)| self.subst.unify(a, b));
+            }
+        }
+        false
+    }
+
+    fn is_interface(&self, ty: &Ty) -> bool {
+        matches!(self.subst.shallow(ty), Ty::Named(n, _) if self.interfaces.contains_key(&n))
+    }
+
+    /// Whether a value of type `a` can be used as an `e`: unifying them, but letting a type
+    /// stand for an interface it implements, in lists and `Maybe`s too.
+    fn conforms(&mut self, a: &Ty, e: &Ty) -> bool {
+        let (a, e) = (self.subst.shallow(a), self.subst.shallow(e));
+        match (&a, &e) {
+            (Ty::List(x), Ty::List(y)) | (Ty::Maybe(x), Ty::Maybe(y)) => self.conforms(x, y),
+            (Ty::Var(_), _) => self.subst.unify(&a, &e),
+            _ if self.is_interface(&e) && a != e => self.implements(&a, &e),
+            _ => self.subst.unify(&a, &e),
+        }
+    }
+
+    /// Checks each type against the interfaces it names, and points interface defaults it
+    /// doesn't override at the type. Returns the type's own methods that interfaces declare,
+    /// with each interface's signature, for `check_signatures`.
+    fn check_impls(&mut self) -> Vec<OwnMethod> {
+        let mut own_methods = Vec::new();
+        let mut owners: Vec<String> = self.impls.keys().cloned().collect();
+        owners.sort();
+        for owner in owners {
+            let this = self.own_type(&owner);
+            let this = match owner.as_str() {
+                "Int" => Ty::Int,
+                "Float" => Ty::Float,
+                "Bool" => Ty::Bool,
+                "String" => Ty::Str,
+                MAYBE => Ty::maybe(Ty::Param(self.generics[MAYBE][0].clone())),
+                _ => this,
+            };
+            let span = self.impl_spans[&owner];
+            let all = self.interfaces_of(&this);
+            let mut tags = HashSet::new();
+            let mut methods: Vec<String> = Vec::new();
+            for i in &all {
+                let Ty::Named(name, args) = i else { continue };
+                tags.insert(name.clone());
+                let def = &self.interfaces[name];
+                let map: HashMap<String, Ty> = def
+                    .params
+                    .iter()
+                    .cloned()
+                    .zip(args.iter().cloned())
+                    .collect();
+                let fields: Vec<(String, Ty, bool)> = def
+                    .fields
+                    .iter()
+                    .map(|(n, t, v)| (n.clone(), t.substitute(&map), *v))
+                    .collect();
+                let method_names: Vec<String> = def.methods.iter().map(|m| m.0.clone()).collect();
+                for (field, ty, is_var) in fields {
+                    let found = match &this {
+                        Ty::Named(class, args) if self.class(class).is_some() => {
+                            self.field(class, args, &field).filter(|f| !f.private)
+                        }
+                        _ => {
+                            self.error(Code::field_requirement_needs_class, span);
+                            continue;
+                        }
+                    };
+                    let ok = found
+                        .is_some_and(|f| (f.mutable || !is_var) && self.subst.unify(&f.ty, &ty));
+                    if !ok {
+                        self.error(Code::missing_implementation, span);
+                    }
+                }
+                for m in method_names {
+                    if !methods.contains(&m) {
+                        methods.push(m);
+                    }
+                }
+            }
+            for m in methods {
+                let key = format!("{owner}.{m}");
+                let own = self.funcs.get(&key).is_some_and(|f| f.this.is_some());
+                // Each interface's version of the method, and whether it has a body.
+                let mut versions = Vec::new();
+                for i in &all {
+                    let Ty::Named(name, args) = i else { continue };
+                    let def = &self.interfaces[name];
+                    if let Some((_, sig, has_body)) = def.methods.iter().find(|(n, ..)| *n == m) {
+                        let map: HashMap<String, Ty> = def
+                            .params
+                            .iter()
+                            .cloned()
+                            .zip(args.iter().cloned())
+                            .collect();
+                        versions.push((name.clone(), sig.clone(), *has_body, map));
+                    }
+                }
+                if own {
+                    let wants = versions.into_iter().map(|v| (v.1, v.3)).collect();
+                    own_methods.push((key, wants));
+                    continue;
+                }
+                // A default overridden by a more specific interface's default doesn't count.
+                let defaults: Vec<String> = versions
+                    .iter()
+                    .filter(|v| v.2)
+                    .map(|v| v.0.clone())
+                    .collect();
+                let most_specific: Vec<&String> = defaults
+                    .iter()
+                    .filter(|d| {
+                        !defaults.iter().any(|other| {
+                            other != *d
+                                && self
+                                    .interfaces_of(&Ty::named(other))
+                                    .iter()
+                                    .any(|p| matches!(p, Ty::Named(n, _) if n == *d))
+                        })
+                    })
+                    .collect();
+                match most_specific.as_slice() {
+                    [one] => {
+                        let target = format!("{one}.{m}");
+                        self.info.aliases.insert(key, target);
+                    }
+                    [] => {
+                        self.error(Code::missing_implementation, span);
+                    }
+                    _ => {
+                        self.error(Code::conflicting_defaults, span);
+                    }
+                }
+            }
+            self.info.implements.insert(owner, tags);
+        }
+        own_methods
+    }
+
+    /// Checks a type's own methods against the signatures its interfaces declare.
+    fn check_signatures(&mut self, own_methods: Vec<OwnMethod>) {
+        for (key, wants) in own_methods {
+            let span = self.funcs[&key].decl.span;
+            let Some(sig) = self.ensure_checked(&key, span) else {
+                continue;
+            };
+            for (want, map) in &wants {
+                let ok = sig.params.len() == want.params.len()
+                    && sig
+                        .params
+                        .iter()
+                        .zip(&want.params)
+                        .all(|(a, b)| self.subst.unify(&a.ty, &b.ty.substitute(map)))
+                    && self.conforms(
+                        sig.ret.as_ref().unwrap_or(&Ty::Void),
+                        &want.ret.clone().unwrap_or(Ty::Void).substitute(map),
+                    );
+                if !ok {
+                    self.error(Code::wrong_implementation, span);
+                }
+            }
+        }
     }
 
     fn add_coercion(&mut self, id: NodeId, to_float: bool, wraps: usize) {
@@ -773,7 +1263,7 @@ impl Checker {
                 self.add_coercion(id, true, 0);
                 true
             }
-            (Ty::Maybe(_), Ty::Maybe(_)) => self.subst.unify(&a, &e),
+            (Ty::Maybe(_), Ty::Maybe(_)) => self.conforms(&a, &e),
             (_, Ty::Maybe(inner)) => {
                 let inner = (**inner).clone();
                 if self.subsume(id, &a, &inner) {
@@ -783,7 +1273,7 @@ impl Checker {
                     false
                 }
             }
-            _ => self.subst.unify(&a, &e),
+            _ => self.conforms(&a, &e),
         }
     }
 
@@ -806,7 +1296,7 @@ impl Checker {
             e => e,
         };
         match (self.subst.shallow(actual), expected) {
-            (Ty::Record(..), Ty::Named(class)) if self.class(&class).is_some() => {
+            (Ty::Record(..), Ty::Named(class, _)) if self.class(&class).is_some() => {
                 Code::record_to_class
             }
             _ => otherwise,
@@ -884,7 +1374,8 @@ impl Checker {
                 ..
             } => {
                 let declared = ty.as_ref().map(|t| self.type_from(t));
-                if let (ExprKind::Record(args), Some(Ty::Named(class))) = (&value.kind, &declared)
+                if let (ExprKind::Record(args), Some(Ty::Named(class, _))) =
+                    (&value.kind, &declared)
                     && self.class(class).is_some()
                     && !args
                         .first()
@@ -961,9 +1452,12 @@ impl Checker {
                 }
                 Ty::Void
             }
-            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) | Stmt::Data(_) => {
-                Ty::Void
-            }
+            Stmt::Func(_)
+            | Stmt::Class(_)
+            | Stmt::Enum(_)
+            | Stmt::Implement(_)
+            | Stmt::Interface(_)
+            | Stmt::Data(_) => Ty::Void,
             Stmt::Expr(e) => self.unused(e),
         }
     }
@@ -1007,27 +1501,36 @@ impl Checker {
             ExprKind::Field(base, name) if self.type_ref(base).is_none() => {
                 let (bt, base_err) = self.place(base);
                 match self.subst.shallow(&bt) {
-                    Ty::Named(class) => match self.visible_field(&class, name, target.span) {
-                        Some(f) => {
-                            let FieldInfo {
-                                ty,
-                                mutable,
-                                is_ref,
-                                ..
-                            } = f;
-                            let err = if !mutable {
-                                Some(Code::assign_to_let)
-                            } else if f.readonly && !self.inside(&class) {
-                                Some(Code::readonly_field)
-                            } else if is_ref {
-                                None
-                            } else {
-                                base_err
-                            };
-                            (ty, err)
+                    t if self.is_interface(&t) || matches!(t, Ty::Param(_)) => {
+                        match self.required_field(&t, name) {
+                            Some((ty, true)) => (ty, base_err),
+                            Some((ty, false)) => (ty, Some(Code::assign_to_let)),
+                            None => (self.error(Code::unknown_field, target.span), None),
                         }
-                        None => (self.error(Code::unknown_field, target.span), None),
-                    },
+                    }
+                    Ty::Named(class, args) => {
+                        match self.visible_field(&class, &args, name, target.span) {
+                            Some(f) => {
+                                let FieldInfo {
+                                    ty,
+                                    mutable,
+                                    is_ref,
+                                    ..
+                                } = f;
+                                let err = if !mutable {
+                                    Some(Code::assign_to_let)
+                                } else if f.readonly && !self.inside(&class) {
+                                    Some(Code::readonly_field)
+                                } else if is_ref {
+                                    None
+                                } else {
+                                    base_err
+                                };
+                                (ty, err)
+                            }
+                            None => (self.error(Code::unknown_field, target.span), None),
+                        }
+                    }
                     Ty::Record(names, fields) => match record_field(&names, &fields, name) {
                         Some(ty) => (ty, Some(Code::assign_to_let)),
                         None => (self.error(Code::unknown_field, target.span), None),
@@ -1059,13 +1562,14 @@ impl Checker {
         }
     }
 
-    fn field(&self, type_name: &str, field: &str) -> Option<FieldInfo> {
+    fn field(&self, type_name: &str, args: &[Ty], field: &str) -> Option<FieldInfo> {
         let c = self.class(type_name)?;
         let i = c.fields.iter().position(|f| f.name == field)?;
         let ty = match &c.fields[i] {
             f if f.is_rest => Ty::list(f.ty.clone()),
             f => f.ty.clone(),
         };
+        let ty = ty.substitute(&self.args_map(type_name, args));
         Some(FieldInfo {
             ty,
             mutable: c.mutable[i],
@@ -1086,32 +1590,60 @@ impl Checker {
     }
 
     /// A field read from code outside its class, which can't see private fields.
-    fn visible_field(&mut self, type_name: &str, field: &str, span: Span) -> Option<FieldInfo> {
-        let f = self.field(type_name, field)?;
+    fn visible_field(
+        &mut self,
+        type_name: &str,
+        args: &[Ty],
+        field: &str,
+        span: Span,
+    ) -> Option<FieldInfo> {
+        let f = self.field(type_name, args, field)?;
         if f.private && !self.inside(type_name) {
             self.error(Code::private_member, span);
         }
         Some(f)
     }
 
+    /// The type of a field an interface or a `T`'s bounds require, and whether it's a `var`.
+    fn required_field(&self, ty: &Ty, field: &str) -> Option<(Ty, bool)> {
+        self.interfaces_of(ty).into_iter().find_map(|i| {
+            let Ty::Named(name, args) = i else {
+                return None;
+            };
+            let def = &self.interfaces[&name];
+            let map: HashMap<String, Ty> = def.params.iter().cloned().zip(args).collect();
+            let (_, t, is_var) = def.fields.iter().find(|f| f.0 == field)?;
+            Some((t.substitute(&map), *is_var))
+        })
+    }
+
     /// The constructor takes every field but the private ones.
-    fn construct(&mut self, class: &str, args: &[Arg], span: Span) {
+    fn construct(&mut self, id: NodeId, class: &str, args: &[Arg], span: Span) -> Ty {
         for a in args {
             if let Some(name) = &a.name
-                && self.field(class, name).is_some_and(|f| f.private)
+                && self.field(class, &[], name).is_some_and(|f| f.private)
             {
                 self.error(Code::private_member, a.value.span);
             }
         }
+        let ty = self.fresh_type(class);
+        let map = self.args_map(class, &Self::type_args(&ty));
         let c = self.class(class).expect("class");
         let params: Vec<ParamSig> = c
             .fields
             .iter()
             .zip(&c.private)
             .filter(|(_, private)| !**private)
-            .map(|(f, _)| f.clone())
+            .map(|(f, _)| ParamSig {
+                ty: f.ty.substitute(&map),
+                ..f.clone()
+            })
             .collect();
         self.match_args(&params, args, span);
+        self.info
+            .resolved
+            .insert(id, Resolved::Construct(class.to_string()));
+        ty
     }
 
     fn type_ref(&self, e: &Expr) -> Option<String> {
@@ -1126,24 +1658,36 @@ impl Checker {
         }
     }
 
-    fn holds_ref(&self, ty: &Ty, seen: &mut HashSet<String>) -> bool {
-        match self.subst.shallow(ty) {
-            Ty::List(inner) | Ty::Maybe(inner) => self.holds_ref(&inner, seen),
-            Ty::Named(name) if seen.insert(name.clone()) => match self.types.get(&name) {
-                Some(TypeDef::Class(c)) => {
-                    c.is_ref || c.fields.iter().any(|f| self.holds_ref(&f.ty, seen))
+    /// Whether `==` can't compare `ty`: it holds a `ref class`, interface or `T` that isn't `Eq`.
+    fn holds_ref(&mut self, ty: &Ty, seen: &mut HashSet<String>) -> bool {
+        let ty = self.subst.shallow(ty);
+        match &ty {
+            Ty::List(inner) | Ty::Maybe(inner) => self.holds_ref(inner, seen),
+            Ty::Param(_) => !self.implements(&ty, &Ty::named(EQ)),
+            Ty::Named(..) if self.is_interface(&ty) => !self.implements(&ty, &Ty::named(EQ)),
+            Ty::Named(name, args) if seen.insert(Show(&self.resolve(&ty)).to_string()) => {
+                let map = self.args_map(name, args);
+                if self.is_ref_class(&ty) && !self.implements(&ty, &Ty::named(EQ)) {
+                    return true;
                 }
-                Some(TypeDef::Enum(vs)) => vs
-                    .iter()
-                    .any(|v| v.fields.iter().any(|f| self.holds_ref(&f.ty, seen))),
-                None => false,
-            },
+                let fields: Vec<Ty> = match self.types.get(name) {
+                    Some(TypeDef::Class(c)) => {
+                        c.fields.iter().map(|f| f.ty.substitute(&map)).collect()
+                    }
+                    Some(TypeDef::Enum(vs)) => vs
+                        .iter()
+                        .flat_map(|v| v.fields.iter().map(|f| f.ty.substitute(&map)))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                fields.iter().any(|f| self.holds_ref(f, seen))
+            }
             _ => false,
         }
     }
 
     fn is_ref_class(&self, ty: &Ty) -> bool {
-        matches!(self.subst.shallow(ty), Ty::Named(n)
+        matches!(self.subst.shallow(ty), Ty::Named(n, _)
             if matches!(self.types.get(&n), Some(TypeDef::Class(c)) if c.is_ref))
     }
 
@@ -1175,12 +1719,30 @@ impl Checker {
             .any(|t| matches!(t, TypeDef::Enum(vs) if vs.iter().any(|v| v.name == variant)))
     }
 
+    /// The enum a bare variant name belongs to: the expected type's, or `Result`'s, which
+    /// are usable anywhere.
     fn expected_variant(&self, expected: Option<&Ty>, name: &str) -> Option<String> {
         match expected.map(|e| self.subst.shallow(e)) {
-            Some(Ty::Named(e)) if self.variant(&e, name).is_some() => Some(e),
+            Some(Ty::Named(e, _)) if self.variant(&e, name).is_some() => Some(e),
             Some(Ty::Maybe(inner)) => self.expected_variant(Some(&inner), name),
+            _ if self.variant(RESULT, name).is_some() => Some(RESULT.to_string()),
             _ => None,
         }
+    }
+
+    /// A variant's field types, for the enum type `ty`.
+    fn variant_fields(&self, enum_name: &str, args: &[Ty], name: &str) -> Option<Vec<ParamSig>> {
+        let map = self.args_map(enum_name, args);
+        let v = self.variant(enum_name, name)?;
+        Some(
+            v.fields
+                .iter()
+                .map(|f| ParamSig {
+                    ty: f.ty.substitute(&map),
+                    ..f.clone()
+                })
+                .collect(),
+        )
     }
 
     fn assign(&mut self, target: &Expr, op: Option<BinOp>, value: &Expr, span: Span) {
@@ -1288,13 +1850,26 @@ impl Checker {
                 Ty::Bool
             }
             ExprKind::List(items) => {
-                let elem = match expected.map(|e| self.subst.shallow(e)) {
-                    Some(Ty::List(e)) => *e,
-                    _ => self.subst.fresh(),
+                let expected = match expected.map(|e| self.subst.shallow(e)) {
+                    Some(Ty::Maybe(inner)) => Some(self.subst.shallow(&inner)),
+                    e => e,
+                };
+                let (elem, declared) = match expected {
+                    Some(Ty::List(e)) => (*e, true),
+                    _ => (self.subst.fresh(), false),
                 };
                 for item in items {
                     let t = self.expr(item, Some(&elem));
-                    self.expect(item, &t, &elem);
+                    let different_types = !declared
+                        && matches!(
+                            (self.subst.shallow(&t), self.subst.shallow(&elem)),
+                            (Ty::Named(a, _), Ty::Named(b, _)) if a != b
+                        );
+                    if different_types {
+                        self.error(Code::list_needs_type, item.span);
+                    } else {
+                        self.expect(item, &t, &elem);
+                    }
                 }
                 Ty::list(elem)
             }
@@ -1411,7 +1986,7 @@ impl Checker {
             id,
             Resolved::Variant(enum_name.to_string(), name.to_string()),
         );
-        Ty::Named(enum_name.to_string())
+        self.fresh_type(enum_name)
     }
 
     fn variant_call(
@@ -1422,16 +1997,16 @@ impl Checker {
         args: &[Arg],
         span: Span,
     ) -> Ty {
+        let ty = self.fresh_type(enum_name);
         let params = self
-            .variant(enum_name, name)
-            .map(|v| v.fields.clone())
+            .variant_fields(enum_name, &Self::type_args(&ty), name)
             .unwrap_or_default();
         self.match_args(&params, args, span);
         self.info.resolved.insert(
             id,
             Resolved::Variant(enum_name.to_string(), name.to_string()),
         );
-        Ty::Named(enum_name.to_string())
+        ty
     }
 
     fn record_literal(&mut self, expr: &Expr, args: &[Arg], expected: Option<&Ty>) -> Ty {
@@ -1442,14 +2017,10 @@ impl Checker {
             Ty::Maybe(inner) => self.subst.shallow(&inner),
             e => e,
         });
-        if let Some(Ty::Named(class)) = &expected
+        if let Some(Ty::Named(class, _)) = &expected
             && self.class(class).is_some()
         {
-            self.construct(class, args, expr.span);
-            self.info
-                .resolved
-                .insert(expr.id, Resolved::Construct(class.clone()));
-            return Ty::Named(class.clone());
+            return self.construct(expr.id, class, args, expr.span);
         }
         if args.is_empty() {
             return self.error(Code::type_needed, expr.span);
@@ -1488,7 +2059,7 @@ impl Checker {
     fn record_copy(&mut self, original: &Expr, changes: &[Arg]) -> Ty {
         let t = self.expr(original, None);
         let copyable = match self.subst.shallow(&t) {
-            Ty::Named(class) => self.class(&class).is_some(),
+            Ty::Named(class, _) => self.class(&class).is_some(),
             Ty::Record(..) | Ty::Error => true,
             Ty::Var(_) => {
                 self.error(Code::type_needed, original.span);
@@ -1509,7 +2080,7 @@ impl Checker {
                 continue;
             }
             let field = match (&change.name, self.subst.shallow(&t)) {
-                (Some(name), Ty::Named(class)) => match self.field(&class, name) {
+                (Some(name), Ty::Named(class, args)) => match self.field(&class, &args, name) {
                     Some(f) if (f.private || f.readonly) && !self.inside(&class) => {
                         let code = if f.private {
                             Code::private_member
@@ -1564,7 +2135,13 @@ impl Checker {
         }
         let bt = self.expr(base, None);
         match self.subst.shallow(&bt) {
-            Ty::Named(class) => match self.visible_field(&class, name, span) {
+            t if self.is_interface(&t) || matches!(t, Ty::Param(_)) => {
+                match self.required_field(&t, name) {
+                    Some((ty, _)) => ty,
+                    None => self.error(Code::unknown_field, span),
+                }
+            }
+            Ty::Named(class, args) => match self.visible_field(&class, &args, name, span) {
                 Some(f) => f.ty,
                 None => self.error(Code::unknown_field, span),
             },
@@ -1586,8 +2163,10 @@ impl Checker {
             let Some(sig) = self.ensure_checked(name, span) else {
                 return Ty::Error;
             };
-            let params = sig.params.iter().map(|p| p.ty.clone()).collect();
-            return Ty::Func(params, Box::new(sig.ret.unwrap_or(Ty::Void)));
+            let map = self.instantiate(name, span);
+            let params = sig.params.iter().map(|p| p.ty.substitute(&map)).collect();
+            let ret = sig.ret.unwrap_or(Ty::Void).substitute(&map);
+            return Ty::Func(params, Box::new(ret));
         }
         if name == "None" {
             return Ty::maybe(self.subst.fresh());
@@ -1926,11 +2505,7 @@ impl Checker {
                 _ => {}
             }
             if let Some(TypeDef::Class(_)) = self.types.get(name) {
-                self.construct(name, args, span);
-                self.info
-                    .resolved
-                    .insert(id, Resolved::Construct(name.clone()));
-                return Ty::Named(name.clone());
+                return self.construct(id, name, args, span);
             }
             if let Some(e) = self.expected_variant(expected, name) {
                 return self.variant_call(id, &e, name, args, span);
@@ -1962,12 +2537,100 @@ impl Checker {
     }
 
     fn call_named(&mut self, name: &str, args: &[Arg], span: Span) -> Ty {
-        let params = self.funcs[name].sig.params.clone();
+        self.call_entry(name, None, args, span)
+    }
+
+    /// Fresh type variables for a function's type parameters, whose bounds are checked later.
+    fn instantiate(&mut self, name: &str, span: Span) -> HashMap<String, Ty> {
+        let bounds = self.funcs[name].bounds.clone();
+        let map: HashMap<String, Ty> = bounds
+            .keys()
+            .map(|g| (g.clone(), self.subst.fresh()))
+            .collect();
+        for (g, bs) in bounds {
+            self.pending_bounds.push((map[&g].clone(), None, span));
+            for b in bs {
+                self.pending_bounds
+                    .push((map[&g].clone(), Some(b.substitute(&map)), span));
+            }
+        }
+        map
+    }
+
+    /// Calls function `name`, a method of `recv` when given.
+    fn call_entry(&mut self, name: &str, recv: Option<&Ty>, args: &[Arg], span: Span) -> Ty {
+        let map = self.instantiate(name, span);
+        if let Some(recv) = recv
+            && let Some((this, _)) = self.funcs[name].this.clone()
+            && !self.conforms(recv, &this.substitute(&map))
+        {
+            for a in args {
+                self.expr(&a.value, None);
+            }
+            return self.error(Code::unknown_method, span);
+        }
+        let params: Vec<ParamSig> = self.funcs[name]
+            .sig
+            .params
+            .iter()
+            .map(|p| ParamSig {
+                ty: p.ty.substitute(&map),
+                ..p.clone()
+            })
+            .collect();
         self.match_args(&params, args, span);
         match self.ensure_checked(name, span) {
-            Some(sig) => sig.ret.unwrap_or(Ty::Void),
+            Some(sig) => sig.ret.unwrap_or(Ty::Void).substitute(&map),
             None => Ty::Error,
         }
+    }
+
+    /// The method `name` of a `recv`, whose run-time type is `tag`: one added for its exact type
+    /// arguments (`Box<Int>.get`) first, then the type's own or an interface default, then
+    /// the only one added for some arguments, which the call checks against `recv`.
+    fn method_key(&self, tag: &str, name: &str, recv: &Ty) -> String {
+        let exact = format!("{}.{name}", Show(&self.resolve(recv)));
+        if self.funcs.contains_key(&exact) {
+            return exact;
+        }
+        let own = format!("{tag}.{name}");
+        let own = self.info.aliases.get(&own).cloned().unwrap_or(own);
+        if self.funcs.contains_key(&own) {
+            return own;
+        }
+        let prefix = format!("{tag}<");
+        let suffix = format!(">.{name}");
+        let mut added = self
+            .funcs
+            .keys()
+            .filter(|k| k.starts_with(&prefix) && k.ends_with(&suffix));
+        match (added.next(), added.next()) {
+            (Some(only), None) => only.clone(),
+            _ => own,
+        }
+    }
+
+    /// A method an interface, or a `T`'s bounds, declare: where to find it and its signature.
+    fn interface_method(&self, ty: &Ty, name: &str) -> Option<Sig> {
+        self.interfaces_of(ty).into_iter().find_map(|i| {
+            let Ty::Named(iface, args) = i else {
+                return None;
+            };
+            let def = &self.interfaces[&iface];
+            let map: HashMap<String, Ty> = def.params.iter().cloned().zip(args).collect();
+            let (_, sig, _) = def.methods.iter().find(|m| m.0 == name)?;
+            Some(Sig {
+                params: sig
+                    .params
+                    .iter()
+                    .map(|p| ParamSig {
+                        ty: p.ty.substitute(&map),
+                        ..p.clone()
+                    })
+                    .collect(),
+                ret: sig.ret.as_ref().map(|r| r.substitute(&map)),
+            })
+        })
     }
 
     fn match_args(&mut self, params: &[ParamSig], args: &[Arg], span: Span) {
@@ -2065,14 +2728,29 @@ impl Checker {
             self.expr(recv, None)
         };
         let recv_ty = self.subst.shallow(&recv_ty);
-        match recv_ty {
-            t @ (Ty::Named(_) | Ty::Str | Ty::Int | Ty::Float | Ty::Bool) => {
-                let key = format!("{}.{name}", Show(&t));
-                if self.funcs.get(&key).is_some_and(|f| f.this.is_some()) {
-                    self.check_private_method(&key, &Show(&t).to_string(), span);
-                    self.info.resolved.insert(id, Resolved::Method(key.clone()));
-                    return self.call_named(&key, args, span);
+        if self.is_interface(&recv_ty) || matches!(recv_ty, Ty::Param(_)) {
+            let Some(sig) = self.interface_method(&recv_ty, name) else {
+                for a in args {
+                    self.expr(&a.value, None);
                 }
+                return self.error(Code::unknown_method, span);
+            };
+            self.match_args(&sig.params, args, span);
+            self.info
+                .resolved
+                .insert(id, Resolved::Dynamic(name.to_string()));
+            return sig.ret.unwrap_or(Ty::Void);
+        }
+        if let Some(tag) = self.tag(&recv_ty) {
+            let key = self.method_key(&tag, name, &recv_ty);
+            if self.funcs.get(&key).is_some_and(|f| f.this.is_some()) {
+                self.check_private_method(&key, &tag, span);
+                self.info.resolved.insert(id, Resolved::Method(key.clone()));
+                return self.call_entry(&key, Some(&recv_ty), args, span);
+            }
+        }
+        match recv_ty {
+            Ty::Named(..) | Ty::Str | Ty::Int | Ty::Float | Ty::Bool => {
                 for a in args {
                     self.expr(&a.value, None);
                 }
@@ -2328,7 +3006,7 @@ impl Checker {
             PatternKind::Wildcard => {}
             PatternKind::Name(name) => {
                 let enum_name = match self.subst.shallow(ty) {
-                    Ty::Named(e) if self.variant(&e, name).is_some() => Some(e),
+                    Ty::Named(e, _) if self.variant(&e, name).is_some() => Some(e),
                     _ => None,
                 };
                 if let Some(e) = enum_name {
@@ -2374,22 +3052,24 @@ impl Checker {
                 }
             }
             PatternKind::Variant(None, name, args) if self.class(name).is_some() => {
-                if !self.subst.unify(ty, &Ty::Named(name.clone())) {
+                let class_ty = self.fresh_type(name);
+                if !self.subst.unify(ty, &class_ty) {
                     self.error(Code::type_mismatch, pat.span);
                     return;
                 }
-                self.class_pattern(name, args, pat.span, binds);
+                self.class_pattern(name, &Self::type_args(&class_ty), args, pat.span, binds);
             }
             PatternKind::Variant(qualifier, name, args) => {
-                let enum_name = match (qualifier, self.subst.shallow(ty)) {
+                let (enum_name, enum_args) = match (qualifier, self.subst.shallow(ty)) {
                     (Some(q), t) => {
-                        if !self.subst.unify(&t, &Ty::Named(q.clone())) {
+                        let enum_ty = self.fresh_type(q);
+                        if !self.subst.unify(&t, &enum_ty) {
                             self.error(Code::type_mismatch, pat.span);
                             return;
                         }
-                        q.clone()
+                        (q.clone(), Self::type_args(&enum_ty))
                     }
-                    (None, Ty::Named(e)) => e,
+                    (None, Ty::Named(e, args)) => (e, args),
                     (None, Ty::Error) => return,
                     (None, Ty::Var(_)) => {
                         self.error(Code::type_needed, pat.span);
@@ -2401,8 +3081,8 @@ impl Checker {
                     }
                 };
                 let Some(fields) = self
-                    .variant(&enum_name, name)
-                    .map(|v| v.fields.iter().map(|f| f.ty.clone()).collect::<Vec<_>>())
+                    .variant_fields(&enum_name, &enum_args, name)
+                    .map(|fs| fs.into_iter().map(|f| f.ty).collect::<Vec<_>>())
                 else {
                     self.error(Code::unknown_name, pat.span);
                     return;
@@ -2445,11 +3125,11 @@ impl Checker {
             }
             PatternKind::Record(items) => match self.subst.shallow(ty) {
                 Ty::Record(_, fields) => self.positional_patterns(items, &fields, pat.span, binds),
-                Ty::Named(class) if self.rest_field(&class).is_some() => {
+                Ty::Named(class, _) if self.rest_field(&class).is_some() => {
                     self.error(Code::wrong_arguments, pat.span);
                 }
-                Ty::Named(class) if self.class(&class).is_some() => {
-                    self.class_pattern(&class, items, pat.span, binds);
+                Ty::Named(class, args) if self.class(&class).is_some() => {
+                    self.class_pattern(&class, &args, items, pat.span, binds);
                 }
                 Ty::Error => {}
                 Ty::Var(_) => {
@@ -2476,6 +3156,7 @@ impl Checker {
     fn class_pattern(
         &mut self,
         class: &str,
+        args: &[Ty],
         items: &[Pattern],
         span: Span,
         binds: &mut Vec<Binding>,
@@ -2484,7 +3165,8 @@ impl Checker {
             .class(class)
             .map(|c| c.fields.clone())
             .unwrap_or_default();
-        let tys: Vec<Ty> = fields.iter().map(|f| f.ty.clone()).collect();
+        let map = self.args_map(class, args);
+        let tys: Vec<Ty> = fields.iter().map(|f| f.ty.substitute(&map)).collect();
         match fields.iter().position(|f| f.is_rest) {
             Some(r) if items.len() >= r => {
                 self.positional_patterns(&items[..r], &tys[..r], span, binds);
@@ -2543,30 +3225,33 @@ impl Checker {
                 ("None".to_string(), Vec::new()),
             ]),
             Ty::Record(_, fields) => Some(vec![(String::new(), fields)]),
-            Ty::Named(e) => match self.types.get(&e) {
-                Some(TypeDef::Enum(vs)) => Some(
-                    vs.iter()
-                        .map(|v| {
-                            (
-                                v.name.clone(),
-                                v.fields.iter().map(|f| f.ty.clone()).collect(),
-                            )
-                        })
-                        .collect(),
-                ),
-                Some(TypeDef::Class(c)) => {
-                    let mut fields = Vec::new();
-                    for f in &c.fields {
-                        if f.is_rest {
-                            fields.push(Ty::list(f.ty.clone()));
-                            break;
+            Ty::Named(e, args) => {
+                let map = self.args_map(&e, &args);
+                match self.types.get(&e) {
+                    Some(TypeDef::Enum(vs)) => Some(
+                        vs.iter()
+                            .map(|v| {
+                                (
+                                    v.name.clone(),
+                                    v.fields.iter().map(|f| f.ty.substitute(&map)).collect(),
+                                )
+                            })
+                            .collect(),
+                    ),
+                    Some(TypeDef::Class(c)) => {
+                        let mut fields = Vec::new();
+                        for f in &c.fields {
+                            if f.is_rest {
+                                fields.push(Ty::list(f.ty.substitute(&map)));
+                                break;
+                            }
+                            fields.push(f.ty.substitute(&map));
                         }
-                        fields.push(f.ty.clone());
+                        Some(vec![(e, fields)])
                     }
-                    Some(vec![(e, fields)])
+                    None => None,
                 }
-                None => None,
-            },
+            }
             _ => None,
         }
     }
@@ -2669,7 +3354,14 @@ impl Checker {
             Ty::List(elem) => return self.missing_list_case(expanded, &elem, rest_tys),
             _ => {}
         }
-        let Some(ctors) = self.constructors(ty) else {
+        // Splitting a column no pattern looks into would never end on a recursive type.
+        let no_ctors = !expanded.is_empty() && expanded.iter().all(|r| self.irrefutable_cell(r[0]));
+        let ctors = if no_ctors {
+            None
+        } else {
+            self.constructors(ty)
+        };
+        let Some(ctors) = ctors else {
             let rest = expanded
                 .into_iter()
                 .filter(|r| self.irrefutable_cell(r[0]))
@@ -2878,9 +3570,12 @@ fn mutates(expr: &Expr, list: &str) -> bool {
             Stmt::Let { value, .. } => mutates(value, list),
             Stmt::Expr(e) => mutates(e, list),
             Stmt::LetPattern { value, .. } => mutates(value, list),
-            Stmt::Func(_) | Stmt::Class(_) | Stmt::Enum(_) | Stmt::Implement(_) | Stmt::Data(_) => {
-                false
-            }
+            Stmt::Func(_)
+            | Stmt::Class(_)
+            | Stmt::Enum(_)
+            | Stmt::Implement(_)
+            | Stmt::Interface(_)
+            | Stmt::Data(_) => false,
         }),
         ExprKind::Str(segs) => segs
             .iter()
@@ -2909,5 +3604,15 @@ fn mutates(expr: &Expr, list: &str) -> bool {
         }
         ExprKind::Break(v) | ExprKind::Return(v) => v.as_ref().is_some_and(|v| mutates(v, list)),
         _ => false,
+    }
+}
+
+fn type_span(t: &TypeExpr) -> Span {
+    match t {
+        TypeExpr::Name(_, span) | TypeExpr::Generic(_, _, span) | TypeExpr::Record(_, _, span) => {
+            *span
+        }
+        TypeExpr::Maybe(inner) => type_span(inner),
+        TypeExpr::Func(params, _) => params.first().map_or(Span::default(), type_span),
     }
 }

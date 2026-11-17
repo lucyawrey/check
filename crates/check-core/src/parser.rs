@@ -274,7 +274,7 @@ impl Parser<'_> {
     /// Eats a leading `private`, a soft keyword only in front of a declaration.
     fn private(&mut self) -> bool {
         let before_decl = match self.peek_at(1) {
-            Tok::Kw("func" | "class" | "enum" | "let" | "var" | "const") => true,
+            Tok::Kw("func" | "class" | "enum" | "interface" | "let" | "var" | "const") => true,
             Tok::Ident(w) => matches!(w.as_str(), "ref" | "static" | "external"),
             _ => false,
         };
@@ -332,7 +332,12 @@ impl Parser<'_> {
 
     fn statement(&mut self) -> PResult<Stmt> {
         let is_private = self.private();
-        if is_private && !(self.is_kw("enum") || self.is_kw("func") || self.is_type_decl()) {
+        if is_private
+            && !(self.is_kw("enum")
+                || self.is_kw("func")
+                || self.is_kw("interface")
+                || self.is_type_decl())
+        {
             return self.error(Code::unexpected_token, self.span());
         }
         let mut stmt = self.declaration()?;
@@ -340,6 +345,7 @@ impl Parser<'_> {
             Stmt::Func(d) => d.is_private = is_private,
             Stmt::Class(d) => d.is_private = is_private,
             Stmt::Enum(d) => d.is_private = is_private,
+            Stmt::Interface(d) => d.is_private = is_private,
             _ => {}
         }
         Ok(stmt)
@@ -352,12 +358,15 @@ impl Parser<'_> {
         if self.is_kw("implement") {
             return Ok(Stmt::Implement(self.implement_decl()?));
         }
+        if self.is_kw("interface") {
+            return Ok(Stmt::Interface(self.interface_decl()?));
+        }
         if self.is_external() {
             self.advance();
             if !self.is_kw("func") {
                 return self.error(Code::unexpected_token, self.span());
             }
-            return Ok(Stmt::Func(self.func_decl(true)?));
+            return Ok(Stmt::Func(self.func_decl(true, false)?));
         }
         if self.is_type_decl() {
             return Ok(Stmt::Class(self.class_decl()?));
@@ -372,7 +381,7 @@ impl Parser<'_> {
             return self.let_stmt();
         }
         if self.is_kw("func") && matches!(self.peek_at(1), Tok::Ident(_)) {
-            return Ok(Stmt::Func(self.func_decl(false)?));
+            return Ok(Stmt::Func(self.func_decl(false, false)?));
         }
         let target = self.expr()?;
         let op = match self.peek() {
@@ -463,29 +472,118 @@ impl Parser<'_> {
 
     fn implement_decl(&mut self) -> PResult<ImplementDecl> {
         let start = self.advance().span;
-        let (target, _) = self.ident()?;
+        let mut target = self.type_expr()?;
+        let mut interface = None;
+        if self.eat_kw("for") {
+            interface = Some(target);
+            target = self.type_expr()?;
+        }
+        let (target, target_args) = match target {
+            TypeExpr::Name(name, _) => (name, Vec::new()),
+            TypeExpr::Generic(name, args, _) if name != "List" => (name, args),
+            _ => return self.error(Code::unexpected_token, self.prev_span()),
+        };
         let mut members = Members::default();
         let owner = target.clone();
         self.body(|p| {
-            if p.member(&mut members, &owner)? {
+            if p.member(&mut members, &owner, false)? {
                 return Ok(());
             }
             p.error(Code::unexpected_token, p.span())
         })?;
         Ok(ImplementDecl {
             target,
+            target_args,
+            interface,
             span: start.to(self.prev_span()),
             members,
         })
     }
 
-    fn member(&mut self, members: &mut Members, owner: &str) -> PResult<bool> {
+    fn interface_decl(&mut self) -> PResult<InterfaceDecl> {
+        let start = self.advance().span;
+        let (name, _) = self.ident()?;
+        let type_params = self.type_params()?;
+        let parents = self.interface_list()?;
+        let mut fields = Vec::new();
+        let mut members = Members::default();
+        let owner = name.clone();
+        self.body(|p| {
+            if p.member(&mut members, &owner, true)? {
+                return Ok(());
+            }
+            fields.push(p.body_field()?);
+            Ok(())
+        })?;
+        Ok(InterfaceDecl {
+            name,
+            span: start.to(self.prev_span()),
+            type_params,
+            parents,
+            fields,
+            members,
+            is_private: false,
+        })
+    }
+
+    /// `<T, U: Shape + Eq>` after a declaration's name, or nothing.
+    fn type_params(&mut self) -> PResult<Vec<TypeParam>> {
+        let mut params = Vec::new();
+        if !self.eat_sym("<") {
+            return Ok(params);
+        }
+        loop {
+            let (name, span) = self.ident()?;
+            let bounds = if self.eat_sym(":") {
+                self.bounds()?
+            } else {
+                Vec::new()
+            };
+            params.push(TypeParam { name, span, bounds });
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        self.close_angle()?;
+        Ok(params)
+    }
+
+    fn bounds(&mut self) -> PResult<Vec<TypeExpr>> {
+        let mut bounds = vec![self.type_expr()?];
+        while self.eat_sym("+") {
+            bounds.push(self.type_expr()?);
+        }
+        Ok(bounds)
+    }
+
+    /// `: Shape + Printable` after a type's header, or nothing.
+    fn interface_list(&mut self) -> PResult<Vec<TypeExpr>> {
+        if self.eat_sym(":") {
+            self.bounds()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Eats a `>` closing type arguments, splitting a `>>` in two.
+    fn close_angle(&mut self) -> PResult<()> {
+        if self.is_sym(">>") {
+            let token = &mut self.tokens[self.pos];
+            token.tok = Tok::Sym(">");
+            token.span.start += 1;
+            return Ok(());
+        }
+        self.expect_sym(">").map(|_| ())
+    }
+
+    /// `optional_body` lets a method end after its signature, as in an interface.
+    fn member(&mut self, members: &mut Members, owner: &str, optional_body: bool) -> PResult<bool> {
         if self.is_soft("private") && matches!(self.peek_at(1), Tok::Kw("let" | "var")) {
             return Ok(false);
         }
         let start = self.pos;
         let is_private = self.private();
-        let found = self.member_decl(members, owner, is_private)?;
+        let found = self.member_decl(members, owner, is_private, optional_body)?;
         if !found {
             self.pos = start;
         }
@@ -497,6 +595,7 @@ impl Parser<'_> {
         members: &mut Members,
         owner: &str,
         is_private: bool,
+        optional_body: bool,
     ) -> PResult<bool> {
         let is_external = self.is_external();
         if is_external {
@@ -504,12 +603,12 @@ impl Parser<'_> {
         }
         if self.is_soft("static") && matches!(self.peek_at(1), Tok::Kw("func")) {
             self.advance();
-            let mut decl = self.func_decl(is_external)?;
+            let mut decl = self.func_decl(is_external, false)?;
             decl.name = format!("{owner}.{}", decl.name);
             decl.is_private = is_private;
             members.statics.push(decl);
         } else if self.is_kw("func") {
-            let mut decl = self.func_decl(is_external)?;
+            let mut decl = self.func_decl(is_external, optional_body)?;
             decl.name = format!("{owner}.{}", decl.name);
             decl.is_private = is_private;
             members.methods.push(decl);
@@ -543,15 +642,19 @@ impl Parser<'_> {
         }
         self.advance();
         let (name, _) = self.ident()?;
+        let type_params = self.type_params()?;
         let mut fields = Vec::new();
         let mut init = None;
         let mut members = Members::default();
+        let interfaces;
         if self.is_sym("(") {
             fields = self.params(true)?;
+            interfaces = self.interface_list()?;
         } else {
+            interfaces = self.interface_list()?;
             let owner = name.clone();
             self.body(|p| {
-                if p.member(&mut members, &owner)? {
+                if p.member(&mut members, &owner, false)? {
                     return Ok(());
                 }
                 if p.is_soft("init") && matches!(p.peek_at(1), Tok::Sym("{")) {
@@ -561,6 +664,7 @@ impl Parser<'_> {
                         id: p.id(),
                         name: format!("{owner}.init"),
                         span: span.to(body.span),
+                        type_params: Vec::new(),
                         params: Vec::new(),
                         ret: None,
                         body: Some(body),
@@ -568,33 +672,7 @@ impl Parser<'_> {
                     });
                     return Ok(());
                 }
-                let (is_private, is_readonly) = p.field_modifiers()?;
-                let is_var = p.is_kw("var");
-                if !is_var && !p.is_kw("let") {
-                    return p.error(Code::unexpected_token, p.span());
-                }
-                p.advance();
-                let (name, span) = p.field_name()?;
-                let ty = if p.eat_sym(":") {
-                    Some(p.type_expr()?)
-                } else {
-                    None
-                };
-                let default = if p.eat_sym("=") {
-                    Some(p.expr()?)
-                } else {
-                    None
-                };
-                fields.push(Param {
-                    name,
-                    span,
-                    ty,
-                    default,
-                    is_var,
-                    is_rest: false,
-                    is_private,
-                    is_readonly,
-                });
+                fields.push(p.body_field()?);
                 Ok(())
             })?;
         }
@@ -603,20 +681,55 @@ impl Parser<'_> {
             name,
             span: start.to(self.prev_span()),
             is_ref,
+            type_params,
+            interfaces,
             fields,
             init,
             members,
         })
     }
 
+    /// A `let` or `var` field in a class or interface body.
+    fn body_field(&mut self) -> PResult<Param> {
+        let (is_private, is_readonly) = self.field_modifiers()?;
+        let is_var = self.is_kw("var");
+        if !is_var && !self.is_kw("let") {
+            return self.error(Code::unexpected_token, self.span());
+        }
+        self.advance();
+        let (name, span) = self.field_name()?;
+        let ty = if self.eat_sym(":") {
+            Some(self.type_expr()?)
+        } else {
+            None
+        };
+        let default = if self.eat_sym("=") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(Param {
+            name,
+            span,
+            ty,
+            default,
+            is_var,
+            is_rest: false,
+            is_private,
+            is_readonly,
+        })
+    }
+
     fn enum_decl(&mut self) -> PResult<EnumDecl> {
         let start = self.advance().span;
         let (name, _) = self.ident()?;
+        let type_params = self.type_params()?;
+        let interfaces = self.interface_list()?;
         let mut variants = Vec::new();
         let mut members = Members::default();
         let owner = name.clone();
         self.body(|p| {
-            if p.member(&mut members, &owner)? {
+            if p.member(&mut members, &owner, false)? {
                 return Ok(());
             }
             loop {
@@ -635,6 +748,8 @@ impl Parser<'_> {
         Ok(EnumDecl {
             name,
             span: start.to(self.prev_span()),
+            type_params,
+            interfaces,
             variants,
             members,
             is_private: false,
@@ -818,16 +933,19 @@ impl Parser<'_> {
         })
     }
 
-    fn func_decl(&mut self, is_external: bool) -> PResult<FuncDecl> {
+    fn func_decl(&mut self, is_external: bool, optional_body: bool) -> PResult<FuncDecl> {
         let start = self.advance().span;
         let (name, _) = self.ident()?;
+        let type_params = self.type_params()?;
         let params = self.params(false)?;
         let ret = if self.eat_sym("->") {
             Some(self.type_expr()?)
         } else {
             None
         };
-        let body = if is_external {
+        let ends =
+            matches!(self.peek(), Tok::Newline | Tok::Eof) || self.is_sym("}") || self.is_sym(";");
+        let body = if is_external || (optional_body && ends) {
             None
         } else {
             Some(self.func_body(ret.is_some())?)
@@ -836,6 +954,7 @@ impl Parser<'_> {
             id: self.id(),
             name,
             span: start.to(self.prev_span()),
+            type_params,
             params,
             ret,
             body,
@@ -978,7 +1097,7 @@ impl Parser<'_> {
                 while self.eat_sym(",") {
                     args.push(self.type_expr()?);
                 }
-                self.expect_sym(">")?;
+                self.close_angle()?;
                 TypeExpr::Generic(name, args, span)
             } else {
                 TypeExpr::Name(name, span)

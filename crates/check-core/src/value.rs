@@ -1,9 +1,11 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::rc::Rc;
 
 use crate::ast::{Expr, FuncDecl, Param};
+use crate::checker::MAYBE;
 
 pub enum Callable {
     Named(Rc<FuncDecl>, String),
@@ -18,6 +20,10 @@ pub enum Callable {
 #[derive(Clone, PartialEq)]
 pub struct Record {
     pub name: Rc<str>,
+    /// The key of the record's class or enum, empty for a plain record.
+    pub ty: Rc<str>,
+    /// A `ref class` that implements `Eq`, so `==` compares its fields.
+    pub by_fields: bool,
     pub field_names: Option<Rc<[Rc<str>]>>,
     pub fields: Vec<Value>,
 }
@@ -32,28 +38,46 @@ impl Record {
     }
 
     fn code(&self, always_parens: bool) -> String {
-        if self.fields.is_empty() && !always_parens {
-            return self.name.to_string();
+        match self.code_with(always_parens, |v| Ok::<_, Infallible>(v.code())) {
+            Ok(text) => text,
+            Err(never) => match never {},
         }
-        let fields: Vec<String> = self
-            .fields
-            .iter()
-            .enumerate()
-            .map(|(i, v)| match &self.field_names {
-                Some(names) => format!("{} = {}", names[i], v.code()),
-                None => v.code(),
-            })
-            .collect();
-        format!("{}({})", self.name, fields.join(", "))
+    }
+
+    /// The record as code, with `field` giving each field's text.
+    pub fn code_with<E>(
+        &self,
+        always_parens: bool,
+        mut field: impl FnMut(&Value) -> Result<String, E>,
+    ) -> Result<String, E> {
+        if self.fields.is_empty() && !always_parens {
+            return Ok(self.name.to_string());
+        }
+        let mut fields = Vec::with_capacity(self.fields.len());
+        for (i, v) in self.fields.iter().enumerate() {
+            let text = field(v)?;
+            fields.push(match &self.field_names {
+                Some(names) => format!("{} = {text}", names[i]),
+                None => text,
+            });
+        }
+        Ok(format!("{}({})", self.name, fields.join(", ")))
     }
 
     pub fn unnamed(field_names: Option<Rc<[Rc<str>]>>, fields: Vec<Value>) -> Record {
         Record {
             name: "".into(),
+            ty: "".into(),
+            by_fields: false,
             field_names,
             fields,
         }
     }
+}
+
+thread_local! {
+    /// The `ref class` objects `==` is comparing, by address.
+    static COMPARING: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Clone)]
@@ -92,7 +116,23 @@ impl PartialEq for Value {
             (Value::Object(a), Value::Object(b))
             | (Value::Variant(a), Value::Variant(b))
             | (Value::Record(a), Value::Record(b)) => a == b,
-            (Value::Shared(a), Value::Shared(b)) => Rc::ptr_eq(a, b),
+            (Value::Shared(a), Value::Shared(b)) => {
+                if Rc::ptr_eq(a, b) {
+                    return true;
+                }
+                if !a.borrow().by_fields {
+                    return false;
+                }
+                // Objects that reach themselves are equal if nothing else differs.
+                let pair = (Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize);
+                if COMPARING.with(|c| c.borrow().contains(&pair)) {
+                    return true;
+                }
+                COMPARING.with(|c| c.borrow_mut().push(pair));
+                let same = *a.borrow() == *b.borrow();
+                COMPARING.with(|c| c.borrow_mut().pop());
+                same
+            }
             _ => false,
         }
     }
@@ -109,6 +149,21 @@ impl Value {
             (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
             (Value::Str(a), Value::Str(b)) => Some(a.cmp(b)),
             _ => None,
+        }
+    }
+
+    /// The type key its methods are found under.
+    pub fn tag(&self) -> Rc<str> {
+        match self {
+            Value::Int(_) => "Int".into(),
+            Value::Float(_) => "Float".into(),
+            Value::Bool(_) => "Bool".into(),
+            Value::Str(_) => "String".into(),
+            Value::List(_) => "List".into(),
+            Value::Some(_) | Value::None => MAYBE.into(),
+            Value::Shared(r) => r.borrow().ty.clone(),
+            Value::Object(r) | Value::Variant(r) | Value::Record(r) => r.ty.clone(),
+            Value::Range(..) | Value::Func(_) | Value::Void => "".into(),
         }
     }
 
