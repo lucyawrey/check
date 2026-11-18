@@ -427,7 +427,7 @@ impl Parser<'_> {
     fn let_pattern(&mut self) -> PResult<Stmt> {
         let is_var = self.is_kw("var");
         let start = self.advance().span;
-        let pattern = self.pattern()?;
+        let pattern = self.pattern(false)?;
         self.expect_sym("=")?;
         let value = self.expr()?;
         let otherwise = if self.eat_kw("else") {
@@ -781,25 +781,45 @@ impl Parser<'_> {
         })
     }
 
-    fn pattern(&mut self) -> PResult<Pattern> {
-        let first = self.single_pattern()?;
+    /// `allow_var` is false in a declaration, whose keyword in front already says `var`.
+    fn pattern(&mut self, allow_var: bool) -> PResult<Pattern> {
+        let first = self.single_pattern(allow_var)?;
         if !self.is_sym("|") {
             return Ok(first);
         }
         let start = first.span;
         let mut alternatives = vec![first];
         while self.eat_sym("|") {
-            alternatives.push(self.single_pattern()?);
+            alternatives.push(self.single_pattern(allow_var)?);
         }
         Ok(Pattern {
             id: self.id(),
             span: start.to(self.prev_span()),
             kind: PatternKind::Or(alternatives),
+            is_var: false,
         })
     }
 
-    fn single_pattern(&mut self) -> PResult<Pattern> {
+    /// Eats `var` before a name in a pattern.
+    fn pattern_var(&mut self, allow_var: bool) -> PResult<bool> {
+        if !self.is_kw("var") {
+            return Ok(false);
+        }
+        let span = self.advance().span;
+        if !allow_var {
+            let mut d = Diagnostic::error(Code::var_in_declaration_pattern, span);
+            d.detail = Some("var (...) = ...".to_string());
+            self.diags.push(d);
+        }
+        match self.peek() {
+            Tok::Ident(name) if name != "_" => Ok(allow_var),
+            _ => self.error(Code::unexpected_token, self.span()),
+        }
+    }
+
+    fn single_pattern(&mut self, allow_var: bool) -> PResult<Pattern> {
         let start = self.span();
+        let is_var = self.pattern_var(allow_var)?;
         let kind = match self.peek().clone() {
             Tok::Ident(name) if name == "_" => {
                 self.advance();
@@ -812,8 +832,11 @@ impl Parser<'_> {
                 } else {
                     (None, name)
                 };
+                if is_var && (qualifier.is_some() || self.is_sym("(")) {
+                    return self.error(Code::unexpected_token, start);
+                }
                 if self.eat_sym("(") {
-                    PatternKind::Variant(qualifier, name, self.pattern_items(")", true)?)
+                    PatternKind::Variant(qualifier, name, self.pattern_items(")", true, allow_var)?)
                 } else if qualifier.is_some() {
                     PatternKind::Variant(qualifier, name, Vec::new())
                 } else {
@@ -822,7 +845,7 @@ impl Parser<'_> {
             }
             Tok::Sym("(") => {
                 self.advance();
-                let mut items = self.pattern_items(")", false)?;
+                let mut items = self.pattern_items(")", false, allow_var)?;
                 if items.len() == 1 {
                     return Ok(items.remove(0));
                 }
@@ -830,7 +853,7 @@ impl Parser<'_> {
             }
             Tok::Sym("[") => {
                 self.advance();
-                PatternKind::List(self.pattern_items("]", true)?)
+                PatternKind::List(self.pattern_items("]", true, allow_var)?)
             }
             _ => {
                 let low = Box::new(self.literal_pattern()?);
@@ -847,24 +870,32 @@ impl Parser<'_> {
             id: self.id(),
             span: start.to(self.prev_span()),
             kind,
+            is_var,
         })
     }
 
-    fn pattern_items(&mut self, close: &str, allow_rest: bool) -> PResult<Vec<Pattern>> {
+    fn pattern_items(
+        &mut self,
+        close: &str,
+        allow_rest: bool,
+        allow_var: bool,
+    ) -> PResult<Vec<Pattern>> {
         let mut items = Vec::new();
         let mut has_rest = false;
         self.list_items(close, |p| {
             let start = p.span();
             if allow_rest && !has_rest && p.eat_sym("...") {
                 has_rest = true;
+                let is_var = p.pattern_var(allow_var)?;
                 let (name, _) = p.ident()?;
                 items.push(Pattern {
                     id: p.id(),
                     span: start.to(p.prev_span()),
                     kind: PatternKind::Rest(name),
+                    is_var,
                 });
             } else {
-                items.push(p.pattern()?);
+                items.push(p.pattern(allow_var)?);
             }
             Ok(())
         })?;
@@ -918,14 +949,13 @@ impl Parser<'_> {
     }
 
     fn arm(&mut self) -> PResult<Arm> {
-        let pattern = self.pattern()?;
+        let pattern = self.pattern(true)?;
         let guard = if self.eat_kw("if") {
-            Some(self.expr()?)
+            Some(self.condition()?)
         } else {
             None
         };
-        self.expect_sym("=>")?;
-        let body = self.expr()?;
+        let body = self.code_body(false)?;
         Ok(Arm {
             pattern,
             guard,
@@ -948,7 +978,7 @@ impl Parser<'_> {
         let body = if is_external || (optional_body && ends) {
             None
         } else {
-            Some(self.func_body(ret.is_some())?)
+            Some(self.code_body(ret.is_some())?)
         };
         Ok(FuncDecl {
             id: self.id(),
@@ -962,17 +992,48 @@ impl Parser<'_> {
         })
     }
 
-    fn func_body(&mut self, has_arrow: bool) -> PResult<Expr> {
+    /// A function, lambda or arm body: a block, or `=>` and one line, meaning that line in
+    /// braces. A function with `->` (`has_ret`) always has braces.
+    fn code_body(&mut self, has_ret: bool) -> PResult<Expr> {
         if self.is_sym("{") {
             return self.block();
         }
-        if has_arrow {
+        if *self.peek() == Tok::Newline && self.next_line_starts_with("=>") {
+            self.skip_newlines();
+            return self.error(Code::unexpected_token, self.span());
+        }
+        let arrow = self.span();
+        let has_arrow = self.eat_sym("=>");
+        if has_arrow && self.is_sym("{") {
+            return self.fix_error(Code::arrow_before_braces, arrow, "{ ... }");
+        }
+        if has_ret {
             return self.error(Code::arrow_without_braces, self.span());
         }
-        if self.is_kw("let") || self.is_kw("var") {
-            return self.error(Code::statement_body_without_braces, self.span());
+        if !has_arrow {
+            return self.fix_error(Code::body_without_arrow, self.span(), "=> ...");
         }
-        self.expr()
+        let stmt = self.block_line()?;
+        if self.is_sym(";") {
+            return self.fix_error(Code::unexpected_token, self.span(), "{ ...; ... }");
+        }
+        let span = arrow.to(self.prev_span());
+        Ok(self.expr_node(span, ExprKind::Block(vec![stmt])))
+    }
+
+    fn fix_error<T>(&mut self, code: Code, span: Span, fix: &str) -> PResult<T> {
+        let mut d = Diagnostic::error(code, span);
+        d.detail = Some(fix.to_string());
+        self.diags.push(d);
+        Err(())
+    }
+
+    fn next_line_starts_with(&self, sym: &str) -> bool {
+        let mut i = 0;
+        while *self.peek_at(i) == Tok::Newline {
+            i += 1;
+        }
+        matches!(self.peek_at(i), Tok::Sym(s) if *s == sym)
     }
 
     /// `fields` allows `private` and `readonly`, as in a class header.
@@ -1127,15 +1188,7 @@ impl Parser<'_> {
             if *self.peek() == Tok::Eof {
                 return self.error(Code::unclosed_bracket, start);
             }
-            if self.is_kw("func") && matches!(self.peek_at(1), Tok::Ident(_)) {
-                self.diags
-                    .push(Diagnostic::error(Code::nested_named_function, self.span()));
-            }
-            if self.is_type_decl() {
-                self.diags
-                    .push(Diagnostic::error(Code::nested_type, self.span()));
-            }
-            match self.statement() {
+            match self.block_line() {
                 Ok(stmt) => stmts.push(stmt),
                 Err(()) => self.recover(),
             }
@@ -1143,6 +1196,18 @@ impl Parser<'_> {
         }
         let end = self.advance().span;
         Ok(self.expr_node(start.to(end), ExprKind::Block(stmts)))
+    }
+
+    fn block_line(&mut self) -> PResult<Stmt> {
+        if self.is_kw("func") && matches!(self.peek_at(1), Tok::Ident(_)) {
+            self.diags
+                .push(Diagnostic::error(Code::nested_named_function, self.span()));
+        }
+        if self.is_type_decl() {
+            self.diags
+                .push(Diagnostic::error(Code::nested_type, self.span()));
+        }
+        self.statement()
     }
 
     fn expr(&mut self) -> PResult<Expr> {
@@ -1230,7 +1295,7 @@ impl Parser<'_> {
     fn comparison(&mut self) -> PResult<Expr> {
         let lhs = self.coalesce()?;
         if self.eat_kw("is") {
-            let pattern = self.pattern()?;
+            let pattern = self.pattern(true)?;
             let span = lhs.span.to(pattern.span);
             return Ok(self.expr_node(span, ExprKind::Is(Box::new(lhs), pattern)));
         }
@@ -1478,7 +1543,7 @@ impl Parser<'_> {
                 } else {
                     None
                 };
-                let body = self.func_body(ret.is_some())?;
+                let body = self.code_body(ret.is_some())?;
                 return Ok(self.expr_node(
                     span.to(body.span),
                     ExprKind::Lambda(params, ret, Box::new(body)),
@@ -1499,7 +1564,7 @@ impl Parser<'_> {
                 return Ok(self.expr_node(span.to(body.span), ExprKind::Loop(Box::new(body))));
             }
             Tok::Kw("for") => {
-                let pattern = self.pattern()?;
+                let pattern = self.pattern(true)?;
                 if !self.eat_kw("in") {
                     return self.error(Code::unexpected_token, self.span());
                 }

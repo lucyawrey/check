@@ -115,7 +115,8 @@ struct ConstEntry {
     state: FuncState,
 }
 
-type Binding = (String, Span, Ty);
+/// A name a pattern binds, where, its type and whether it's marked `var`.
+type Binding = (String, Span, Ty, bool);
 
 /// A type's own method key, with each interface's signature for it and what that
 /// interface's parameters stand for.
@@ -136,6 +137,7 @@ static WILDCARD: Pattern = Pattern {
     id: 0,
     span: Span { start: 0, end: 0 },
     kind: PatternKind::Wildcard,
+    is_var: false,
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1568,7 +1570,7 @@ impl Checker<'_> {
                     }
                     None => self.report_missing(vec![vec![Cell::Pat(pattern)]], &t, pattern.span),
                 }
-                for (name, span, ty) in binds {
+                for (name, span, ty, _) in binds {
                     let var = Var {
                         mutable: *is_var,
                         ..Var::binding(ty, span)
@@ -2103,7 +2105,7 @@ impl Checker<'_> {
                 self.expect(cond, &c, &Ty::Bool);
                 self.push_bindings(self.exports(cond));
                 let ty = self.valued_loop(expr.id, body);
-                self.scopes.pop();
+                self.finish_scope();
                 ty
             }
             ExprKind::For(pattern, iter, body) => self.for_loop(expr.id, pattern, iter, body),
@@ -2166,7 +2168,13 @@ impl Checker<'_> {
     fn push_bindings(&mut self, binds: Vec<Binding>) {
         let scope = binds
             .into_iter()
-            .map(|(name, span, ty)| (name, Var::binding(ty, span)))
+            .map(|(name, span, ty, mutable)| {
+                let var = Var {
+                    mutable,
+                    ..Var::binding(ty, span)
+                };
+                (name, var)
+            })
             .collect();
         self.scopes.push(scope);
     }
@@ -3315,7 +3323,7 @@ impl Checker<'_> {
         if narrowed.is_some() {
             self.narrowed.pop();
         }
-        self.scopes.pop();
+        self.finish_scope();
         t
     }
 
@@ -3361,7 +3369,7 @@ impl Checker<'_> {
             } else {
                 self.unused(&arm.body)
             };
-            self.scopes.pop();
+            self.finish_scope();
             bodies.push((&arm.body, t));
         }
         let rows = arms
@@ -3417,7 +3425,7 @@ impl Checker<'_> {
                 } else if binds.iter().any(|b| &b.0 == name) {
                     self.error(Code::duplicate_name, pat.span);
                 } else {
-                    binds.push((name.clone(), pat.span, ty.clone()));
+                    binds.push((name.clone(), pat.span, ty.clone(), pat.is_var));
                 }
             }
             PatternKind::Literal(lit) => {
@@ -3498,11 +3506,10 @@ impl Checker<'_> {
                         None => first = Some(alt_binds),
                         Some(expected) => {
                             let same = expected.len() == alt_binds.len()
-                                && expected.iter().all(|(n, _, t)| {
-                                    alt_binds
-                                        .iter()
-                                        .find(|b| &b.0 == n)
-                                        .is_some_and(|b| self.subst.unify(t, &b.2))
+                                && expected.iter().all(|(n, _, t, is_var)| {
+                                    alt_binds.iter().find(|b| &b.0 == n).is_some_and(|b| {
+                                        b.3 == *is_var && self.subst.unify(t, &b.2)
+                                    })
                                 });
                             if !same {
                                 self.error(Code::or_pattern_bindings, alt.span);
@@ -3597,7 +3604,7 @@ impl Checker<'_> {
                     self.error(Code::duplicate_name, item.span);
                 }
                 PatternKind::Rest(name) => {
-                    binds.push((name.clone(), item.span, Ty::list(elem.clone())));
+                    binds.push((name.clone(), item.span, Ty::list(elem.clone()), item.is_var));
                 }
                 _ => self.pattern(item, elem, binds),
             }
@@ -3909,14 +3916,9 @@ impl Checker<'_> {
         if let Some(narrowed) = &narrowed_list {
             self.narrowed.push(narrowed.clone());
         }
-        self.scopes.push(
-            binds
-                .into_iter()
-                .map(|(name, span, ty)| (name, Var::binding(ty, span)))
-                .collect(),
-        );
+        self.push_bindings(binds);
         let ty = self.valued_loop(id, body);
-        self.scopes.pop();
+        self.finish_scope();
         if narrowed_list.is_some() {
             self.narrowed.pop();
         }

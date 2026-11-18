@@ -14,7 +14,9 @@
 - `foreign_operator` an operator from another language (`%`, `&&`, `||`, `!`)
 - `assignment_in_condition` `=` in a condition
 - `arrow_without_braces` a function with `->` and no braces
-- `statement_body_without_braces` a body without braces that is a statement (`let` or an assignment)
+- `arrow_before_braces` `=>` before a body in braces
+- `body_without_arrow` a body without braces and without `=>`
+- `var_in_declaration_pattern` `var` inside a `let` or `var` declaration's pattern
 - `unknown_name` a name that doesn't exist
 - `duplicate_name` a name defined twice in the same block or file
 - `redefined_builtin` redefining or shadowing `Maybe`, `Some`, `None`, `Result`, `Ok` or `Err`
