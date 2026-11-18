@@ -1,0 +1,14 @@
+Story([
+  Text("Welcome to Awakening Quest! Check's premier for-testing-purposes only text adventure.")
+  Text("I hope you have fun!")
+  Pause
+  Text("You awaken on soft grass, the sound of rushing water filling your ears.")
+  Pause
+  Text("Your eyes are too heavy to open, but you hear footsteps approach. Someone, probably a young woman, speaks:")
+  Text("Ah, so you're awake? Good.")
+  Text("Can you tell me your name?")
+  Input("Name")
+  Text("{Name}? A strange name, but it will do.")
+  Pause()
+  Text("That's all for now!")
+])

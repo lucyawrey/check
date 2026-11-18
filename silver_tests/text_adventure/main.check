@@ -1,41 +1,29 @@
-// var name = ref("")
+import "package.con"
 
-// let story = Story([
-//   Text("Welcome to Awakening Quest! Check's premier for-testing-purposes only text adventure.")
-//   Text("Have fun!")
-//   Pause
-//   Text("You awaken on soft grass, the sound of rushing water filling your ears.")
-//   Pause
-//   Text("Your eyes are too heavy to open, but you hear footsteps approach. Someone, probably a young woman, speaks:")
-//   Text("  Ah, so you're awake? Good.")
-//   Text("  Can you tell me your name?")
-//   Input(name)
-//   Text("  {state.name}? A strange name, but it will do.")
-//   Text("\nThat's all for now!")
-// ])
+var state = [=]
 
 func main() {
-  print("Welcome to Awakening Quest! Check's premier for-testing-purposes only text adventure.")
-  print("Have fun!")
-  try input()
-  print("You awaken on soft grass, the sound of rushing water filling your ears.")
-  try input()
-  print("Your eyes are too heavy to open, but you hear footsteps approach. Someone, probably a young woman, speaks:")
-  print("Ah, so you're awake? Good.")
-  print("Can you tell me your name?")
-  let name = loop {
-    let line = try input()
-    if not line.isBlank() { break line }
+  for line in story.script {
+    match line {
+      Text(text) => {
+        var replaced = text
+        for (key, value) in state {
+          replaced = replaced.replace("\{{key}}", value)
+        }
+        print(replaced)
+      }
+      Pause => { try input("\npress enter to continue..."); print("") }
+      Input(key) => { state[key] = try input("\n{key}: "); print("") }
+    }
   }
-  print("{name}? A strange name, but it will do.")
 }
 
-// enum StoryLine {
-//   Text(text: String)
-//   Pause
-//   Input(store: Ref<String>)
-// }
+enum StoryLine {
+  Text(text: String)
+  Pause
+  Input(key: String)
+}
 
-// ref class Story(script: StoryLine[], position = 0)
+ref class Story(script: StoryLine[], var position = 0)
 
 try main()
