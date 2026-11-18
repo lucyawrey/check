@@ -39,7 +39,10 @@
 - `doubled_maybe` a `T?` body in an `if` without `else` or a value loop, where a plain `T?` is expected
 - `flatten_without_nesting` `flatten()` on a `T?` with nothing nested
 - `not_iterable` `for` over something that isn't a list or range
-- `try_outside_maybe` `try` in a function whose return type can't hold `None` (added by the agent while building, 2026-11-14)
+- `try_outside_failable` `try` in a function that returns neither a `Maybe` nor a `Result` (added by the agent while building, 2026-11-14)
+- `try_result_in_maybe` `try` on a `Result` in a function returning a `Maybe` (suggests `try x.ok()`)
+- `try_maybe_in_result` `try` on a `Maybe` in a function returning a `Result` (suggests `try x.orErr(...)`)
+- `try_error_mismatch` `try` on a `Result` whose error type differs from the function's
 - `assign_to_let` assigning to a `let`
 - `assign_to_parameter` assigning to a parameter not written `var`
 - `change_let_list` changing a `let` list (`push`, `pop`, `removeAt`)
@@ -95,13 +98,14 @@
 - `missing_entry` a `package.con` `entry` file that doesn't exist
 
 ## Stops
-- `try_stopped` a top-level `try` found `None`, so the program stopped (not a panic; exit status 1)
+- `try_stopped` a top-level `try` found `None` or an `Err` (shown after the message), so the program stopped (not a panic; exit status 1)
 
 ## Panics
 - `panic_called` `panic(reason)` was called
 - `integer_overflow` integer overflow
 - `division_by_zero` integer division by zero (`div`, `mod`, or `/` with two `Int`s)
 - `or_panic_on_none` `orPanic` on a `None`
+- `or_panic_on_err` `orPanic` on an `Err` (shows the error)
 - `negative_exponent` a negative exponent on an `Int`
 - `shift_out_of_range` a shift amount below 0 or of 64 and above
 - `round_out_of_range` rounding `NaN`, `Infinity` or a `Float` too big for an `Int`
