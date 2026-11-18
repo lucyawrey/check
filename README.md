@@ -1,4 +1,6 @@
-# Check Language
+# The Check Programming Language
+
+A rust hosted, beginner friendly programming language that checks your work. Compiles to WebAssembly.
 
 ## Build
 
