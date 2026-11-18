@@ -302,6 +302,32 @@ fn a_stop_or_or_panic_on_an_err_shows_the_error_through_to_string() {
 }
 
 #[test]
+fn an_unknown_method_still_reports_errors_in_its_arguments() {
+    for recv in ["Int.parse(\"1\")", "[1]", "Ok(1)", "1", "true"] {
+        let src = format!("{recv}.foo(nowhere)");
+        let report = run_source(
+            "test.check",
+            &src,
+            &mut Cursor::new(Vec::new()),
+            &mut Vec::new(),
+        );
+        let codes: Vec<String> = report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.to_string())
+            .collect();
+        assert!(
+            codes.contains(&"unknown_method".to_string()),
+            "{src}: {codes:?}"
+        );
+        assert!(
+            codes.contains(&"unknown_name".to_string()),
+            "{src}: {codes:?}"
+        );
+    }
+}
+
+#[test]
 fn or_err_and_ok_convert_between_maybe_and_result() {
     assert_eq!(
         output("print(Int.parse(\"1\").orErr(\"no\"))\nprint(Int.parse(\"x\").orErr(\"no\"))"),

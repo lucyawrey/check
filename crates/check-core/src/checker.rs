@@ -2675,10 +2675,7 @@ impl Checker<'_> {
             && let Some((this, _)) = self.funcs[name].this.clone()
             && !self.conforms(recv, &this.substitute(&map))
         {
-            for a in args {
-                self.expr(&a.value, None);
-            }
-            return self.error(Code::unknown_method, span);
+            return self.unknown_method(args, span);
         }
         let params: Vec<ParamSig> = self.funcs[name]
             .sig
@@ -2813,10 +2810,7 @@ impl Checker<'_> {
                 self.info.resolved.insert(id, Resolved::Static(key.clone()));
                 return self.call_named(&key, args, span);
             }
-            for a in args {
-                self.expr(&a.value, None);
-            }
-            return self.error(Code::unknown_method, span);
+            return self.unknown_method(args, span);
         }
         let is_place = matches!(
             recv.kind,
@@ -2841,10 +2835,7 @@ impl Checker<'_> {
         let recv_ty = self.subst.shallow(&recv_ty);
         if self.is_interface(&recv_ty) || matches!(recv_ty, Ty::Param(_)) {
             let Some(sig) = self.interface_method(&recv_ty, name) else {
-                for a in args {
-                    self.expr(&a.value, None);
-                }
-                return self.error(Code::unknown_method, span);
+                return self.unknown_method(args, span);
             };
             self.match_args(&sig.params, args, span);
             self.info
@@ -2872,13 +2863,10 @@ impl Checker<'_> {
                     self.args_of(args, span, &[]);
                     Ty::maybe(targs.swap_remove(0))
                 }
-                _ => self.error(Code::unknown_method, span),
+                _ => self.unknown_method(args, span),
             },
             Ty::Named(..) | Ty::Str | Ty::Int | Ty::Float | Ty::Bool => {
-                for a in args {
-                    self.expr(&a.value, None);
-                }
-                self.error(Code::unknown_method, span)
+                self.unknown_method(args, span)
             }
             Ty::Error => {
                 for a in args {
@@ -2911,10 +2899,18 @@ impl Checker<'_> {
                     self.args_of(args, span, std::slice::from_ref(&e));
                     Ty::Named(RESULT.to_string(), vec![*inner, e])
                 }
-                _ => self.error(Code::unknown_method, span),
+                _ => self.unknown_method(args, span),
             },
-            _ => self.error(Code::unknown_method, span),
+            _ => self.unknown_method(args, span),
         }
+    }
+
+    /// Checks the arguments anyway, so their own errors show too.
+    fn unknown_method(&mut self, args: &[Arg], span: Span) -> Ty {
+        for a in args {
+            self.expr(&a.value, None);
+        }
+        self.error(Code::unknown_method, span)
     }
 
     fn list_method(&mut self, elem: Ty, name: &str, args: &[Arg], span: Span) -> Ty {
@@ -2949,7 +2945,7 @@ impl Checker<'_> {
             }
             "join" => {
                 if !self.subst.unify(&elem, &Ty::Str) {
-                    return self.error(Code::unknown_method, span);
+                    return self.unknown_method(args, span);
                 }
                 self.args_of(args, span, &[Ty::Str]);
                 Ty::Str
@@ -2967,7 +2963,7 @@ impl Checker<'_> {
                 );
                 Ty::list(elem)
             }
-            _ => self.error(Code::unknown_method, span),
+            _ => self.unknown_method(args, span),
         }
     }
 
