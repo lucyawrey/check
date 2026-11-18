@@ -200,7 +200,9 @@ pub struct Checker<'s> {
     funcs: HashMap<String, FuncEntry>,
     fns: Vec<FnCtx>,
     loops: Vec<LoopCtx>,
-    narrowed: Vec<(String, String)>,
+    /// Collection and key names whose index can't miss, and the innermost scope they
+    /// may come from, so a shadowing name isn't narrowed.
+    narrowed: Vec<(String, String, usize)>,
     top_level_names: HashSet<String>,
     lambda_types: Vec<(NodeId, Ty)>,
     type_names: HashSet<String>,
@@ -217,6 +219,8 @@ pub struct Checker<'s> {
     impls: HashMap<String, Vec<Ty>>,
     /// The type parameters in scope and their bounds.
     bounds: HashMap<String, Vec<Ty>>,
+    /// Each generic class's and enum's parameter bounds, checked where a value is made.
+    type_bounds: HashMap<String, HashMap<String, Vec<Ty>>>,
     /// A call's type arguments and a bound each must meet, if any, checked once inference
     /// is done.
     pending_bounds: Vec<(Ty, Option<Ty>, Span)>,
@@ -262,6 +266,7 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         interfaces: HashMap::new(),
         impls: HashMap::new(),
         bounds: HashMap::new(),
+        type_bounds: HashMap::new(),
         pending_bounds: Vec::new(),
         impl_spans: HashMap::new(),
         renamed: HashMap::new(),
@@ -533,7 +538,7 @@ impl Checker<'_> {
         }
         self.declare_members(&c.name, this, &c.members);
         self.add_impls(&c.name, &c.interfaces);
-        self.bounds = saved;
+        self.save_type_bounds(&c.name, &c.type_params, saved);
     }
 
     fn declare_implement(&mut self, i: &ImplementDecl) {
@@ -617,7 +622,36 @@ impl Checker<'_> {
         let this = self.own_type(&e.name);
         self.declare_members(&e.name, this, &e.members);
         self.add_impls(&e.name, &e.interfaces);
+        self.save_type_bounds(&e.name, &e.type_params, saved);
+    }
+
+    /// Keeps a type's parameter bounds, its fields' key bounds included, and restores `saved`.
+    fn save_type_bounds(
+        &mut self,
+        name: &str,
+        params: &[TypeParam],
+        saved: HashMap<String, Vec<Ty>>,
+    ) {
+        let bounds = params
+            .iter()
+            .map(|p| (p.name.clone(), self.bounds[&p.name].clone()))
+            .collect();
+        self.type_bounds.insert(name.to_string(), bounds);
         self.bounds = saved;
+    }
+
+    /// Checks, once inference is done, that a value of `ty`, a generic type, meets its bounds.
+    fn require_type_bounds(&mut self, ty: &Ty, span: Span) {
+        let Ty::Named(name, args) = ty else {
+            return;
+        };
+        let map = self.args_map(name, args);
+        for (p, bounds) in self.type_bounds.get(name).cloned().unwrap_or_default() {
+            for b in bounds {
+                self.pending_bounds
+                    .push((map[&p].clone(), Some(b.substitute(&map)), span));
+            }
+        }
     }
 
     fn declare_members(&mut self, owner: &str, this: Ty, members: &Members) {
@@ -786,7 +820,7 @@ impl Checker<'_> {
     }
 
     /// The first part of a `.con` value that isn't a literal: only constructor and variant
-    /// calls, record literals, variants, lists, strings without interpolation, numbers and
+    /// calls, record literals, variants, lists, maps, strings, numbers and
     /// `Bool` are.
     fn non_literal<'e>(&self, e: &'e Expr) -> Option<&'e Expr> {
         let made = matches!(
@@ -796,7 +830,7 @@ impl Checker<'_> {
         let args = |args: &'e [Arg]| args.iter().find_map(|a| self.non_literal(&a.value));
         match &e.kind {
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) => None,
-            ExprKind::Str(segs) if segs.iter().all(|s| matches!(s, StrSeg::Text(_))) => None,
+            ExprKind::Str(_) => None,
             ExprKind::Unary(UnOp::Neg, x)
                 if matches!(x.kind, ExprKind::Int(_) | ExprKind::Float(_)) =>
             {
@@ -962,7 +996,7 @@ impl Checker<'_> {
         let body = decl.body.as_ref().expect("checked functions have bodies");
         let ret = self.function_body(body, sig.ret.clone());
         self.finish_scope();
-        self.bounds = saved_bounds;
+        let bounds = std::mem::replace(&mut self.bounds, saved_bounds);
         self.renamed = saved_renamed;
         self.current_type = saved_type;
         self.scopes.truncate(1);
@@ -971,6 +1005,7 @@ impl Checker<'_> {
         self.narrowed = saved_narrowed;
         let entry = self.funcs.get_mut(name)?;
         entry.sig.ret = Some(ret);
+        entry.bounds = bounds;
         entry.state = FuncState::Done;
         Some(entry.sig.clone())
     }
@@ -1428,6 +1463,10 @@ impl Checker<'_> {
         self.scopes.iter().rev().find_map(|s| s.get(name))
     }
 
+    fn scope_of(&self, name: &str) -> Option<usize> {
+        self.scopes.iter().rposition(|s| s.contains_key(name))
+    }
+
     fn lookup_mut(&mut self, name: &str) -> Option<&mut Var> {
         self.scopes.iter_mut().rev().find_map(|s| s.get_mut(name))
     }
@@ -1720,6 +1759,7 @@ impl Checker<'_> {
             }
         }
         let ty = self.fresh_type(class);
+        self.require_type_bounds(&ty, span);
         let map = self.args_map(class, &Self::type_args(&ty));
         let c = self.class(class).expect("class");
         let params: Vec<ParamSig> = c
@@ -1791,10 +1831,16 @@ impl Checker<'_> {
         let ty = self.subst.shallow(ty);
         match &ty {
             Ty::Int | Ty::Str | Ty::Bool | Ty::Error => true,
-            Ty::Param(p) => self
-                .bounds
-                .get(p)
-                .is_some_and(|b| b.contains(&Ty::named(KEY))),
+            // A type parameter used as a key becomes a key type, checked where it's filled in.
+            Ty::Param(p) => match self.bounds.get_mut(p) {
+                Some(bounds) => {
+                    if !bounds.contains(&Ty::named(KEY)) {
+                        bounds.push(Ty::named(KEY));
+                    }
+                    true
+                }
+                None => false,
+            },
             Ty::Record(_, fields) => fields.iter().all(|f| self.is_key(f, seen)),
             Ty::Named(name, _) if name == MAP || name == SET => false,
             Ty::Named(..) if self.is_interface(&ty) || self.is_ref_class(&ty) => false,
@@ -2148,7 +2194,9 @@ impl Checker<'_> {
             id,
             Resolved::Variant(enum_name.to_string(), name.to_string()),
         );
-        self.fresh_type(enum_name)
+        let ty = self.fresh_type(enum_name);
+        self.require_type_bounds(&ty, span);
+        ty
     }
 
     fn variant_call(
@@ -2161,6 +2209,7 @@ impl Checker<'_> {
         expected: Option<&Ty>,
     ) -> Ty {
         let ty = self.fresh_type(enum_name);
+        self.require_type_bounds(&ty, span);
         let expected = expected.map(|e| match self.subst.shallow(e) {
             Ty::Maybe(inner) => self.subst.shallow(&inner),
             e => e,
@@ -2785,6 +2834,8 @@ impl Checker<'_> {
 
     /// Calls function `name`, a method of `recv` when given.
     fn call_entry(&mut self, name: &str, recv: Option<&Ty>, args: &[Arg], span: Span) -> Ty {
+        // Checking the body first lets it add key bounds to the type parameters.
+        let sig = self.ensure_checked(name, span);
         let map = self.instantiate(name, span);
         if let Some(recv) = recv
             && let Some((this, _)) = self.funcs[name].this.clone()
@@ -2802,7 +2853,7 @@ impl Checker<'_> {
             })
             .collect();
         self.match_args(&params, args, span);
-        match self.ensure_checked(name, span) {
+        match sig {
             Some(sig) => sig.ret.unwrap_or(Ty::Void).substitute(&map),
             None => Ty::Error,
         }
@@ -3170,10 +3221,13 @@ impl Checker<'_> {
                 return elem;
             }
             if let ExprKind::Name(index_name) = &index.kind
-                && self
-                    .narrowed
-                    .iter()
-                    .any(|(l, i)| l == list_name && i == index_name)
+                && self.narrowed.iter().any(|(l, i, depth)| {
+                    l == list_name
+                        && i == index_name
+                        && [l, i]
+                            .iter()
+                            .all(|n| self.scope_of(n).is_some_and(|s| s <= *depth))
+                })
             {
                 self.info.unwrapped_index.insert(id);
                 return elem;
@@ -3267,7 +3321,7 @@ impl Checker<'_> {
 
     /// The map and key that `if m.contains(k)` narrows `m[k]` for in `then`, when neither
     /// changes there.
-    fn contains_check(&self, cond: &Expr, then: &Expr) -> Option<(String, String)> {
+    fn contains_check(&self, cond: &Expr, then: &Expr) -> Option<(String, String, usize)> {
         let ExprKind::Method(recv, method, args) = &cond.kind else {
             return None;
         };
@@ -3281,7 +3335,7 @@ impl Checker<'_> {
             .lookup(m)
             .is_some_and(|v| matches!(self.subst.shallow(&v.ty), Ty::Named(n, _) if n == MAP));
         (method == "contains" && is_map && !mutates(then, m) && !mutates(then, k))
-            .then(|| (m.clone(), k.clone()))
+            .then(|| (m.clone(), k.clone(), self.scopes.len() - 1))
     }
 
     fn match_expr(
@@ -3849,7 +3903,7 @@ impl Checker<'_> {
         let narrowed_list = match &pattern.kind {
             PatternKind::Name(name) => narrowing_list(iter)
                 .filter(|list| !mutates(body, list))
-                .map(|list| (list, name.clone())),
+                .map(|list| (list, name.clone(), self.scopes.len())),
             _ => None,
         };
         if let Some(narrowed) = &narrowed_list {

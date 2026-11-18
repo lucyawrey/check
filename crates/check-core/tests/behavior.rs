@@ -2150,6 +2150,13 @@ fn contains_narrows_a_lookup_while_neither_map_nor_key_changes() {
         "{AGES}let k = \"bo\"\nif ages.contains(k) {{\n    ages.remove(k)\n    print(ages[k] + 1)\n}}"
     );
     assert_eq!(first_error(&map_changes), "invalid_operand_types");
+    for shadowed in [
+        "if true { let k = \"zz\"\n print(ages[k] + 1) }",
+        "for k in [\"zz\"] { print(ages[k] + 1) }",
+    ] {
+        let src = format!("{AGES}let k = \"bo\"\nif ages.contains(k) {{ {shadowed} }}");
+        assert_eq!(first_error(&src), "invalid_operand_types");
+    }
 }
 
 #[test]
@@ -2202,6 +2209,29 @@ fn map_keys_and_set_items_need_exact_equality() {
     );
     let record_keys = "class P(x: Int, y: Int)\nprint(Set([P(1, 2), P(1, 2)]))";
     assert_eq!(output(record_keys), "Set([P(x = 1, y = 2)])");
+    for made in [
+        "class Box<K>(m: Map<K, Int>)\nprint(Box([1.5 = 1]))",
+        "enum E<K> { A(s: Set<K>), B }\nprint(E.A(Set([1.5])))",
+        "func f<K>(k: K) -> Int {\n    let s: Set<K> = Set([k])\n    s.length()\n}\nprint(f(1.5))",
+    ] {
+        assert_eq!(first_error(made), "invalid_key_type");
+    }
+    let body_use = "func uniq<T>(xs: T[]) -> Int { Set(xs).length() }\nprint(uniq([1, 1, 2]))\n";
+    assert_eq!(output(body_use), "2");
+    assert_eq!(
+        first_error(&format!("{body_use}print(uniq([1.5]))")),
+        "invalid_key_type"
+    );
+}
+
+#[test]
+fn a_generic_type_checks_its_bounds_where_a_value_is_made() {
+    assert_eq!(
+        first_error(
+            "interface Named { func name() -> String }\nclass Box<T: Named>(x: T)\nprint(Box(1).x)"
+        ),
+        "unmet_constraint"
+    );
 }
 
 #[test]
