@@ -1,0 +1,10 @@
+the: 3
+cat: 1
+sat: 1
+on: 1
+mat: 1
+end: 1
+6
+3
+["the"]
+Set([3, 2])

@@ -2104,3 +2104,135 @@ print(E.Has(P(2)))
 print((a = P(3), b = \"s\"))";
     assert_eq!(output(src), "Box(v = P1)\nHas(P2)\n(a = P3, b = \"s\")");
 }
+
+const AGES: &str = "var ages = [\"ana\" = 31, \"bo\" = 27]\n";
+
+#[test]
+fn a_map_literal_prints_compares_and_copies_like_a_value() {
+    let src = format!(
+        "{AGES}let copy = ages\nages[\"cy\"] = 40\nprint(copy)\nprint(ages)\nlet none: Map<String, Int> = [=]\nprint(none)\nprint([\"a\" = 1, \"b\" = 2] == [\"b\" = 2, \"a\" = 1])"
+    );
+    assert_eq!(
+        output(&src),
+        "[\"ana\" = 31, \"bo\" = 27]\n[\"ana\" = 31, \"bo\" = 27, \"cy\" = 40]\n[=]\ntrue"
+    );
+    let unused = "var m = [=]\nprint(m)\nvar s = Set([])\nprint(s)";
+    assert_eq!(output(unused), "[=]\nSet([])");
+}
+
+#[test]
+fn a_map_key_can_be_any_expression() {
+    let src = "func f(i: Int) i\nlet a = 1\nprint([f(1) = \"f\", (a + 1) = \"sum\"])\nprint([(a == 2) = \"no\"])";
+    assert_eq!(output(src), "[1 = \"f\", 2 = \"sum\"]\n[false = \"no\"]");
+}
+
+#[test]
+fn map_lookups_writes_and_removals_keep_insertion_order() {
+    let src = format!(
+        "{AGES}print(ages[\"cy\"])\nages[\"ana\"] = 32\nages[\"bo\"] += 1\nprint(ages.remove(\"ana\"))\nages[\"ana\"] = 1\nprint(ages.keys())\nprint(ages.values())\nprint(\"{{ages.length()}} {{ages.isEmpty()}} {{ages.contains(\"bo\")}}\")"
+    );
+    assert_eq!(
+        output(&src),
+        "None\nSome(32)\n[\"bo\", \"ana\"]\n[28, 1]\n2 false true"
+    );
+    panics_with(&format!("{AGES}ages[\"cy\"] += 1"), "missing_key");
+}
+
+#[test]
+fn contains_narrows_a_lookup_while_neither_map_nor_key_changes() {
+    let narrowed = format!("{AGES}let k = \"bo\"\nif ages.contains(k) {{ print(ages[k] + 1) }}");
+    assert_eq!(output(&narrowed), "28");
+    let key_changes = format!(
+        "{AGES}var k = \"bo\"\nif ages.contains(k) {{\n    k = \"zz\"\n    print(ages[k] + 1)\n}}"
+    );
+    assert_eq!(first_error(&key_changes), "invalid_operand_types");
+    let map_changes = format!(
+        "{AGES}let k = \"bo\"\nif ages.contains(k) {{\n    ages.remove(k)\n    print(ages[k] + 1)\n}}"
+    );
+    assert_eq!(first_error(&map_changes), "invalid_operand_types");
+}
+
+#[test]
+fn for_walks_maps_sets_and_enumerated_lists_in_order() {
+    let src = format!(
+        "{AGES}for (name, age) in ages {{ print(\"{{name}} {{age}}\") }}\nfor t in Set([\"b\", \"a\", \"b\"]) {{ print(t) }}\nfor (i, x) in [\"x\", \"y\"].enumerate() {{ print(\"{{i}} {{x}}\") }}"
+    );
+    assert_eq!(output(&src), "ana 31\nbo 27\nb\na\n0 x\n1 y");
+}
+
+#[test]
+fn a_set_keeps_one_of_each_item() {
+    let src = "var tags = Set([\"red\", \"blue\", \"red\"])\ntags.add(\"green\")\ntags.add(\"red\")\nprint(tags)\nprint(tags.remove(\"blue\"))\nprint(tags.remove(\"blue\"))\nprint(\"{tags.contains(\"red\")} {tags.length()} {tags.isEmpty()}\")";
+    assert_eq!(
+        output(src),
+        "Set([\"red\", \"blue\", \"green\"])\ntrue\nfalse\ntrue 2 false"
+    );
+}
+
+#[test]
+fn maps_and_sets_work_as_parameters_fields_and_type_names() {
+    let src = "class Inv(items: Map<String, Int>, tags: Set<String>)\nfunc total(m: Map<String, Int>) -> Int {\n    var t = 0\n    for (_, v) in m { t += v }\n    t\n}\nlet inv = Inv([\"a\" = 2, \"b\" = 3], Set([]))\nprint(total(inv.items))\nprint(inv)";
+    assert_eq!(
+        output(src),
+        "5\nInv(items = [\"a\" = 2, \"b\" = 3], tags = Set([]))"
+    );
+    assert_eq!(first_error("class Set {}"), "redefined_builtin");
+}
+
+#[test]
+fn map_keys_and_set_items_need_exact_equality() {
+    assert_eq!(first_error("let m = [1.5 = \"a\"]"), "invalid_key_type");
+    assert_eq!(
+        first_error("let m: Map<Float, Int> = [=]"),
+        "invalid_key_type"
+    );
+    assert_eq!(
+        first_error("ref class R { var n = 0 }\nlet s = Set([R()])"),
+        "invalid_key_type"
+    );
+    assert_eq!(
+        first_error("enum E { A, B(Float) }\nlet s = Set([E.A])"),
+        "invalid_key_type"
+    );
+    let generic = "func f<K, V>(m: Map<K, V>) -> Int { m.length() }\nprint(f([\"a\" = 1]))\n";
+    assert_eq!(output(generic), "1");
+    assert_eq!(
+        first_error(&format!("{generic}print(f([1.5 = 1]))")),
+        "invalid_key_type"
+    );
+    let record_keys = "class P(x: Int, y: Int)\nprint(Set([P(1, 2), P(1, 2)]))";
+    assert_eq!(output(record_keys), "Set([P(x = 1, y = 2)])");
+}
+
+#[test]
+fn a_let_map_or_set_never_changes() {
+    assert_eq!(
+        first_error("let s = Set([1])\ns.add(2)"),
+        "change_let_collection"
+    );
+    assert_eq!(
+        first_error("let m = [\"a\" = 1]\nprint(m.remove(\"a\"))"),
+        "change_let_collection"
+    );
+    assert_eq!(
+        first_error("let m = [\"a\" = 1]\nm[\"b\"] = 2"),
+        "assign_to_let"
+    );
+    let own_add = "ref class Bag {\n    var n = 0\n    func add(x: Int) { this.n += x }\n}\nlet b = Bag()\nb.add(2)\nprint(b.n)";
+    assert_eq!(output(own_add), "2");
+    assert_eq!(first_error("let m = [\"a\" = 1, 2]"), "unexpected_token");
+}
+
+#[test]
+fn a_data_file_can_hold_a_map() {
+    assert_eq!(
+        files_output(&[
+            (
+                "main.check",
+                "import \"shop.con\"\nprint(shop.prices[\"pear\"])"
+            ),
+            ("shop.con", "prices = [\"apple\" = 1, \"pear\" = 2]"),
+        ]),
+        "Some(2)"
+    );
+}
