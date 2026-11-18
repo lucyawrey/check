@@ -77,4 +77,24 @@ fn refuses_code_mixed_fields_and_files_that_arent_con() {
     check_error("p.con", "title = \"a\" + \"b\"", "code_in_pure_data");
     check_error("p.con", "kind = Game(8, maxPlayers = 8)", "mixed_fields");
     check_error("p.conx", "title = \"a\"", "not_pure_data");
+    for text in [
+        "title = foo",
+        "kind = Kind.Link.Game",
+        "kind = list.Link(\"x\")",
+        "title = Set(\"x\")",
+    ] {
+        check_error("p.con", text, "code_in_pure_data");
+    }
+}
+
+#[test]
+fn empty_fields_leave_optional_fields_unset() {
+    #[derive(Deserialize)]
+    struct Options {
+        name: Option<String>,
+    }
+    for text in ["", "()", "Options()"] {
+        let options: Options = from_str_unchecked("o.con", text).unwrap();
+        assert_eq!(options.name, None);
+    }
 }

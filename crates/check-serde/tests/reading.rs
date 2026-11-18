@@ -237,3 +237,15 @@ fn reads_maps_and_sets() {
     assert_eq!(place.tags.into_iter().collect::<Vec<_>>(), ["a", "b"]);
     assert_eq!(place.scores["bo"], 4);
 }
+
+#[test]
+fn a_panic_in_init_is_a_check_error() {
+    let schema = [(
+        "place/place.check",
+        "namespace place\n\nclass Bad {\n  let n: Int\n  init { panic(\"no\") }\n}\n",
+    )];
+    match read_with::<Place>(&schema, "bad.con", "n = 1", "place.Bad") {
+        Err(e @ Error::Check { .. }) => assert!(e.to_string().contains("panic_called"), "{e}"),
+        _ => panic!("expected a check error"),
+    }
+}
