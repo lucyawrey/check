@@ -142,7 +142,8 @@ pub fn load(entry: &str, files: &dyn Files, allow_private: bool) -> Loaded {
 }
 
 /// Loads a `.con` file a host reads as the const `name` of type `expected_type`, which is
-/// named as code importing the unit at `schema` would name it.
+/// named as code importing the unit at `schema` would name it. Returns the value's id and
+/// whether it's written as a call, like `Place(...)`.
 pub fn load_data(
     files: &dyn Files,
     schema: &str,
@@ -150,13 +151,14 @@ pub fn load_data(
     path: &str,
     text: &str,
     expected_type: &str,
-) -> (Loaded, NodeId) {
+) -> (Loaded, NodeId, bool) {
     let mut loader = Loader::new(path, files);
     let data = loader.parse_data(path, text);
     let id = data.value.id;
+    let is_call = matches!(data.value.kind, ExprKind::Call(..) | ExprKind::Method(..));
     if !path.ends_with(".con") {
         loader.error(Code::not_pure_data, data.value.span, None);
-        return (loader.finish(), id);
+        return (loader.finish(), id, is_call);
     }
     if let Some(unit) = loader.import("", schema, data.value.span) {
         loader.grant(ENTRY, unit, false);
@@ -171,7 +173,7 @@ pub fn load_data(
     };
     let namespace = data.namespace.map(|(n, _)| n).unwrap_or_default();
     loader.push(ENTRY, namespace, vec![Stmt::Data(decl)]);
-    (loader.finish(), id)
+    (loader.finish(), id, is_call)
 }
 
 /// The fields of a `package.con` the loader needs before checking, with their spans. Values

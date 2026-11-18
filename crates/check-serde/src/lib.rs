@@ -61,15 +61,27 @@ pub fn from_str<T: DeserializeOwned>(
     text: &str,
     expected_type: &str,
 ) -> Result<T, Error> {
-    let value =
-        check_core::check_data(files, schema, name, path, text, expected_type).map_err(|r| {
-            Error::Check {
-                diagnostics: r.diagnostics,
-                sources: r.sources,
-                panic_text: r.panic_text,
-            }
+    from_str_with_class(files, schema, name, path, text, expected_type).map(|(value, _)| value)
+}
+
+/// Like `from_str`, and also returns the class the file's value is written as, as
+/// `check_core::check_data` does.
+#[cfg(feature = "check")]
+pub fn from_str_with_class<T: DeserializeOwned>(
+    files: &dyn check_core::Files,
+    schema: &str,
+    name: &str,
+    path: &str,
+    text: &str,
+    expected_type: &str,
+) -> Result<(T, Option<String>), Error> {
+    let (value, class) = check_core::check_data(files, schema, name, path, text, expected_type)
+        .map_err(|r| Error::Check {
+            diagnostics: r.diagnostics,
+            sources: r.sources,
+            panic_text: r.panic_text,
         })?;
-    deserialize(value.into())
+    Ok((deserialize(value.into())?, class))
 }
 
 /// Reads a `.con` file into `T` without a Check class: no defaults, `init` or type checks,
