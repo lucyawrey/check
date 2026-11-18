@@ -132,7 +132,7 @@ fn a_copied_list_never_changes_the_original() {
 #[test]
 fn a_lambda_keeps_the_values_it_captured() {
     assert_eq!(
-        output("var n = 1\nlet f = func() n\nn = 2\nprint(f())"),
+        output("var n = 1\nlet f = func() => n\nn = 2\nprint(f())"),
         "1"
     );
 }
@@ -339,7 +339,7 @@ fn or_err_and_ok_convert_between_maybe_and_result() {
     );
 }
 
-fn first_error(src: &str) -> String {
+fn diagnostics(src: &str, severity: Severity) -> Vec<String> {
     let report = run_source(
         "test.check",
         src,
@@ -349,8 +349,15 @@ fn first_error(src: &str) -> String {
     report
         .diagnostics
         .iter()
-        .find(|d| d.severity == Severity::Error)
+        .filter(|d| d.severity == severity)
         .map(|d| d.code.to_string())
+        .collect()
+}
+
+fn first_error(src: &str) -> String {
+    diagnostics(src, Severity::Error)
+        .into_iter()
+        .next()
         .unwrap_or_default()
 }
 
@@ -724,18 +731,7 @@ fn external_marks_only_functions() {
 }
 
 fn warnings(src: &str) -> Vec<String> {
-    let report = run_source(
-        "test.check",
-        src,
-        &mut Cursor::new(Vec::new()),
-        &mut Vec::new(),
-    );
-    report
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == Severity::Warning)
-        .map(|d| d.code.to_string())
-        .collect()
+    diagnostics(src, Severity::Warning)
 }
 
 const POINT: &str = "class Point(x: Int, y: Int = 0)\n";
@@ -1773,7 +1769,7 @@ print(Box(5).doubled())
 let Box(inner) = Box(\"hi\")
 print(inner)
 let boxes: Box<Int>[] = [Box(1), Box(2)]
-print(boxes.map(func(x) x.get()))
+print(boxes.map(func(x) => x.get()))
 let t: Tree<String> = Node(Leaf, \"a\", Node(Leaf, \"b\", Leaf))
 print(size(t))";
     assert_eq!(output(src), "4\n10\nhi\n[1, 2]\n2");
@@ -2122,7 +2118,7 @@ fn a_map_literal_prints_compares_and_copies_like_a_value() {
 
 #[test]
 fn a_map_key_can_be_any_expression() {
-    let src = "func f(i: Int) i\nlet a = 1\nprint([f(1) = \"f\", (a + 1) = \"sum\"])\nprint([(a == 2) = \"no\"])";
+    let src = "func f(i: Int) => i\nlet a = 1\nprint([f(1) = \"f\", (a + 1) = \"sum\"])\nprint([(a == 2) = \"no\"])";
     assert_eq!(output(src), "[1 = \"f\", 2 = \"sum\"]\n[false = \"no\"]");
 }
 
@@ -2289,4 +2285,174 @@ fn braces_in_a_con_string_are_plain_text() {
         ]),
         "2"
     );
+}
+
+#[test]
+fn a_body_is_braces_or_an_arrow_and_one_line() {
+    for (src, expected) in [
+        ("func double(x: Int) => x * 2\nprint(double(2))", "4"),
+        ("func one() -> Int { 1 }\nprint(one())", "1"),
+        ("print([1, 2].map(func(x) => x * 2))", "[2, 4]"),
+        ("print([1].map(func(x) -> Int { x + 1 }))", "[2]"),
+        (
+            "func sign(n: Int) => if n < 0 { -1 } else { 1 }\nprint(sign(-3))",
+            "-1",
+        ),
+        (
+            "func name(n: Int) => match n {\n  0 => \"zero\"\n  _ => \"many\"\n}\nprint(name(0))",
+            "zero",
+        ),
+        (
+            "func big(n: Int) => n > 1\nmatch 2 {\n  x if big(x) { print(\"big\") }\n  _ => print(\"small\")\n}",
+            "big",
+        ),
+        (
+            "let y = 2\nmatch 2 {\n  x if x == y { print(\"same\") }\n  _ => print(\"no\")\n}",
+            "same",
+        ),
+        (
+            "match 1 { 1 { print(\"one\") }, _ => print(\"other\") }",
+            "one",
+        ),
+    ] {
+        assert_eq!(output(src), expected, "{src}");
+    }
+    for (src, code) in [
+        ("func f(x: Int) => { x }", "arrow_before_braces"),
+        ("let f = func(x: Int) => { x }", "arrow_before_braces"),
+        (
+            "match 1 {\n  1 => { print(1) }\n  _ => print(2)\n}",
+            "arrow_before_braces",
+        ),
+        ("func f() -> Int => 1", "arrow_without_braces"),
+        ("func f() -> Int 1", "arrow_without_braces"),
+        ("func f(x: Int) x * 2", "body_without_arrow"),
+        (
+            "enum S { Square }\nmatch S.Square { Square 1.0 }",
+            "body_without_arrow",
+        ),
+        ("func f(x: Int)\n  => x", "unexpected_token"),
+        (
+            "let a = 1\nlet b = 2\nif a = b { print(1) }",
+            "assignment_in_condition",
+        ),
+        (
+            "let a = 1\nmatch 1 {\n  x if x = a { print(x) }\n  _ => print(0)\n}",
+            "assignment_in_condition",
+        ),
+    ] {
+        assert_eq!(first_error(src), code, "{src}");
+    }
+}
+
+#[test]
+fn an_arrow_line_means_that_line_in_braces() {
+    for (arrow, braces) in [
+        (
+            "match 1 {\n  1 => m[\"a\"] = 5\n  _ => print(0)\n}",
+            "match 1 {\n  1 { m[\"a\"] = 5 }\n  _ => print(0)\n}",
+        ),
+        (
+            "func bump() => n += 1\nbump()",
+            "func bump() { n += 1 }\nbump()",
+        ),
+        (
+            "n = [1, 2].map(func(x) => x * 10)[1] ?? 0",
+            "n = [1, 2].map(func(x) { x * 10 })[1] ?? 0",
+        ),
+        ("func f() => let x = 1\nf()", "func f() { let x = 1 }\nf()"),
+    ] {
+        let start = "var n = 0\nvar m = [\"a\" = 1]\n";
+        let end = "\nprint(\"{n} {m}\")";
+        assert_eq!(
+            output(&format!("{start}{arrow}{end}")),
+            output(&format!("{start}{braces}{end}"))
+        );
+    }
+    assert_eq!(
+        first_error("match 1 {\n  1 => print(1); print(2)\n  _ => print(3)\n}"),
+        "unexpected_token"
+    );
+    assert_eq!(output("let f = func(x: Int) => x * 2; print(f(1))"), "2");
+}
+
+#[test]
+fn bad_arms_are_reported_and_parsing_goes_on() {
+    assert_eq!(
+        diagnostics(
+            "match 1 {\n  1 => { print(1) }\n  2 => { print(2) }\n  _ => print(3)\n}",
+            Severity::Error
+        ),
+        ["arrow_before_braces", "arrow_before_braces"]
+    );
+}
+
+#[test]
+fn var_in_a_pattern_binds_a_copy_that_can_change() {
+    let src = "enum Shape { Circle(r: Float), Square }
+let s = Shape.Circle(1.0)
+match s {
+  Circle(var r) {
+    r += 1.0
+    print(r)
+  }
+  Square => print(\"square\")
+}
+print(s)
+let m: Int? = Some(3)
+if m is Some(var v) {
+  v += 1
+  print(v)
+}
+for var x in [1, 2] {
+  x *= 10
+  print(x)
+}
+for (k, var v) in [\"a\" = 1] {
+  v += 1
+  print(\"{k} {v}\")
+}
+match [1, 2, 3] {
+  [first, ...var rest] {
+    rest.push(first)
+    print(rest)
+  }
+  _ => print(\"other\")
+}";
+    assert_eq!(
+        output(src),
+        "2.0\nCircle(r = 1.0)\n4\n10\n20\na 2\n[2, 3, 1]"
+    );
+    for (src, code) in [
+        (
+            "let p = (1, 2)\nlet (var a, b) = p",
+            "var_in_declaration_pattern",
+        ),
+        ("match 1 { var _ => print(1) }", "unexpected_token"),
+        (
+            "enum E { A(n: Int), B(n: Int) }\nmatch E.A(1) { A(var n) | B(n) => print(n) }",
+            "or_pattern_bindings",
+        ),
+        (
+            "let m: Int? = Some(1)\nif m is Some(v) { v = 2 }",
+            "assign_to_let",
+        ),
+        (
+            "enum C { Red, Blue }\nmatch C.Red { var Red => print(1), _ => print(2) }",
+            "unexpected_token",
+        ),
+        (
+            "let m: Int? = None\nmatch m { var None => print(1), _ => print(2) }",
+            "unexpected_token",
+        ),
+    ] {
+        assert_eq!(first_error(src), code, "{src}");
+    }
+    for unchanged in [
+        "let m: Int? = Some(1)\nif m is Some(var v) { print(v) }",
+        "let m: Int? = Some(1)\nmatch m {\n  Some(var v) => print(v)\n  None => print(0)\n}",
+        "for var x in [1] { print(x) }",
+    ] {
+        assert_eq!(warnings(unchanged), ["unused_var"], "{unchanged}");
+    }
 }

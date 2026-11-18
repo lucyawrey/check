@@ -16,5 +16,5 @@ for (word, n) in counts {
 }
 print(counts.length())
 print(counts["the"] ?? 0)
-print(counts.keys().filter(func(w) counts[w] ?? 0 > 1))
+print(counts.keys().filter(func(w) => counts[w] ?? 0 > 1))
 print(sizes)

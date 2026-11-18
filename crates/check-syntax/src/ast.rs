@@ -149,6 +149,8 @@ pub struct Pattern {
     pub id: NodeId,
     pub span: Span,
     pub kind: PatternKind,
+    /// A name or rest marked `var`, a copy that can change.
+    pub is_var: bool,
 }
 
 #[derive(Debug, Clone)]
