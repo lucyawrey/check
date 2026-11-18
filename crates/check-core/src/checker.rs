@@ -820,7 +820,7 @@ impl Checker<'_> {
     }
 
     /// The first part of a `.con` value that isn't a literal: only constructor and variant
-    /// calls, record literals, variants, lists, maps, strings, numbers and
+    /// calls, record literals, variants, lists, maps, sets, strings, numbers and
     /// `Bool` are.
     fn non_literal<'e>(&self, e: &'e Expr) -> Option<&'e Expr> {
         let made = matches!(
@@ -842,7 +842,7 @@ impl Checker<'_> {
                 .find_map(|(k, v)| self.non_literal(k).or_else(|| self.non_literal(v))),
             ExprKind::Record(a) => args(a),
             ExprKind::Call(callee, a)
-                if made || matches!(&callee.kind, ExprKind::Name(n) if n == "Some") =>
+                if made || matches!(&callee.kind, ExprKind::Name(n) if n == "Some" || n == SET) =>
             {
                 args(a)
             }

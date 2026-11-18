@@ -1,11 +1,9 @@
-pub mod ast;
+pub use check_syntax::{ast, diag, lexer, parser};
+
 pub mod checker;
-pub mod diag;
 pub mod host;
 pub mod interp;
-pub mod lexer;
 pub mod modules;
-pub mod parser;
 pub mod resolve;
 pub mod types;
 pub mod value;
@@ -41,12 +39,16 @@ pub struct Checked {
 }
 
 pub fn check_program(entry: &str, files: &dyn Files, allow_private: bool) -> Checked {
+    check_loaded(modules::load(entry, files, allow_private))
+}
+
+fn check_loaded(loaded: Loaded) -> Checked {
     let Loaded {
         program,
         library,
         sources,
         diagnostics,
-    } = modules::load(entry, files, allow_private);
+    } = loaded;
     let mut checked = Checked {
         program,
         library,
@@ -65,6 +67,40 @@ pub fn check_program(entry: &str, files: &dyn Files, allow_private: bool) -> Che
     checked.info = info;
     checked.diagnostics.extend(check_diags);
     checked
+}
+
+/// Reads the `.con` file at `path`, with contents `text`, as the const `name` of type
+/// `expected_type`, which is named as code importing the unit at `schema` in `files` names it.
+pub fn check_data(
+    files: &dyn Files,
+    schema: &str,
+    name: &str,
+    path: &str,
+    text: &str,
+    expected_type: &str,
+) -> Result<value::Value, Report> {
+    let (loaded, id) = modules::load_data(files, schema, name, path, text, expected_type);
+    let Checked {
+        program,
+        library,
+        info,
+        diagnostics,
+        sources,
+    } = check_loaded(loaded);
+    if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+        return Err(Report {
+            outcome: Outcome::CheckFailed,
+            diagnostics,
+            panic_text: None,
+            sources,
+        });
+    }
+    interp::eval_data(&program, &library, &info, id).map_err(|p| Report {
+        outcome: Outcome::Panicked(p.code),
+        panic_text: Some(panic_text(&p, &sources)),
+        diagnostics,
+        sources,
+    })
 }
 
 fn one_file(path: &str, src: &str) -> MemFiles {
@@ -112,20 +148,7 @@ pub fn run_program(
                 );
                 (Outcome::Stopped, Some(text))
             }
-            Err(p) => {
-                let (path, line, col, _) = sources.locate(p.span.start);
-                let reason = p.reason.map(|r| format!(": {r}")).unwrap_or_default();
-                let mut text = format!(
-                    "panic[{}]: {}{reason}\n --> {path}:{line}:{col}\n",
-                    p.code,
-                    p.code.message()
-                );
-                for call in &p.stack {
-                    let (path, line, col, _) = sources.locate(call.start);
-                    text.push_str(&format!("    at {path}:{line}:{col}\n"));
-                }
-                (Outcome::Panicked(p.code), Some(text))
-            }
+            Err(p) => (Outcome::Panicked(p.code), Some(panic_text(&p, &sources))),
         }
     };
     Report {
@@ -134,4 +157,23 @@ pub fn run_program(
         panic_text,
         sources,
     }
+}
+
+fn panic_text(p: &interp::Panic, sources: &Sources) -> String {
+    let (path, line, col, _) = sources.locate(p.span.start);
+    let reason = p
+        .reason
+        .as_ref()
+        .map(|r| format!(": {r}"))
+        .unwrap_or_default();
+    let mut text = format!(
+        "panic[{}]: {}{reason}\n --> {path}:{line}:{col}\n",
+        p.code,
+        p.code.message()
+    );
+    for call in &p.stack {
+        let (path, line, col, _) = sources.locate(call.start);
+        text.push_str(&format!("    at {path}:{line}:{col}\n"));
+    }
+    text
 }

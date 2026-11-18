@@ -112,31 +112,7 @@ pub fn entry_of(folder: &str, files: &dyn Files) -> Result<String, Code> {
 
 /// Loads the entry file and the units it imports. `allow_private` lets it use `import private`.
 pub fn load(entry: &str, files: &dyn Files, allow_private: bool) -> Loaded {
-    let mut loader = Loader {
-        files,
-        sources: Sources::default(),
-        diags: Vec::new(),
-        next_id: 0,
-        entry: normalize(entry),
-        owners: HashMap::new(),
-        units: HashMap::new(),
-        loading: Vec::new(),
-        access: Vec::new(),
-        labels: Vec::new(),
-        parsed: Vec::new(),
-    };
-    for label in ["check:std", "check:cli", entry] {
-        loader.new_unit(label);
-    }
-    loader.loading.clear();
-    for (unit, path, text) in MANIFESTS {
-        let data = loader.parse_data(path, text);
-        let ns = data.namespace.map(|(n, _)| n).unwrap_or_default();
-        for (u, path, text) in LIBRARY.iter().filter(|(u, ..)| u == unit) {
-            let file = loader.parse(path, text);
-            loader.push(*u, ns.clone(), file.stmts);
-        }
-    }
+    let mut loader = Loader::new(entry, files);
     let text = files.read(entry).unwrap_or_default();
     let entry_file = loader.parse(entry, &text);
     let mut host_imports = 0;
@@ -162,28 +138,40 @@ pub fn load(entry: &str, files: &dyn Files, allow_private: bool) -> Loaded {
     }
     let entry_ns = entry_file.namespace.map(|(n, _)| n).unwrap_or_default();
     loader.push(ENTRY, entry_ns, entry_file.stmts);
-    let mut sources = std::mem::take(&mut loader.parsed);
-    resolve(
-        &mut sources,
-        &loader.access,
-        &loader.labels,
-        &mut loader.diags,
-    );
-    let mut program = Vec::new();
-    let mut library = Vec::new();
-    for file in sources {
-        if file.is_library {
-            library.extend(file.stmts);
-        } else {
-            program.extend(file.stmts);
-        }
+    loader.finish()
+}
+
+/// Loads a `.con` file a host reads as the const `name` of type `expected_type`, which is
+/// named as code importing the unit at `schema` would name it.
+pub fn load_data(
+    files: &dyn Files,
+    schema: &str,
+    name: &str,
+    path: &str,
+    text: &str,
+    expected_type: &str,
+) -> (Loaded, NodeId) {
+    let mut loader = Loader::new(path, files);
+    let data = loader.parse_data(path, text);
+    let id = data.value.id;
+    if !path.ends_with(".con") {
+        loader.error(Code::not_pure_data, data.value.span, None);
+        return (loader.finish(), id);
     }
-    Loaded {
-        program,
-        library,
-        sources: loader.sources,
-        diagnostics: loader.diags,
+    if let Some(unit) = loader.import("", schema, data.value.span) {
+        loader.grant(ENTRY, unit, false);
     }
+    let decl = DataDecl {
+        name: name.to_string(),
+        span: data.value.span,
+        ty: Some(TypeExpr::Name(expected_type.to_string(), data.value.span)),
+        value: data.value,
+        is_pure: true,
+        is_private: false,
+    };
+    let namespace = data.namespace.map(|(n, _)| n).unwrap_or_default();
+    loader.push(ENTRY, namespace, vec![Stmt::Data(decl)]);
+    (loader.finish(), id)
 }
 
 /// The fields of a `package.con` the loader needs before checking, with their spans. Values
@@ -242,7 +230,57 @@ struct Loader<'a> {
     parsed: Vec<SourceFile>,
 }
 
-impl Loader<'_> {
+impl<'a> Loader<'a> {
+    /// A loader with the built-in units loaded and `entry`'s unit created.
+    fn new(entry: &str, files: &'a dyn Files) -> Loader<'a> {
+        let mut loader = Loader {
+            files,
+            sources: Sources::default(),
+            diags: Vec::new(),
+            next_id: 0,
+            entry: normalize(entry),
+            owners: HashMap::new(),
+            units: HashMap::new(),
+            loading: Vec::new(),
+            access: Vec::new(),
+            labels: Vec::new(),
+            parsed: Vec::new(),
+        };
+        for label in ["check:std", "check:cli", entry] {
+            loader.new_unit(label);
+        }
+        loader.loading.clear();
+        for (unit, path, text) in MANIFESTS {
+            let data = loader.parse_data(path, text);
+            let ns = data.namespace.map(|(n, _)| n).unwrap_or_default();
+            for (u, path, text) in LIBRARY.iter().filter(|(u, ..)| u == unit) {
+                let file = loader.parse(path, text);
+                loader.push(*u, ns.clone(), file.stmts);
+            }
+        }
+        loader
+    }
+
+    fn finish(mut self) -> Loaded {
+        let mut sources = std::mem::take(&mut self.parsed);
+        resolve(&mut sources, &self.access, &self.labels, &mut self.diags);
+        let mut program = Vec::new();
+        let mut library = Vec::new();
+        for file in sources {
+            if file.is_library {
+                library.extend(file.stmts);
+            } else {
+                program.extend(file.stmts);
+            }
+        }
+        Loaded {
+            program,
+            library,
+            sources: self.sources,
+            diagnostics: self.diags,
+        }
+    }
+
     fn error(&mut self, code: Code, span: Span, detail: Option<String>) {
         let mut d = Diagnostic::error(code, span);
         d.detail = detail;
