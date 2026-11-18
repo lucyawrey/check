@@ -3411,6 +3411,9 @@ impl Checker<'_> {
                     Ty::Named(e, _) if self.variant(&e, name).is_some() => Some(e),
                     _ => None,
                 };
+                if pat.is_var && (enum_name.is_some() || name == "None") {
+                    self.error(Code::unexpected_token, pat.span);
+                }
                 if let Some(e) = enum_name {
                     if self.variant(&e, name).is_some_and(|v| !v.fields.is_empty()) {
                         self.error(Code::wrong_arguments, pat.span);

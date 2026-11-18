@@ -955,7 +955,7 @@ impl Parser<'_> {
         } else {
             None
         };
-        let body = self.code_body(false)?;
+        let body = self.code_body(false, false)?;
         Ok(Arm {
             pattern,
             guard,
@@ -978,7 +978,7 @@ impl Parser<'_> {
         let body = if is_external || (optional_body && ends) {
             None
         } else {
-            Some(self.code_body(ret.is_some())?)
+            Some(self.code_body(ret.is_some(), false)?)
         };
         Ok(FuncDecl {
             id: self.id(),
@@ -993,8 +993,9 @@ impl Parser<'_> {
     }
 
     /// A function, lambda or arm body: a block, or `=>` and one line, meaning that line in
-    /// braces. A function with `->` (`has_ret`) always has braces.
-    fn code_body(&mut self, has_ret: bool) -> PResult<Expr> {
+    /// braces. A function with `->` (`has_ret`) always has braces. A lambda's line ends at a
+    /// `;`, which then ends the statement around it.
+    fn code_body(&mut self, has_ret: bool, is_lambda: bool) -> PResult<Expr> {
         if self.is_sym("{") {
             return self.block();
         }
@@ -1014,7 +1015,7 @@ impl Parser<'_> {
             return self.fix_error(Code::body_without_arrow, self.span(), "=> ...");
         }
         let stmt = self.block_line()?;
-        if self.is_sym(";") {
+        if self.is_sym(";") && !is_lambda {
             return self.fix_error(Code::unexpected_token, self.span(), "{ ...; ... }");
         }
         let span = arrow.to(self.prev_span());
@@ -1543,7 +1544,7 @@ impl Parser<'_> {
                 } else {
                     None
                 };
-                let body = self.code_body(ret.is_some())?;
+                let body = self.code_body(ret.is_some(), true)?;
                 return Ok(self.expr_node(
                     span.to(body.span),
                     ExprKind::Lambda(params, ret, Box::new(body)),

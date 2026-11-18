@@ -339,7 +339,7 @@ fn or_err_and_ok_convert_between_maybe_and_result() {
     );
 }
 
-fn first_error(src: &str) -> String {
+fn diagnostics(src: &str, severity: Severity) -> Vec<String> {
     let report = run_source(
         "test.check",
         src,
@@ -349,8 +349,15 @@ fn first_error(src: &str) -> String {
     report
         .diagnostics
         .iter()
-        .find(|d| d.severity == Severity::Error)
+        .filter(|d| d.severity == severity)
         .map(|d| d.code.to_string())
+        .collect()
+}
+
+fn first_error(src: &str) -> String {
+    diagnostics(src, Severity::Error)
+        .into_iter()
+        .next()
         .unwrap_or_default()
 }
 
@@ -724,18 +731,7 @@ fn external_marks_only_functions() {
 }
 
 fn warnings(src: &str) -> Vec<String> {
-    let report = run_source(
-        "test.check",
-        src,
-        &mut Cursor::new(Vec::new()),
-        &mut Vec::new(),
-    );
-    report
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == Severity::Warning)
-        .map(|d| d.code.to_string())
-        .collect()
+    diagnostics(src, Severity::Warning)
 }
 
 const POINT: &str = "class Point(x: Int, y: Int = 0)\n";
@@ -2291,21 +2287,6 @@ fn braces_in_a_con_string_are_plain_text() {
     );
 }
 
-fn errors(src: &str) -> Vec<String> {
-    let report = run_source(
-        "test.check",
-        src,
-        &mut Cursor::new(Vec::new()),
-        &mut Vec::new(),
-    );
-    report
-        .diagnostics
-        .iter()
-        .filter(|d| d.severity == Severity::Error)
-        .map(|d| d.code.to_string())
-        .collect()
-}
-
 #[test]
 fn a_body_is_braces_or_an_arrow_and_one_line() {
     for (src, expected) in [
@@ -2376,8 +2357,8 @@ fn an_arrow_line_means_that_line_in_braces() {
             "func bump() { n += 1 }\nbump()",
         ),
         (
-            "let add = func() => n += 1\nadd()",
-            "let add = func() { n += 1 }\nadd()",
+            "n = [1, 2].map(func(x) => x * 10)[1] ?? 0",
+            "n = [1, 2].map(func(x) { x * 10 })[1] ?? 0",
         ),
         ("func f() => let x = 1\nf()", "func f() { let x = 1 }\nf()"),
     ] {
@@ -2392,12 +2373,16 @@ fn an_arrow_line_means_that_line_in_braces() {
         first_error("match 1 {\n  1 => print(1); print(2)\n  _ => print(3)\n}"),
         "unexpected_token"
     );
+    assert_eq!(output("let f = func(x: Int) => x * 2; print(f(1))"), "2");
 }
 
 #[test]
 fn bad_arms_are_reported_and_parsing_goes_on() {
     assert_eq!(
-        errors("match 1 {\n  1 => { print(1) }\n  2 => { print(2) }\n  _ => print(3)\n}"),
+        diagnostics(
+            "match 1 {\n  1 => { print(1) }\n  2 => { print(2) }\n  _ => print(3)\n}",
+            Severity::Error
+        ),
         ["arrow_before_braces", "arrow_before_braces"]
     );
 }
@@ -2452,11 +2437,22 @@ match [1, 2, 3] {
             "let m: Int? = Some(1)\nif m is Some(v) { v = 2 }",
             "assign_to_let",
         ),
+        (
+            "enum C { Red, Blue }\nmatch C.Red { var Red => print(1), _ => print(2) }",
+            "unexpected_token",
+        ),
+        (
+            "let m: Int? = None\nmatch m { var None => print(1), _ => print(2) }",
+            "unexpected_token",
+        ),
     ] {
         assert_eq!(first_error(src), code, "{src}");
     }
-    assert_eq!(
-        warnings("let m: Int? = Some(1)\nif m is Some(var v) { print(v) }"),
-        ["unused_var"]
-    );
+    for unchanged in [
+        "let m: Int? = Some(1)\nif m is Some(var v) { print(v) }",
+        "let m: Int? = Some(1)\nmatch m {\n  Some(var v) => print(v)\n  None => print(0)\n}",
+        "for var x in [1] { print(x) }",
+    ] {
+        assert_eq!(warnings(unchanged), ["unused_var"], "{unchanged}");
+    }
 }
