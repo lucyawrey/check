@@ -90,23 +90,37 @@ impl Data {
             }
             ExprKind::Record(args) => named(None, args, diags),
             ExprKind::Name(n) if n == "None" => Data::None,
-            ExprKind::Name(n) | ExprKind::Field(_, n) => Data::Named {
-                name: Some(n.clone()),
-                is_variant: true,
-                field_names: None,
-                fields: Vec::new(),
+            ExprKind::Name(_) | ExprKind::Field(..) => match type_name(e) {
+                Some(n) => Data::Named {
+                    name: Some(n.clone()),
+                    is_variant: true,
+                    field_names: None,
+                    fields: Vec::new(),
+                },
+                None => code(e, diags),
             },
             ExprKind::Call(callee, args) => match (&callee.kind, args.as_slice()) {
                 (ExprKind::Name(n), [arg]) if n == "Some" && arg.name.is_none() => {
                     Data::Some(Box::new(read(&arg.value)))
                 }
-                (ExprKind::Name(n), [arg]) if n == "Set" && arg.name.is_none() => read(&arg.value),
-                (ExprKind::Name(n) | ExprKind::Field(_, n), _) => {
-                    named(Some(n.clone()), args, diags)
+                (ExprKind::Name(n), [arg])
+                    if n == "Set"
+                        && arg.name.is_none()
+                        && matches!(arg.value.kind, ExprKind::List(_)) =>
+                {
+                    read(&arg.value)
                 }
-                _ => code(e, diags),
+                _ => match type_name(callee) {
+                    Some(n) if n != "Set" => named(Some(n.clone()), args, diags),
+                    _ => code(e, diags),
+                },
             },
-            ExprKind::Method(_, n, args) => named(Some(n.clone()), args, diags),
+            ExprKind::Method(base, n, args)
+                if is_type_name(n)
+                    && matches!(&base.kind, ExprKind::Name(t) if is_type_name(t)) =>
+            {
+                named(Some(n.clone()), args, diags)
+            }
             _ => code(e, diags),
         }
     }
@@ -123,12 +137,29 @@ fn named(name: Option<String>, args: &[Arg], diags: &mut Vec<Diagnostic>) -> Dat
     Data::Named {
         name,
         is_variant: false,
-        field_names: names.filter(|n| !n.is_empty()),
+        field_names: names,
         fields: args
             .iter()
             .map(|a| Data::from_expr(&a.value, diags))
             .collect(),
     }
+}
+
+/// A class or variant named as a literal can: `Name`, or `Type.Variant`.
+fn type_name(e: &Expr) -> Option<&String> {
+    match &e.kind {
+        ExprKind::Name(n) if is_type_name(n) => Some(n),
+        ExprKind::Field(base, n)
+            if is_type_name(n) && matches!(&base.kind, ExprKind::Name(t) if is_type_name(t)) =>
+        {
+            Some(n)
+        }
+        _ => None,
+    }
+}
+
+fn is_type_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_uppercase())
 }
 
 fn code(e: &Expr, diags: &mut Vec<Diagnostic>) -> Data {
