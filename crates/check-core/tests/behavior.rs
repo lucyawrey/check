@@ -2236,3 +2236,9 @@ fn a_data_file_can_hold_a_map() {
         "Some(2)"
     );
 }
+
+#[test]
+fn replace_changes_every_match_unless_given_a_count() {
+    let src = "print(\"a-b-c\".replace(\"-\", \"+\"))\nprint(\"a-b-c\".replace(\"-\", \"+\", 1))\nprint(\"a-b-c\".replace(\"-\", \"+\", count = 0))";
+    assert_eq!(output(src), "a+b+c\na+b-c\na-b-c");
+}
