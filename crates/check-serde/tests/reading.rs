@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use check_core::modules::MemFiles;
-use check_serde::{Error, from_str};
+use check_serde::{Error, from_str, from_str_with_class};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
@@ -143,6 +143,26 @@ size = (4, 2)";
 fn any_file_name_works() {
     let place: Place = read("my-place.con", "title = \"A\"", "place.Place").unwrap();
     assert_eq!(place.title, "A");
+}
+
+#[test]
+fn reports_the_class_a_file_is_written_as() {
+    let files = MemFiles(HashMap::from([("place/place.check".into(), SCHEMA.into())]));
+    let class = |text| {
+        from_str_with_class::<Place>(&files, "place/", "place", "a.con", text, "place.Place")
+            .unwrap()
+            .1
+    };
+    assert_eq!(
+        class("Place(title = \"A\")").as_deref(),
+        Some("place.Place")
+    );
+    assert_eq!(
+        class("place.Place(title = \"A\")").as_deref(),
+        Some("place.Place")
+    );
+    assert_eq!(class("(title = \"A\")"), None);
+    assert_eq!(class("title = \"A\""), None);
 }
 
 #[test]

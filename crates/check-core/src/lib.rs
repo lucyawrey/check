@@ -71,6 +71,8 @@ fn check_loaded(loaded: Loaded) -> Checked {
 
 /// Reads the `.con` file at `path`, with contents `text`, as the const `name` of type
 /// `expected_type`, which is named as code importing the unit at `schema` in `files` names it.
+/// Also returns the class the file's value is written as, resolved (`place.Place` for
+/// `Place(...)`), or `None` when it's a plain record or other value.
 pub fn check_data(
     files: &dyn Files,
     schema: &str,
@@ -78,8 +80,8 @@ pub fn check_data(
     path: &str,
     text: &str,
     expected_type: &str,
-) -> Result<value::Value, Report> {
-    let (loaded, id) = modules::load_data(files, schema, name, path, text, expected_type);
+) -> Result<(value::Value, Option<String>), Report> {
+    let (loaded, id, is_call) = modules::load_data(files, schema, name, path, text, expected_type);
     let Checked {
         program,
         library,
@@ -95,12 +97,18 @@ pub fn check_data(
             sources,
         });
     }
-    interp::eval_data(&program, &library, &info, id).map_err(|p| Report {
+    // A plain record also resolves as a construct of the expected class.
+    let class = match info.resolved.get(&id) {
+        Some(checker::Resolved::Construct(class)) if is_call => Some(class.clone()),
+        _ => None,
+    };
+    let value = interp::eval_data(&program, &library, &info, id).map_err(|p| Report {
         outcome: Outcome::Panicked(p.code),
         panic_text: Some(panic_text(&p, &sources)),
         diagnostics,
         sources,
-    })
+    })?;
+    Ok((value, class))
 }
 
 fn one_file(path: &str, src: &str) -> MemFiles {
