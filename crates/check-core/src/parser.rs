@@ -1440,12 +1440,30 @@ impl Parser<'_> {
                 return Ok(self.expr_node(span, ExprKind::Record(args)));
             }
             Tok::Sym("[") => {
+                if self.eat_sym("=") {
+                    let end = self.expect_sym("]")?;
+                    return Ok(self.expr_node(span.to(end), ExprKind::Map(Vec::new())));
+                }
                 let mut items = Vec::new();
+                let mut entries = Vec::new();
                 let end = self.list_items("]", |p| {
-                    items.push(p.expr()?);
+                    let item = p.expr()?;
+                    if p.is_sym("=") && items.is_empty() {
+                        p.advance();
+                        entries.push((item, p.expr()?));
+                    } else if entries.is_empty() {
+                        items.push(item);
+                    } else {
+                        return p.error(Code::unexpected_token, item.span);
+                    }
                     Ok(())
                 })?;
-                return Ok(self.expr_node(span.to(end), ExprKind::List(items)));
+                let kind = if entries.is_empty() {
+                    ExprKind::List(items)
+                } else {
+                    ExprKind::Map(entries)
+                };
+                return Ok(self.expr_node(span.to(end), kind));
             }
             Tok::Sym("{") => {
                 self.pos -= 1;

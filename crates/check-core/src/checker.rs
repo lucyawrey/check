@@ -227,9 +227,13 @@ pub struct Checker<'s> {
 }
 
 pub(crate) const RESERVED_NAMES: &[&str] = &["Maybe", "Some", "None", "Result", "Ok", "Err"];
-const MUTATING: &[&str] = &["push", "pop", "removeAt"];
+const MUTATING: &[&str] = &["push", "pop", "removeAt", "add", "remove"];
 pub(crate) const BUILT_IN_TYPES: &[&str] = &["String", "Int", "Float", "Bool"];
 pub(crate) const MAYBE: &str = "check.std.Maybe";
+pub(crate) const MAP: &str = "Map";
+pub(crate) const SET: &str = "Set";
+/// The bound a map key or set item's type needs; not a real interface.
+const KEY: &str = "check.std.Key";
 pub(crate) const RESULT: &str = "check.std.Result";
 pub(crate) const PRINTABLE: &str = "check.std.Printable";
 pub(crate) const EQ: &str = "check.std.Eq";
@@ -288,7 +292,10 @@ impl Checker<'_> {
                 Stmt::Interface(i) => (&i.name, i.span, &i.type_params),
                 _ => continue,
             };
-            if RESERVED_NAMES.contains(&name.as_str()) || BUILT_IN_TYPES.contains(&name.as_str()) {
+            if RESERVED_NAMES.contains(&name.as_str())
+                || BUILT_IN_TYPES.contains(&name.as_str())
+                || [MAP, SET].contains(&name.as_str())
+            {
                 self.error(Code::redefined_builtin, span);
             } else if !self.type_names.insert(name.clone()) {
                 self.error(Code::duplicate_name, span);
@@ -796,6 +803,9 @@ impl Checker<'_> {
                 None
             }
             ExprKind::List(items) => items.iter().find_map(|x| self.non_literal(x)),
+            ExprKind::Map(entries) => entries
+                .iter()
+                .find_map(|(k, v)| self.non_literal(k).or_else(|| self.non_literal(v))),
             ExprKind::Record(a) => args(a),
             ExprKind::Call(callee, a)
                 if made || matches!(&callee.kind, ExprKind::Name(n) if n == "Some") =>
@@ -817,6 +827,10 @@ impl Checker<'_> {
                 StrSeg::Text(_) => None,
             }),
             ExprKind::List(items) => items.iter().find_map(|x| self.non_constant(x, owner)),
+            ExprKind::Map(entries) => entries.iter().find_map(|(k, v)| {
+                self.non_constant(k, owner)
+                    .or_else(|| self.non_constant(v, owner))
+            }),
             ExprKind::Unary(op, x) if *op != UnOp::Try => self.non_constant(x, owner),
             ExprKind::Binary(_, a, b) => self
                 .non_constant(a, owner)
@@ -857,6 +871,10 @@ impl Checker<'_> {
                 let args: Vec<Ty> = args.iter().map(|a| self.type_from(a)).collect();
                 match (name.as_str(), args.as_slice()) {
                     ("List", [elem]) => Ty::list(elem.clone()),
+                    (MAP, [k, _]) | (SET, [k]) => {
+                        self.require_key(k, *span);
+                        Ty::Named(name.clone(), args)
+                    }
                     (MAYBE, [inner]) => Ty::maybe(inner.clone()),
                     _ if !self.type_names.contains(name) => self.error(Code::unknown_name, *span),
                     _ if self.generics.get(name).map_or(0, Vec::len) != args.len() => {
@@ -1049,14 +1067,20 @@ impl Checker<'_> {
         let mut reported = HashSet::new();
         for (ty, bound, span) in self.pending_bounds.split_off(from) {
             let ty = self.resolve(&ty);
+            let is_key = bound == Some(Ty::named(KEY));
             if matches!(ty, Ty::Var(_)) {
-                if reported.insert(span.start) {
+                // An empty map or set whose types are never used, like an empty list.
+                if !is_key && reported.insert(span.start) {
                     self.error(Code::type_needed, span);
                 }
             } else if let Some(bound) = bound
                 && !self.implements(&ty, &bound)
             {
-                self.error(Code::unmet_constraint, span);
+                if !is_key {
+                    self.error(Code::unmet_constraint, span);
+                } else if reported.insert(span.start) {
+                    self.error(Code::invalid_key_type, span);
+                }
             }
         }
     }
@@ -1125,8 +1149,11 @@ impl Checker<'_> {
         let Ty::Named(want, want_args) = self.subst.shallow(iface) else {
             return false;
         };
-        // Every type `==` works on is `Eq`; a `ref class` has to say so.
         let ty = self.subst.shallow(ty);
+        if want == KEY {
+            return self.is_key(&ty, &mut HashSet::new());
+        }
+        // Every type `==` works on is `Eq`; a `ref class` has to say so.
         if want == EQ
             && !matches!(ty, Ty::Param(_))
             && !self.is_interface(&ty)
@@ -1601,8 +1628,15 @@ impl Checker<'_> {
             }
             ExprKind::Index(list, index) => {
                 let (lt, base_err) = self.place(list);
-                let it = self.expr(index, Some(&Ty::Int));
-                self.expect(index, &it, &Ty::Int);
+                let (key, value) = match self.subst.shallow(&lt) {
+                    Ty::Named(n, mut a) if n == MAP => (a.remove(0), Some(a.remove(0))),
+                    _ => (Ty::Int, None),
+                };
+                let it = self.expr(index, Some(&key));
+                self.expect(index, &it, &key);
+                if let Some(value) = value {
+                    return (value, base_err);
+                }
                 match self.subst.shallow(&lt) {
                     Ty::List(elem) => (*elem, base_err),
                     Ty::Error => (Ty::Error, None),
@@ -1724,23 +1758,75 @@ impl Checker<'_> {
             Ty::List(inner) | Ty::Maybe(inner) => self.holds_ref(inner, seen),
             Ty::Param(_) => !self.implements(&ty, &Ty::named(EQ)),
             Ty::Named(..) if self.is_interface(&ty) => !self.implements(&ty, &Ty::named(EQ)),
+            Ty::Named(name, args) if name == MAP || name == SET => {
+                args.iter().any(|a| self.holds_ref(a, seen))
+            }
             Ty::Named(name, args) if seen.insert(Show(&self.resolve(&ty)).to_string()) => {
-                let map = self.args_map(name, args);
                 if self.is_ref_class(&ty) && !self.implements(&ty, &Ty::named(EQ)) {
                     return true;
                 }
-                let fields: Vec<Ty> = match self.types.get(name) {
-                    Some(TypeDef::Class(c)) => {
-                        c.fields.iter().map(|f| f.ty.substitute(&map)).collect()
-                    }
-                    Some(TypeDef::Enum(vs)) => vs
-                        .iter()
-                        .flat_map(|v| v.fields.iter().map(|f| f.ty.substitute(&map)))
-                        .collect(),
-                    None => Vec::new(),
-                };
+                let fields = self.field_types(name, args);
                 fields.iter().any(|f| self.holds_ref(f, seen))
             }
+            _ => false,
+        }
+    }
+
+    /// The types of a class's fields, or of all an enum's variant fields.
+    fn field_types(&self, name: &str, args: &[Ty]) -> Vec<Ty> {
+        let map = self.args_map(name, args);
+        match self.types.get(name) {
+            Some(TypeDef::Class(c)) => c.fields.iter().map(|f| f.ty.substitute(&map)).collect(),
+            Some(TypeDef::Enum(vs)) => vs
+                .iter()
+                .flat_map(|v| v.fields.iter().map(|f| f.ty.substitute(&map)))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether `ty` can be a map key or set item: its `==` is exact, so no `Float`,
+    /// function, collection or shared value anywhere inside it.
+    fn is_key(&mut self, ty: &Ty, seen: &mut HashSet<String>) -> bool {
+        let ty = self.subst.shallow(ty);
+        match &ty {
+            Ty::Int | Ty::Str | Ty::Bool | Ty::Error => true,
+            Ty::Param(p) => self
+                .bounds
+                .get(p)
+                .is_some_and(|b| b.contains(&Ty::named(KEY))),
+            Ty::Record(_, fields) => fields.iter().all(|f| self.is_key(f, seen)),
+            Ty::Named(name, _) if name == MAP || name == SET => false,
+            Ty::Named(..) if self.is_interface(&ty) || self.is_ref_class(&ty) => false,
+            Ty::Named(name, args) => {
+                if !seen.insert(Show(&self.resolve(&ty)).to_string()) {
+                    return true;
+                }
+                let fields = self.field_types(name, args);
+                fields.iter().all(|f| self.is_key(f, seen))
+            }
+            _ => false,
+        }
+    }
+
+    /// Checks `ty` can be a key once inference is done. A type parameter gets the
+    /// requirement as a bound, checked where a call fills it in.
+    fn require_key(&mut self, ty: &Ty, span: Span) {
+        if let Ty::Param(p) = self.subst.shallow(ty) {
+            let bounds = self.bounds.entry(p).or_default();
+            if !bounds.contains(&Ty::named(KEY)) {
+                bounds.push(Ty::named(KEY));
+            }
+        } else {
+            self.pending_bounds
+                .push((ty.clone(), Some(Ty::named(KEY)), span));
+        }
+    }
+
+    fn is_collection(&self, ty: &Ty) -> bool {
+        match self.subst.shallow(ty) {
+            Ty::List(_) => true,
+            Ty::Named(n, _) => n == MAP || n == SET,
             _ => false,
         }
     }
@@ -1859,11 +1945,7 @@ impl Checker<'_> {
                 self.finish_scope();
             }
             ExprKind::If(cond, then, otherwise) => {
-                let c = self.expr(cond, Some(&Ty::Bool));
-                self.expect(cond, &c, &Ty::Bool);
-                self.push_bindings(self.exports(cond));
-                self.unused(then);
-                self.scopes.pop();
+                self.then_branch(cond, then, |c| c.unused(then));
                 if let Some(other) = otherwise {
                     self.unused(other);
                 }
@@ -1931,6 +2013,27 @@ impl Checker<'_> {
                     }
                 }
                 Ty::list(elem)
+            }
+            ExprKind::Map(entries) => {
+                let expected = match expected.map(|e| self.subst.shallow(e)) {
+                    Some(Ty::Maybe(inner)) => Some(self.subst.shallow(&inner)),
+                    e => e,
+                };
+                let (key, value) = match expected {
+                    Some(Ty::Named(n, mut a)) if n == MAP => (a.remove(0), a.remove(0)),
+                    _ => {
+                        let key = self.subst.fresh();
+                        self.require_key(&key, expr.span);
+                        (key, self.subst.fresh())
+                    }
+                };
+                for (k, v) in entries {
+                    let kt = self.expr(k, Some(&key));
+                    self.expect(k, &kt, &key);
+                    let vt = self.expr(v, Some(&value));
+                    self.expect(v, &vt, &value);
+                }
+                Ty::Named(MAP.to_string(), vec![key, value])
             }
             ExprKind::Record(args) => self.record_literal(expr, args, expected),
             ExprKind::Spread(inner) => {
@@ -2602,6 +2705,18 @@ impl Checker<'_> {
                     let t = self.expr(&args[0].value, inner.as_ref());
                     return Ty::maybe(t);
                 }
+                SET => {
+                    let item = match expected.map(|e| self.subst.shallow(e)) {
+                        Some(Ty::Named(n, mut a)) if n == SET => a.remove(0),
+                        _ => {
+                            let item = self.subst.fresh();
+                            self.require_key(&item, span);
+                            item
+                        }
+                    };
+                    self.args_of(args, span, &[Ty::list(item.clone())]);
+                    return Ty::Named(SET.to_string(), vec![item]);
+                }
                 "same" => {
                     if args.len() != 2 {
                         return self.error(Code::wrong_arguments, span);
@@ -2819,12 +2934,12 @@ impl Checker<'_> {
         let recv_ty = if MUTATING.contains(&name) && is_place {
             let (t, err) = self.place(recv);
             if let Some(code) = err
-                && matches!(self.subst.shallow(&t), Ty::List(_))
+                && self.is_collection(&t)
             {
                 let code = if code == Code::readonly_field {
                     code
                 } else {
-                    Code::change_let_list
+                    Code::change_let_collection
                 };
                 self.error(code, recv.span);
             }
@@ -2852,6 +2967,10 @@ impl Checker<'_> {
             }
         }
         match recv_ty {
+            Ty::Named(n, targs) if n == MAP => self.map_method(targs, name, args, span),
+            Ty::Named(n, mut targs) if n == SET => {
+                self.set_method(targs.remove(0), name, args, span)
+            }
             Ty::Named(n, mut targs) if n == RESULT => match name {
                 "orPanic" => {
                     if !args.is_empty() {
@@ -2905,6 +3024,59 @@ impl Checker<'_> {
         }
     }
 
+    fn map_method(&mut self, targs: Vec<Ty>, name: &str, args: &[Arg], span: Span) -> Ty {
+        let (key, value) = (targs[0].clone(), targs[1].clone());
+        match name {
+            "contains" => {
+                self.args_of(args, span, &[key]);
+                Ty::Bool
+            }
+            "remove" => {
+                self.args_of(args, span, &[key]);
+                Ty::maybe(value)
+            }
+            "keys" => {
+                self.args_of(args, span, &[]);
+                Ty::list(key)
+            }
+            "values" => {
+                self.args_of(args, span, &[]);
+                Ty::list(value)
+            }
+            "length" => {
+                self.args_of(args, span, &[]);
+                Ty::Int
+            }
+            "isEmpty" => {
+                self.args_of(args, span, &[]);
+                Ty::Bool
+            }
+            _ => self.unknown_method(args, span),
+        }
+    }
+
+    fn set_method(&mut self, item: Ty, name: &str, args: &[Arg], span: Span) -> Ty {
+        match name {
+            "add" => {
+                self.args_of(args, span, &[item]);
+                Ty::Void
+            }
+            "remove" | "contains" => {
+                self.args_of(args, span, &[item]);
+                Ty::Bool
+            }
+            "length" => {
+                self.args_of(args, span, &[]);
+                Ty::Int
+            }
+            "isEmpty" => {
+                self.args_of(args, span, &[]);
+                Ty::Bool
+            }
+            _ => self.unknown_method(args, span),
+        }
+    }
+
     /// Checks the arguments anyway, so their own errors show too.
     fn unknown_method(&mut self, args: &[Arg], span: Span) -> Ty {
         for a in args {
@@ -2943,6 +3115,10 @@ impl Checker<'_> {
                 self.args_of(args, span, &[]);
                 Ty::Range
             }
+            "enumerate" => {
+                self.args_of(args, span, &[]);
+                Ty::list(Ty::Record(Vec::new(), vec![Ty::Int, elem]))
+            }
             "join" => {
                 if !self.subst.unify(&elem, &Ty::Str) {
                     return self.unknown_method(args, span);
@@ -2969,10 +3145,16 @@ impl Checker<'_> {
 
     fn index(&mut self, id: NodeId, list: &Expr, index: &Expr, span: Span) -> Ty {
         let lt = self.expr(list, None);
-        let it = self.expr(index, Some(&Ty::Int));
-        self.expect(index, &it, &Ty::Int);
-        let elem = match self.subst.shallow(&lt) {
+        let lt = self.subst.shallow(&lt);
+        let key = match &lt {
+            Ty::Named(n, a) if n == MAP => a[0].clone(),
+            _ => Ty::Int,
+        };
+        let it = self.expr(index, Some(&key));
+        self.expect(index, &it, &key);
+        let elem = match lt {
             Ty::List(e) => *e,
+            Ty::Named(n, mut a) if n == MAP => a.remove(1),
             Ty::Error => return Ty::Error,
             Ty::Var(_) => return self.error(Code::type_needed, list.span),
             _ => return self.error(Code::invalid_operand_types, span),
@@ -3052,11 +3234,7 @@ impl Checker<'_> {
         otherwise: Option<&Expr>,
         expected: Option<&Ty>,
     ) -> Ty {
-        let c = self.expr(cond, Some(&Ty::Bool));
-        self.expect(cond, &c, &Ty::Bool);
-        self.push_bindings(self.exports(cond));
-        let tt = self.expr(then, expected);
-        self.scopes.pop();
+        let tt = self.then_branch(cond, then, |c| c.expr(then, expected));
         match otherwise {
             Some(other) => {
                 let ot = self.expr(other, expected);
@@ -3067,6 +3245,43 @@ impl Checker<'_> {
             }
             None => self.optional_value(expr, tt),
         }
+    }
+
+    /// Checks an `if`'s condition, then runs `f` on its `then` branch with what the
+    /// condition binds and narrows.
+    fn then_branch<T>(&mut self, cond: &Expr, then: &Expr, f: impl FnOnce(&mut Self) -> T) -> T {
+        let c = self.expr(cond, Some(&Ty::Bool));
+        self.expect(cond, &c, &Ty::Bool);
+        self.push_bindings(self.exports(cond));
+        let narrowed = self.contains_check(cond, then);
+        if let Some(n) = &narrowed {
+            self.narrowed.push(n.clone());
+        }
+        let t = f(self);
+        if narrowed.is_some() {
+            self.narrowed.pop();
+        }
+        self.scopes.pop();
+        t
+    }
+
+    /// The map and key that `if m.contains(k)` narrows `m[k]` for in `then`, when neither
+    /// changes there.
+    fn contains_check(&self, cond: &Expr, then: &Expr) -> Option<(String, String)> {
+        let ExprKind::Method(recv, method, args) = &cond.kind else {
+            return None;
+        };
+        let (ExprKind::Name(m), [arg]) = (&recv.kind, args.as_slice()) else {
+            return None;
+        };
+        let ExprKind::Name(k) = &arg.value.kind else {
+            return None;
+        };
+        let is_map = self
+            .lookup(m)
+            .is_some_and(|v| matches!(self.subst.shallow(&v.ty), Ty::Named(n, _) if n == MAP));
+        (method == "contains" && is_map && !mutates(then, m) && !mutates(then, k))
+            .then(|| (m.clone(), k.clone()))
     }
 
     fn match_expr(
@@ -3623,6 +3838,8 @@ impl Checker<'_> {
         let elem = match self.subst.shallow(&it) {
             Ty::Range => Ty::Int,
             Ty::List(e) => *e,
+            Ty::Named(n, a) if n == MAP => Ty::Record(Vec::new(), a),
+            Ty::Named(n, mut a) if n == SET => a.remove(0),
             Ty::Error => Ty::Error,
             _ => self.error(Code::not_iterable, iter.span),
         };
@@ -3706,6 +3923,9 @@ fn mutates(expr: &Expr, list: &str) -> bool {
             .iter()
             .any(|s| matches!(s, StrSeg::Expr(e) if mutates(e, list))),
         ExprKind::List(items) => items.iter().any(|e| mutates(e, list)),
+        ExprKind::Map(entries) => entries
+            .iter()
+            .any(|(k, v)| mutates(k, list) || mutates(v, list)),
         ExprKind::Record(args) => args.iter().any(|a| mutates(&a.value, list)),
         ExprKind::Unary(_, e)
         | ExprKind::Loop(e)
