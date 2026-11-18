@@ -1,0 +1,9 @@
+5
+-4
+'x' isn't a number.
+Unknown command 'mul'.
+Type a command.
+Ok(-3)
+Err(UnknownCommand(name = "half"))
+2
+Some(7)

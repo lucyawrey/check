@@ -61,7 +61,7 @@ pub fn check_program(entry: &str, files: &dyn Files, allow_private: bool) -> Che
     {
         return checked;
     }
-    let (info, check_diags) = checker::check(&checked.program, &checked.library);
+    let (info, check_diags) = checker::check(&checked.program, &checked.library, &checked.sources);
     checked.info = info;
     checked.diagnostics.extend(check_diags);
     checked
@@ -103,9 +103,13 @@ pub fn run_program(
     } else {
         match interp::run(&program, &library, &info, input, output) {
             Ok(None) => (Outcome::Finished, None),
-            Ok(Some(span)) => {
+            Ok(Some((span, err))) => {
                 let (path, line, col, _) = sources.locate(span.start);
-                let text = format!("{} at {path}:{line}:{col}\n", Code::try_stopped.message());
+                let err = err.map(|e| format!(": {e}")).unwrap_or_default();
+                let text = format!(
+                    "{}{err} at {path}:{line}:{col}\n",
+                    Code::try_stopped.message()
+                );
                 (Outcome::Stopped, Some(text))
             }
             Err(p) => {

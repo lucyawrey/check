@@ -5,7 +5,7 @@ use std::io::{BufRead, Write};
 use std::rc::Rc;
 
 use crate::ast::*;
-use crate::checker::{EQ, Info, PRINTABLE, Resolved};
+use crate::checker::{EQ, Info, PRINTABLE, RESULT, Resolved};
 use crate::diag::{Code, Span};
 use crate::host::{self, Io};
 use crate::value::{Callable, Record, Value};
@@ -21,7 +21,8 @@ pub enum Flow {
     Break(Value),
     Continue,
     Return(Value),
-    Stop(Span),
+    /// A top-level `try` found `None`, or an `Err` with this text.
+    Stop(Span, Option<String>),
     Panic(Panic),
 }
 
@@ -67,7 +68,7 @@ pub fn run(
     info: &Info,
     input: &mut dyn BufRead,
     output: &mut dyn Write,
-) -> Result<Option<Span>, Panic> {
+) -> Result<Option<(Span, Option<String>)>, Panic> {
     let mut interp = Interpreter {
         info,
         funcs: HashMap::new(),
@@ -131,7 +132,7 @@ pub fn run(
         match interp.stmt(stmt) {
             Ok(_) => {}
             Err(Flow::Panic(p)) => return Err(p),
-            Err(Flow::Stop(span)) => return Ok(Some(span)),
+            Err(Flow::Stop(span, err)) => return Ok(Some((span, err))),
             Err(_) => {}
         }
     }
@@ -157,8 +158,21 @@ fn coerce(info: &Info, id: NodeId, mut value: Value) -> Value {
         for _ in 0..c.wraps {
             value = Value::Some(Rc::new(value));
         }
+        if c.ok {
+            value = result_variant("Ok", value);
+        }
     }
     value
+}
+
+fn result_variant(name: &str, value: Value) -> Value {
+    Value::Variant(Rc::new(Record {
+        name: name.into(),
+        ty: RESULT.into(),
+        by_fields: false,
+        field_names: None,
+        fields: vec![value],
+    }))
 }
 
 fn descend<'s>(v: &mut Value, steps: &'s [Step], f: Writer) -> Descent<'s> {
@@ -765,7 +779,13 @@ impl Interpreter<'_> {
                     (UnOp::BitNot, Value::Int(n)) => Ok(Value::Int(!n)),
                     (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                     (UnOp::Try, Value::Some(v)) => Ok((*v).clone()),
-                    (UnOp::Try, _) if self.frames.len() == 1 => Err(Flow::Stop(expr.span)),
+                    (UnOp::Try, Value::Variant(r)) if &*r.name == "Ok" => Ok(r.fields[0].clone()),
+                    (UnOp::Try, Value::Variant(r)) if self.frames.len() == 1 => {
+                        let text = self.text(&r.fields[0], false, expr.span)?;
+                        Err(Flow::Stop(expr.span, Some(text)))
+                    }
+                    (UnOp::Try, v @ Value::Variant(_)) => Err(Flow::Return(v)),
+                    (UnOp::Try, _) if self.frames.len() == 1 => Err(Flow::Stop(expr.span, None)),
                     (UnOp::Try, _) => Err(Flow::Return(Value::None)),
                     (_, v) => Ok(v),
                 }
@@ -929,6 +949,7 @@ impl Interpreter<'_> {
             }
             BinOp::Coalesce => match self.expr(lhs)? {
                 Value::Some(v) => Ok((*v).clone()),
+                Value::Variant(r) if &*r.name == "Ok" => Ok(r.fields[0].clone()),
                 _ => self.expr(rhs),
             },
             _ => {
@@ -1218,6 +1239,31 @@ impl Interpreter<'_> {
                     reason,
                     stack: Vec::new(),
                 }));
+            }
+            (Value::Variant(r), "orPanic") if &*r.name == "Ok" => r.fields[0].clone(),
+            (Value::Variant(r), "orPanic") => {
+                let err = self.text(&r.fields[0], false, span)?;
+                let reason = match args.first() {
+                    Some(reason) => format!("{}: {err}", reason.display()),
+                    None => err,
+                };
+                return Err(Flow::Panic(Panic {
+                    code: Code::or_panic_on_err,
+                    span,
+                    reason: Some(reason),
+                    stack: Vec::new(),
+                }));
+            }
+            (Value::Variant(r), "ok") if &*r.name == "Ok" => {
+                Value::Some(Rc::new(r.fields[0].clone()))
+            }
+            (Value::Variant(_), "ok") => Value::None,
+            (v @ (Value::Some(_) | Value::None), "orErr") => {
+                let (name, field) = match v {
+                    Value::Some(v) => ("Ok", (*v).clone()),
+                    _ => ("Err", args.into_iter().next().unwrap_or(Value::Void)),
+                };
+                result_variant(name, field)
             }
             (v @ (Value::Some(_) | Value::None), "flatten") => {
                 let mut v = v;

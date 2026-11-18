@@ -76,7 +76,10 @@ codes! {
     doubled_maybe => "[a T? body where a plain T? is expected]",
     flatten_without_nesting => "[flatten() on a T? with nothing nested]",
     not_iterable => "[for over something that isn't a list or range]",
-    try_outside_maybe => "[try outside a function returning a Maybe]",
+    try_outside_failable => "[try outside a function returning a Maybe or a Result]",
+    try_result_in_maybe => "[try on a Result in a function returning a Maybe]",
+    try_maybe_in_result => "[try on a Maybe in a function returning a Result]",
+    try_error_mismatch => "[try on a Result whose error type differs from the function's]",
     assign_to_let => "[assigning to a let]",
     assign_to_parameter => "[assigning to a parameter not written var]",
     change_let_list => "[changing a let list]",
@@ -130,11 +133,12 @@ codes! {
     namespace_outside_package => "[a namespace that doesn't start with its package's]",
     misplaced_namespace => "[a namespace line that isn't the first line of the file]",
     external_outside_library => "[an external function outside a library package]",
-    try_stopped => "[a top-level try found no value, so the program stopped]",
+    try_stopped => "[a top-level try found None or an Err, so the program stopped]",
     panic_called => "[panic was called]",
     integer_overflow => "[integer overflow]",
     division_by_zero => "[integer division by zero]",
     or_panic_on_none => "[orPanic on a None]",
+    or_panic_on_err => "[orPanic on an Err]",
     negative_exponent => "[a negative exponent on an Int]",
     shift_out_of_range => "[a shift amount out of range]",
     round_out_of_range => "[rounding a Float that has no Int]",
@@ -237,6 +241,11 @@ impl Sources {
     pub fn file(&self, offset: usize) -> &Source {
         let i = self.files.partition_point(|f| f.base <= offset);
         &self.files[i.saturating_sub(1)]
+    }
+
+    pub fn text(&self, span: Span) -> &str {
+        let file = self.file(span.start);
+        &file.text[span.start - file.base..span.end - file.base]
     }
 
     pub fn locate(&self, offset: usize) -> (&str, usize, usize, &str) {

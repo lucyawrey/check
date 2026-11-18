@@ -154,6 +154,191 @@ fn a_top_level_try_on_none_stops_without_a_panic() {
     assert_eq!(String::from_utf8(out).expect("utf-8"), "before\n");
 }
 
+const PARSE: &str = "func parse(s: String) -> Result<Int, String> {\n    match Int.parse(s) { Some(n) => Ok(n), None => Err(\"bad {s}\") }\n}\n";
+
+fn with_parse(src: &str) -> String {
+    output(&format!("{PARSE}{src}"))
+}
+
+#[test]
+fn try_on_a_result_gives_the_ok_value_or_passes_the_err_up() {
+    let sum = "func sum(a: String, b: String) -> Result<Int, String> {\n    Ok(try parse(a) + try parse(b))\n}\n";
+    assert_eq!(
+        with_parse(&format!(
+            "{sum}print(sum(\"1\", \"2\"))\nprint(sum(\"1\", \"x\"))"
+        )),
+        "Ok(3)\nErr(\"bad x\")"
+    );
+}
+
+#[test]
+fn try_on_a_result_makes_an_inferred_return_type_a_result() {
+    let f = "func f(s: String) {\n    if s == \"\" { return 0 }\n    if s == \"-\" { return Err(\"dash\") }\n    try parse(s) + 1\n}\n";
+    assert_eq!(
+        with_parse(&format!(
+            "{f}print(f(\"1\"))\nprint(f(\"\"))\nprint(f(\"-\"))\nprint(f(\"x\"))"
+        )),
+        "Ok(2)\nOk(0)\nErr(\"dash\")\nErr(\"bad x\")"
+    );
+    let ends_in_result = "func g(s: String) {\n    try parse(s)\n    parse(s)\n}\nprint(g(\"2\"))";
+    assert_eq!(with_parse(ends_in_result), "Ok(2)");
+    assert_eq!(
+        with_parse(
+            "let h = func(s: String) { try parse(s) * 2 }\nprint(h(\"4\"))\nprint(h(\"x\"))"
+        ),
+        "Ok(8)\nErr(\"bad x\")"
+    );
+}
+
+#[test]
+fn a_variant_inside_ok_or_err_takes_its_enum_from_the_return_type() {
+    let src = "enum E { A, B }\nfunc f() -> Result<Int, E> { Err(A) }\nprint(f())";
+    assert_eq!(output(src), "Err(A)");
+}
+
+#[test]
+fn a_recursive_function_with_a_return_type_can_use_try() {
+    let f = "func f(n: Int) -> Result<Int, String> {\n    if n == 0 { return Ok(0) }\n    Ok(try f(n - 1) + try parse(\"2\"))\n}\nprint(f(3))";
+    assert_eq!(with_parse(f), "Ok(6)");
+}
+
+fn error_and_fix(src: &str) -> (String, Option<String>) {
+    let src = format!("{PARSE}{src}");
+    let report = run_source(
+        "test.check",
+        &src,
+        &mut Cursor::new(Vec::new()),
+        &mut Vec::new(),
+    );
+    let d = report
+        .diagnostics
+        .into_iter()
+        .find(|d| d.severity == Severity::Error)
+        .expect("an error");
+    (d.code.to_string(), d.detail)
+}
+
+#[test]
+fn try_mixing_maybe_and_result_suggests_a_conversion() {
+    assert_eq!(
+        error_and_fix("func f() -> Int? { try parse(\"1\") }"),
+        (
+            "try_result_in_maybe".into(),
+            Some("try parse(\"1\").ok()".into())
+        )
+    );
+    assert_eq!(
+        error_and_fix("func f() -> Result<Int, String> { Ok(try Int.parse(\"1\")) }"),
+        (
+            "try_maybe_in_result".into(),
+            Some("try Int.parse(\"1\").orErr(...)".into())
+        )
+    );
+    assert_eq!(
+        error_and_fix("func f() {\n    let a = try Int.parse(\"1\")\n    try parse(\"2\")\n}"),
+        (
+            "try_result_in_maybe".into(),
+            Some("try parse(\"2\").ok()".into())
+        )
+    );
+    let operator = "func f() -> Result<Int, String> {\n    let b = Some(Int.parse(\"1\"))\n    Ok(try (b ?? None))\n}";
+    assert_eq!(
+        error_and_fix(operator).1.as_deref(),
+        Some("try (b ?? None).orErr(...)")
+    );
+}
+
+#[test]
+fn try_needs_a_function_that_can_pass_its_failure_up() {
+    let mismatch = "func f() -> Result<Int, Int> { Ok(try parse(\"1\")) }";
+    assert_eq!(error_and_fix(mismatch).0, "try_error_mismatch");
+    let ends_in_other = "func f() {\n    try parse(\"1\")\n    Int.parse(\"1\").orErr(0)\n}";
+    assert_eq!(error_and_fix(ends_in_other).0, "try_error_mismatch");
+    assert_eq!(
+        error_and_fix("func f() -> Int { try parse(\"1\") }").0,
+        "try_outside_failable"
+    );
+    let class = "class C(n: Int)\nfunc f() -> C { C(try Int.parse(\"1\")) }";
+    assert_eq!(error_and_fix(class).0, "try_outside_failable");
+}
+
+#[test]
+fn a_top_level_try_on_an_err_stops_and_shows_the_error() {
+    let mut out = Vec::new();
+    let src = format!("{PARSE}let n = try parse(\"x\")\nprint(n)");
+    let report = run_source("test.check", &src, &mut Cursor::new(Vec::new()), &mut out);
+    assert!(matches!(report.outcome, Outcome::Stopped));
+    assert!(out.is_empty());
+    let text = report.panic_text.unwrap_or_default();
+    assert!(text.contains(": bad x at test.check:4:9"), "{text}");
+}
+
+#[test]
+fn coalesce_and_or_panic_work_on_a_result() {
+    assert_eq!(
+        with_parse("print(parse(\"3\") ?? panic(\"run\"))\nprint(parse(\"x\") ?? 0)"),
+        "3\n0"
+    );
+    panics_with(&format!("{PARSE}parse(\"x\").orPanic()"), "or_panic_on_err");
+}
+
+fn failure_text(src: &str) -> String {
+    let report = run_source(
+        "test.check",
+        src,
+        &mut Cursor::new(Vec::new()),
+        &mut Vec::new(),
+    );
+    report.panic_text.unwrap_or_default()
+}
+
+#[test]
+fn a_stop_or_or_panic_on_an_err_shows_the_error_through_to_string() {
+    let boom = "class Boom: Printable {\n    func toString() -> String { \"boom\" }\n}\nfunc f() -> Result<Int, Boom> { Err(Boom()) }\n";
+    let text = failure_text(&format!("{boom}f().orPanic(\"needed\")"));
+    assert!(text.contains(": needed: boom"), "{text}");
+    let text = failure_text(&format!("{boom}let n = try f()"));
+    assert!(text.contains(": boom at"), "{text}");
+}
+
+#[test]
+fn an_unknown_method_still_reports_errors_in_its_arguments() {
+    for recv in ["Int.parse(\"1\")", "[1]", "Ok(1)", "1", "true"] {
+        let src = format!("{recv}.foo(nowhere)");
+        let report = run_source(
+            "test.check",
+            &src,
+            &mut Cursor::new(Vec::new()),
+            &mut Vec::new(),
+        );
+        let codes: Vec<String> = report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.to_string())
+            .collect();
+        assert!(
+            codes.contains(&"unknown_method".to_string()),
+            "{src}: {codes:?}"
+        );
+        assert!(
+            codes.contains(&"unknown_name".to_string()),
+            "{src}: {codes:?}"
+        );
+    }
+}
+
+#[test]
+fn or_err_and_ok_convert_between_maybe_and_result() {
+    assert_eq!(
+        output("print(Int.parse(\"1\").orErr(\"no\"))\nprint(Int.parse(\"x\").orErr(\"no\"))"),
+        "Ok(1)\nErr(\"no\")"
+    );
+    assert_eq!(
+        with_parse("print(parse(\"1\").ok())\nprint(parse(\"x\").ok())"),
+        "Some(1)\nNone"
+    );
+}
+
 fn first_error(src: &str) -> String {
     let report = run_source(
         "test.check",

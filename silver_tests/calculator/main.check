@@ -1,0 +1,48 @@
+enum ParseError {
+  Empty
+  UnknownCommand(name: String)
+  NotANumber(text: String)
+}
+
+func parseNumber(text: String) -> Result<Int, ParseError> {
+  match Int.parse(text) {
+    Some(n) => Ok(n)
+    None => Err(NotANumber(text))
+  }
+}
+
+func evaluate(line: String) -> Result<Int, ParseError> {
+  match line.split() {
+    [] => Err(Empty)
+    ["add", a, b] => Ok(try parseNumber(a) + try parseNumber(b))
+    ["neg", a] => Ok(-(try parseNumber(a)))
+    [name, ..._] => Err(UnknownCommand(name))
+  }
+}
+
+func total(lines: String[]) {
+  var sum = 0
+  for line in lines {
+    sum += try evaluate(line)
+  }
+  sum
+}
+
+func describe(error: ParseError) -> String {
+  match error {
+    Empty => "Type a command."
+    UnknownCommand(name) => "Unknown command '{name}'."
+    NotANumber(text) => "'{text}' isn't a number."
+  }
+}
+
+for line in ["add 2 3", "neg 4", "add 1 x", "mul 2 2", ""] {
+  match evaluate(line) {
+    Ok(n) => print(n)
+    Err(e) => print(describe(e))
+  }
+}
+print(total(["add 1 1", "neg 5"]))
+print(total(["add 1 1", "half 5"]))
+print(evaluate("add 1 1") ?? 0)
+print(Int.parse("7").orErr(ParseError.Empty).ok())
