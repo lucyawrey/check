@@ -12,8 +12,8 @@ func main() {
         }
         print(replaced)
       }
-      Pause { try input("\npress enter to continue..."); print("") }
-      Input(key) { state[key] = try input("\n{key}: "); print("") }
+      Pause => try input("> ")
+      Input(key) => state[key] = try input("{key}: ")
     }
   }
 }

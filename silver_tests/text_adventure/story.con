@@ -4,11 +4,13 @@ Story([
   Pause
   Text("You awaken on soft grass, the sound of rushing water filling your ears.")
   Pause
-  Text("Your eyes are too heavy to open, but you hear footsteps approach. Someone, probably a young woman, speaks:")
+  Text("Your eyes are too heavy to open, but you hear footsteps approach. Someone, probably a young woman based on the voice, speaks:")
   Text("Ah, so you're awake? Good.")
+  Pause()
   Text("Can you tell me your name?")
+  Pause()
   Input("Name")
   Text("{Name}? A strange name, but it will do.")
   Pause()
-  Text("That's all for now!")
+  Text("\nThat's all for now!")
 ])

@@ -1,16 +1,9 @@
 Welcome to Awakening Quest! Check's premier for-testing-purposes only text adventure.
 I hope you have fun!
-
-press enter to continue...
-You awaken on soft grass, the sound of rushing water filling your ears.
-
-press enter to continue...
-Your eyes are too heavy to open, but you hear footsteps approach. Someone, probably a young woman, speaks:
+> You awaken on soft grass, the sound of rushing water filling your ears.
+> Your eyes are too heavy to open, but you hear footsteps approach. Someone, probably a young woman based on the voice, speaks:
 Ah, so you're awake? Good.
-Can you tell me your name?
-
-Name: 
-Azalea? A strange name, but it will do.
-
-press enter to continue...
+> Can you tell me your name?
+> Name: Azalea? A strange name, but it will do.
+> 
 That's all for now!
