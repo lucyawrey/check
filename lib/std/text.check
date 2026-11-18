@@ -5,5 +5,6 @@ implement String {
   external func isEmpty() -> Bool
   external func isBlank() -> Bool
   external func contains(text: String) -> Bool
+  external func replace(old: String, new: String, count: Int? = None) -> String
   external func split(separator: String? = None) -> List<String>
 }

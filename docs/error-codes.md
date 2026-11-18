@@ -45,7 +45,8 @@
 - `try_error_mismatch` `try` on a `Result` whose error type differs from the function's
 - `assign_to_let` assigning to a `let`
 - `assign_to_parameter` assigning to a parameter not written `var`
-- `change_let_list` changing a `let` list (`push`, `pop`, `removeAt`)
+- `change_let_collection` changing a `let` list, map or set (`push`, `pop`, `removeAt`, `add`, `remove`)
+- `invalid_key_type` a map key or set item whose type has no exact equality (`Float`, a function, a collection, a `ref class` or anything holding one)
 - `break_outside_loop` `break` or `continue` outside a loop
 - `return_outside_function` `return` outside a function
 - `loop_value_without_break` a `for`, `while` or `loop` used as a value with no `break` value
@@ -111,6 +112,7 @@
 - `round_out_of_range` rounding `NaN`, `Infinity` or a `Float` too big for an `Int`
 - `stack_overflow` more than 10,000 nested calls
 - `index_out_of_range` writing to a list index that doesn't exist (`list[9] = x`)
+- `missing_key` a compound assignment or nested write to a map key that isn't there (`m[k] += 1`)
 - `const_cycle` a `.conx` value that reaches itself through a function call while it's being built
 
 ## Warnings

@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::rc::Rc;
 
 use crate::ast::{Expr, FuncDecl, Param};
-use crate::checker::MAYBE;
+use crate::checker::{MAP, MAYBE, SET};
 
 pub enum Callable {
     Named(Rc<FuncDecl>, String),
@@ -87,6 +87,10 @@ pub enum Value {
     Bool(bool),
     Str(Rc<str>),
     List(Rc<Vec<Value>>),
+    /// Entries in insertion order.
+    Map(Rc<Vec<(Value, Value)>>),
+    /// Items in insertion order.
+    Set(Rc<Vec<Value>>),
     Some(Rc<Value>),
     None,
     Range(i64, i64, bool),
@@ -109,6 +113,10 @@ impl PartialEq for Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
+            (Value::Map(a), Value::Map(b)) => {
+                a.len() == b.len() && a.iter().all(|(k, v)| map_get(b, k) == Some(v))
+            }
+            (Value::Set(a), Value::Set(b)) => a.len() == b.len() && a.iter().all(|x| b.contains(x)),
             (Value::Some(a), Value::Some(b)) => a == b,
             (Value::None, Value::None) | (Value::Void, Value::Void) => true,
             (Value::Range(a, b, x), Value::Range(c, d, y)) => a == c && b == d && x == y,
@@ -160,6 +168,8 @@ impl Value {
             Value::Bool(_) => "Bool".into(),
             Value::Str(_) => "String".into(),
             Value::List(_) => "List".into(),
+            Value::Map(_) => MAP.into(),
+            Value::Set(_) => SET.into(),
             Value::Some(_) | Value::None => MAYBE.into(),
             Value::Shared(r) => r.borrow().ty.clone(),
             Value::Object(r) | Value::Variant(r) | Value::Record(r) => r.ty.clone(),
@@ -184,6 +194,11 @@ impl Value {
                 "[{}]",
                 items.iter().map(Value::code).collect::<Vec<_>>().join(", ")
             ),
+            Value::Map(entries) => map_code(entries.iter().map(|(k, v)| (k.code(), v.code()))),
+            Value::Set(items) => format!(
+                "Set([{}])",
+                items.iter().map(Value::code).collect::<Vec<_>>().join(", ")
+            ),
             Value::Some(v) => match &**v {
                 Value::Void => "Some()".to_string(),
                 inner => format!("Some({})", inner.code()),
@@ -204,6 +219,19 @@ impl Value {
             Value::Record(r) => r.code(true),
             Value::Void => String::new(),
         }
+    }
+}
+
+pub fn map_get<'m>(entries: &'m [(Value, Value)], key: &Value) -> Option<&'m Value> {
+    entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+pub fn map_code(entries: impl Iterator<Item = (String, String)>) -> String {
+    let parts: Vec<String> = entries.map(|(k, v)| format!("{k} = {v}")).collect();
+    if parts.is_empty() {
+        "[=]".to_string()
+    } else {
+        format!("[{}]", parts.join(", "))
     }
 }
 

@@ -266,6 +266,8 @@ pub enum ExprKind {
     Name(String),
     This,
     List(Vec<Expr>),
+    /// `[k = v, ...]`, or `[=]` with no entries.
+    Map(Vec<(Expr, Expr)>),
     Record(Vec<Arg>),
     Spread(Box<Expr>),
     Unary(UnOp, Box<Expr>),

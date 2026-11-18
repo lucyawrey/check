@@ -1,0 +1,20 @@
+var counts: Map<String, Int> = [=]
+var sizes: Set<Int> = Set([])
+loop {
+  let line = input() ?? break
+  for word in line.split() {
+    if counts.contains(word) {
+      counts[word] += 1
+    } else {
+      counts[word] = 1
+    }
+  }
+  sizes.add(line.split().length())
+}
+for (word, n) in counts {
+  print("{word}: {n}")
+}
+print(counts.length())
+print(counts["the"] ?? 0)
+print(counts.keys().filter(func(w) counts[w] ?? 0 > 1))
+print(sizes)

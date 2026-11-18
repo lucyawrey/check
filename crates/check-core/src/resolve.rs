@@ -681,6 +681,12 @@ impl Resolver<'_> {
                     self.expr(x);
                 }
             }
+            ExprKind::Map(entries) => {
+                for (k, v) in entries {
+                    self.expr(k);
+                    self.expr(v);
+                }
+            }
             ExprKind::Record(args) => self.args(args),
             ExprKind::Call(callee, args) => {
                 self.expr(callee);

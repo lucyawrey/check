@@ -1,0 +1,5 @@
+namespace text_adventure
+
+version = "0.0.1"
+entry = "main.check"
+imports = ["./..."]

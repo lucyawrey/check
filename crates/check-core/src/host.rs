@@ -34,6 +34,7 @@ pub const FUNCTIONS: &[(&str, HostFn)] = &[
         Ok(Value::Bool(text(&a[0]).contains(text(&a[1]))))
     }),
     ("String.split", split),
+    ("String.replace", replace),
     ("Int.toFloat", |_, a, _| match a[0] {
         Value::Int(n) => Ok(Value::Float(n as f64)),
         _ => Ok(Value::Void),
@@ -108,6 +109,21 @@ fn split(_: &mut Io, args: Vec<Value>, _: Span) -> Result<Value, Flow> {
         _ => s.split_whitespace().map(|p| Value::Str(p.into())).collect(),
     };
     Ok(Value::List(Rc::new(parts)))
+}
+
+/// A negative `count` replaces nothing.
+fn replace(_: &mut Io, args: Vec<Value>, _: Span) -> Result<Value, Flow> {
+    let (s, old, new) = (text(&args[0]), text(&args[1]), text(&args[2]));
+    Ok(Value::Str(
+        match &args[3] {
+            Value::Some(n) => match **n {
+                Value::Int(n) => s.replacen(old, new, usize::try_from(n).unwrap_or(0)),
+                _ => s.to_string(),
+            },
+            _ => s.replace(old, new),
+        }
+        .into(),
+    ))
 }
 
 fn to_int(v: &Value, round: fn(f64) -> f64, span: Span) -> Result<Value, Flow> {
