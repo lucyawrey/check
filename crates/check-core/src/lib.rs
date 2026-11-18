@@ -1,11 +1,9 @@
-pub mod ast;
+pub use check_syntax::{ast, diag, lexer, parser};
+
 pub mod checker;
-pub mod diag;
 pub mod host;
 pub mod interp;
-pub mod lexer;
 pub mod modules;
-pub mod parser;
 pub mod resolve;
 pub mod types;
 pub mod value;

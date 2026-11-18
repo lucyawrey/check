@@ -12,3 +12,10 @@ dependencies = [
 [[package]]
 name = "check-core"
 version = "0.1.0"
+dependencies = [
+ "check-syntax",
+]
+
+[[package]]
+name = "check-syntax"
+version = "0.1.0"
