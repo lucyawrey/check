@@ -74,12 +74,14 @@ const CONTINUES_AFTER: &[&str] = &[
 
 const CONTINUING_WORDS: &[&str] = &["and", "or", "not", "div", "mod", "is", "in", "as"];
 
-pub fn lex(src: &str, base: usize, diags: &mut Vec<Diagnostic>) -> Vec<Token> {
+/// `pure` is for `.con` files, whose strings hold no interpolation, so `{` is plain text.
+pub fn lex(src: &str, base: usize, pure: bool, diags: &mut Vec<Diagnostic>) -> Vec<Token> {
     let mut lexer = Lexer {
         src: src.as_bytes(),
         text: src,
         pos: 0,
         base,
+        pure,
         diags,
     };
     let raw = lexer.run();
@@ -91,6 +93,7 @@ struct Lexer<'a> {
     text: &'a str,
     pos: usize,
     base: usize,
+    pure: bool,
     diags: &'a mut Vec<Diagnostic>,
 }
 
@@ -326,7 +329,7 @@ impl Lexer<'_> {
             let c = self.peek(0);
             if c == b'\\' && !raw {
                 self.escape(&mut text);
-            } else if c == b'{' && !raw {
+            } else if c == b'{' && !raw && !self.pure {
                 if !text.is_empty() {
                     parts.push(StrPart::Text(std::mem::take(&mut text)));
                 }
@@ -430,6 +433,7 @@ impl Lexer<'_> {
             text: inner,
             pos: 0,
             base: self.base + inner_start,
+            pure: false,
             diags: self.diags,
         };
         let tokens = sub

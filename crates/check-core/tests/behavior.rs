@@ -1346,7 +1346,7 @@ fn a_con_file_holds_only_literals() {
         "game/blocks.check",
         "func half(x: Float) -> Float { x / 2.0 }",
     );
-    for value in ["half(3.0)", "half", "\"a{1}\"", "[1 + 2]"] {
+    for value in ["half(3.0)", "half", "[1 + 2]"] {
         let data = ("game/bad.con", value);
         let main = ("main.check", "import \"game/\"\nprint(1)");
         assert_eq!(
@@ -2241,4 +2241,22 @@ fn a_data_file_can_hold_a_map() {
 fn replace_changes_every_match_unless_given_a_count() {
     let src = "print(\"a-b-c\".replace(\"-\", \"+\"))\nprint(\"a-b-c\".replace(\"-\", \"+\", 1))\nprint(\"a-b-c\".replace(\"-\", \"+\", count = 0))";
     assert_eq!(output(src), "a+b+c\na+b-c\na-b-c");
+}
+
+#[test]
+fn braces_in_a_con_string_are_plain_text() {
+    assert_eq!(
+        files_output(&[
+            ("main.check", "import \"./\"\nprint(lines.hello)"),
+            ("lines.con", "hello = \"Hi, {name}!\""),
+        ]),
+        "Hi, {name}!"
+    );
+    assert_eq!(
+        files_output(&[
+            ("main.check", "import \"./\"\nprint(lines)"),
+            ("lines.conx", "\"{1 + 1}\""),
+        ]),
+        "2"
+    );
 }
