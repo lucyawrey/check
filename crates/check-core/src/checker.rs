@@ -1,13 +1,15 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
-use crate::diag::{Code, Diagnostic, Span};
+use crate::diag::{Code, Diagnostic, Sources, Span};
 use crate::types::{Show, Subst, Ty};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Coercion {
     pub to_float: bool,
     pub wraps: usize,
+    /// Wraps the value in `Ok` after any `Some`s, for a function that infers a `Result`.
+    pub ok: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -164,9 +166,17 @@ impl Var {
     }
 }
 
+/// What the `try`s in a function pass up.
+#[derive(Clone)]
+enum Fails {
+    Maybe,
+    /// A `Result`, with its error type.
+    Result(Ty),
+}
+
 struct FnCtx {
     declared: Option<Ty>,
-    uses_try: bool,
+    fails: Option<Fails>,
     returns: Vec<(NodeId, Span, Ty)>,
 }
 
@@ -181,7 +191,8 @@ struct LoopCtx {
     break_ty: Option<Ty>,
 }
 
-pub struct Checker {
+pub struct Checker<'s> {
+    sources: &'s Sources,
     subst: Subst,
     pub diags: Vec<Diagnostic>,
     pub info: Info,
@@ -219,12 +230,13 @@ pub(crate) const RESERVED_NAMES: &[&str] = &["Maybe", "Some", "None", "Result", 
 const MUTATING: &[&str] = &["push", "pop", "removeAt"];
 pub(crate) const BUILT_IN_TYPES: &[&str] = &["String", "Int", "Float", "Bool"];
 pub(crate) const MAYBE: &str = "check.std.Maybe";
-const RESULT: &str = "check.std.Result";
+pub(crate) const RESULT: &str = "check.std.Result";
 pub(crate) const PRINTABLE: &str = "check.std.Printable";
 pub(crate) const EQ: &str = "check.std.Eq";
 
-pub fn check(program: &[Stmt], library: &[Stmt]) -> (Info, Vec<Diagnostic>) {
+pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Vec<Diagnostic>) {
     let mut checker = Checker {
+        sources,
         subst: Subst::default(),
         diags: Vec::new(),
         info: Info::default(),
@@ -254,7 +266,7 @@ pub fn check(program: &[Stmt], library: &[Stmt]) -> (Info, Vec<Diagnostic>) {
     (checker.info, checker.diags)
 }
 
-impl Checker {
+impl Checker<'_> {
     fn error(&mut self, code: Code, span: Span) -> Ty {
         self.diags.push(Diagnostic::error(code, span));
         Ty::Error
@@ -949,7 +961,7 @@ impl Checker {
         let pending = self.pending_bounds.len();
         self.fns.push(FnCtx {
             declared: declared.clone(),
-            uses_try: false,
+            fails: None,
             returns: Vec::new(),
         });
         let body_ty = self.expr(body, declared.as_ref());
@@ -957,6 +969,11 @@ impl Checker {
         let ret = match declared {
             Some(t) => t,
             None => {
+                if let Some(Fails::Result(e)) = ctx.fails {
+                    let ret = self.ok_wrapped(body, body_ty, ctx.returns, e);
+                    self.check_bounds(pending);
+                    return ret;
+                }
                 let base = match self.subst.shallow(&body_ty) {
                     Ty::Never => ctx
                         .returns
@@ -964,7 +981,7 @@ impl Checker {
                         .map_or(Ty::Never, |r| self.subst.shallow(&r.2)),
                     other => other,
                 };
-                if ctx.uses_try && !matches!(self.subst.shallow(&base), Ty::Maybe(_)) {
+                if ctx.fails.is_some() && !matches!(self.subst.shallow(&base), Ty::Maybe(_)) {
                     Ty::maybe(base)
                 } else {
                     base
@@ -982,6 +999,48 @@ impl Checker {
             }
         }
         self.check_bounds(pending);
+        ret
+    }
+
+    /// The `Result<T, E>` a function without `->` returns when its `try`s pass up `E`s: each
+    /// value it ends with or returns is wrapped in `Ok`, unless it's already a `Result`.
+    fn ok_wrapped(
+        &mut self,
+        body: &Expr,
+        body_ty: Ty,
+        returns: Vec<(NodeId, Span, Ty)>,
+        e: Ty,
+    ) -> Ty {
+        let ok = self.subst.fresh();
+        let ret = Ty::Named(RESULT.to_string(), vec![ok.clone(), e]);
+        let tail = match &body.kind {
+            ExprKind::Block(stmts) => match stmts.last() {
+                Some(Stmt::Expr(e)) => e.span,
+                _ => body.span,
+            },
+            _ => body.span,
+        };
+        for (id, span, ty) in std::iter::once((body.id, tail, body_ty)).chain(returns) {
+            let ty = self.subst.shallow(&ty);
+            let fits = match &ty {
+                Ty::Never => true,
+                Ty::Named(n, _) if n == RESULT => {
+                    if !self.subsume(id, &ty, &ret) {
+                        self.error(Code::try_error_mismatch, span);
+                    }
+                    true
+                }
+                _ => {
+                    let fits = self.subsume(id, &ty, &ok);
+                    self.info.coercions.entry(id).or_default().ok = true;
+                    fits
+                }
+            };
+            if !fits {
+                let code = self.mismatch(&ty, &ret, Code::return_type_mismatch);
+                self.error(code, span);
+            }
+        }
         ret
     }
 
@@ -1996,8 +2055,18 @@ impl Checker {
         name: &str,
         args: &[Arg],
         span: Span,
+        expected: Option<&Ty>,
     ) -> Ty {
         let ty = self.fresh_type(enum_name);
+        let expected = expected.map(|e| match self.subst.shallow(e) {
+            Ty::Maybe(inner) => self.subst.shallow(&inner),
+            e => e,
+        });
+        if let Some(e @ Ty::Named(n, _)) = &expected
+            && n == enum_name
+        {
+            self.subst.unify(&ty, e);
+        }
         let params = self
             .variant_fields(enum_name, &Self::type_args(&ty), name)
             .unwrap_or_default();
@@ -2209,31 +2278,73 @@ impl Checker {
             (UnOp::BitNot, Ty::Int) => Ty::Int,
             (UnOp::Not, Ty::Bool) => Ty::Bool,
             (UnOp::Try, Ty::Maybe(inner)) => {
-                let declared = self
-                    .fns
-                    .last()
-                    .map(|f| f.declared.as_ref().map(|d| self.subst.shallow(d)));
-                match declared {
-                    None => (**inner).clone(),
-                    Some(Some(
-                        Ty::Int
-                        | Ty::Float
-                        | Ty::Bool
-                        | Ty::Str
-                        | Ty::Void
-                        | Ty::List(_)
-                        | Ty::Func(..)
-                        | Ty::Range,
-                    )) => self.error(Code::try_outside_maybe, span),
-                    _ => {
-                        self.fns.last_mut().expect("fn").uses_try = true;
-                        (**inner).clone()
-                    }
+                let inner = (**inner).clone();
+                if self.try_fails(Fails::Maybe, operand, span) {
+                    inner
+                } else {
+                    Ty::Error
+                }
+            }
+            (UnOp::Try, Ty::Named(n, args)) if n == RESULT => {
+                let (ok, e) = (args[0].clone(), args[1].clone());
+                if self.try_fails(Fails::Result(e), operand, span) {
+                    ok
+                } else {
+                    Ty::Error
                 }
             }
             (_, Ty::Var(_)) => self.error(Code::type_needed, operand.span),
             _ => self.error(Code::invalid_operand_types, span),
         }
+    }
+
+    /// Records what a `try` passes up, or reports why the function can't pass it up.
+    fn try_fails(&mut self, fails: Fails, operand: &Expr, span: Span) -> bool {
+        let Some(ctx) = self.fns.last() else {
+            return true;
+        };
+        let declared = ctx.declared.as_ref().map(|d| self.subst.shallow(d));
+        let passes = match declared {
+            Some(Ty::Maybe(_)) => Some(Fails::Maybe),
+            Some(Ty::Named(n, args)) if n == RESULT => Some(Fails::Result(args[1].clone())),
+            Some(Ty::Error) => return false,
+            Some(_) => {
+                self.error(Code::try_outside_failable, span);
+                return false;
+            }
+            None => ctx.fails.clone(),
+        };
+        let (code, fix) = match (&fails, passes) {
+            (_, None) => {
+                self.fns.last_mut().expect("fn").fails = Some(fails);
+                return true;
+            }
+            (Fails::Maybe, Some(Fails::Maybe)) => return true,
+            (Fails::Result(e1), Some(Fails::Result(e2))) => {
+                if self.subst.unify(e1, &e2) {
+                    return true;
+                }
+                self.error(Code::try_error_mismatch, operand.span);
+                return false;
+            }
+            (Fails::Result(_), Some(Fails::Maybe)) => (Code::try_result_in_maybe, "ok()"),
+            (Fails::Maybe, Some(Fails::Result(_))) => (Code::try_maybe_in_result, "orErr(...)"),
+        };
+        let text = self.sources.text(operand.span);
+        let text = text.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+        let text = match operand.kind {
+            ExprKind::Name(_)
+            | ExprKind::This
+            | ExprKind::Call(..)
+            | ExprKind::Method(..)
+            | ExprKind::Field(..)
+            | ExprKind::Index(..) => text,
+            _ => format!("({text})"),
+        };
+        let mut d = Diagnostic::error(code, span);
+        d.detail = Some(format!("try {text}.{fix}"));
+        self.diags.push(d);
+        false
     }
 
     fn binary(&mut self, op: BinOp, lhs: &Expr, rhs: &Expr, span: Span) -> Ty {
@@ -2258,16 +2369,16 @@ impl Checker {
             }
             BinOp::Coalesce => {
                 let lt = self.expr(lhs, None);
-                match self.subst.shallow(&lt) {
-                    Ty::Maybe(inner) => {
-                        let rt = self.expr(rhs, Some(&inner));
-                        self.expect(rhs, &rt, &inner);
-                        *inner
-                    }
-                    Ty::Var(_) => self.error(Code::type_needed, lhs.span),
-                    Ty::Error => Ty::Error,
-                    _ => self.error(Code::type_mismatch, lhs.span),
-                }
+                let inner = match self.subst.shallow(&lt) {
+                    Ty::Maybe(inner) => *inner,
+                    Ty::Named(n, mut args) if n == RESULT => args.swap_remove(0),
+                    Ty::Var(_) => return self.error(Code::type_needed, lhs.span),
+                    Ty::Error => return Ty::Error,
+                    _ => return self.error(Code::type_mismatch, lhs.span),
+                };
+                let rt = self.expr(rhs, Some(&inner));
+                self.expect(rhs, &rt, &inner);
+                inner
             }
             BinOp::Eq | BinOp::Ne => {
                 let (lt, rt) = if self.bare_variant(lhs) {
@@ -2508,7 +2619,7 @@ impl Checker {
                 return self.construct(id, name, args, span);
             }
             if let Some(e) = self.expected_variant(expected, name) {
-                return self.variant_call(id, &e, name, args, span);
+                return self.variant_call(id, &e, name, args, span, expected);
             }
             if self.enum_with_variant(name) {
                 for a in args {
@@ -2694,7 +2805,7 @@ impl Checker {
     fn method(&mut self, id: NodeId, recv: &Expr, name: &str, args: &[Arg], span: Span) -> Ty {
         if let Some(t) = self.type_ref(recv) {
             if self.variant(&t, name).is_some() {
-                return self.variant_call(id, &t, name, args, span);
+                return self.variant_call(id, &t, name, args, span, None);
             }
             let key = format!("{t}.{name}");
             if self.funcs.get(&key).is_some_and(|f| f.this.is_none()) {
@@ -2750,6 +2861,19 @@ impl Checker {
             }
         }
         match recv_ty {
+            Ty::Named(n, mut targs) if n == RESULT => match name {
+                "orPanic" => {
+                    if !args.is_empty() {
+                        self.args_of(args, span, &[Ty::Str]);
+                    }
+                    targs.swap_remove(0)
+                }
+                "ok" => {
+                    self.args_of(args, span, &[]);
+                    Ty::maybe(targs.swap_remove(0))
+                }
+                _ => self.error(Code::unknown_method, span),
+            },
             Ty::Named(..) | Ty::Str | Ty::Int | Ty::Float | Ty::Bool => {
                 for a in args {
                     self.expr(&a.value, None);
@@ -2781,6 +2905,11 @@ impl Checker {
                         t = self.subst.shallow(&i);
                     }
                     Ty::maybe(t)
+                }
+                "orErr" => {
+                    let e = self.subst.fresh();
+                    self.args_of(args, span, std::slice::from_ref(&e));
+                    Ty::Named(RESULT.to_string(), vec![*inner, e])
                 }
                 _ => self.error(Code::unknown_method, span),
             },
