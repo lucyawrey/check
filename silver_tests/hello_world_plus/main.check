@@ -45,7 +45,7 @@ copy.push("extra")
 expect(words.length() == 3 and copy.pop() ?? "" == "extra" and copy.removeAt(1) ?? "" == "decoy")
 expect(copy[5] ?? "none" == "none" and copy.join(" ") == "Hello World" and words[0] == "Hello")
 expect(words.contains("World") and words.first() ?? "" == "Hello" and words.last() ?? "" == "World")
-expect([1, 2].map(func(x) x * 2)[1] ?? 0 == 4 and words.filter(func(w) w != "decoy").length() == 2)
+expect([1, 2].map(func(x) => x * 2)[1] ?? 0 == 4 and words.filter(func(w) => w != "decoy").length() == 2)
 var names = []
 names.push("Bo")
 let [firstName, ..._] = names else { panic() }
@@ -76,7 +76,7 @@ let five = Some(Int.parse("5")).flatten() ?? 0
 expect(grade == "B" and bonus == 0 and five == 5)
 
 // functions
-func double(x: Int) x * 2
+func double(x: Int) => x * 2
 func half(x: Int) -> Float { x / 2 }
 func fact(n: Int) -> Int { if n <= 1 { 1 } else { n * fact(n - 1) } }
 func total(...nums: List<Int>) -> Int {
@@ -84,7 +84,7 @@ func total(...nums: List<Int>) -> Int {
     for n in nums { subtotal += n }
     subtotal
 }
-func greet(name: String, greeting = "Hi") "{greeting}, {name}"
+func greet(name: String, greeting = "Hi") => "{greeting}, {name}"
 func countdown(var n: Int) -> Int {
     while n > 0 { n -= 1 }
     n
@@ -98,10 +98,10 @@ expect(greet("Bo") == "Hi, Bo" and greet("Bo", "Yo") == "Yo, Bo" and countdown(s
 expect(find(words, "world") == "World" and find(words, "bye") == "")
 
 var mark = "!"
-let exclaim = func(s) "{s}{mark}"
+let exclaim = func(s) => "{s}{mark}"
 mark = "?"
-func apply(f: func(String) -> String, s: String) f(s)
-expect(exclaim("Hi") == "Hi!" and apply(func(s) s.upper(), "hi") == "HI")
+func apply(f: func(String) -> String, s: String) => f(s)
+expect(exclaim("Hi") == "Hi!" and apply(func(s) => s.upper(), "hi") == "HI")
 
 implement Int {
   func squared() -> Int { this * this }
@@ -189,7 +189,7 @@ expect(command(["add", "buy", "milk"]) == "buy milk" and command(["list"]) == "l
 // main
 func buildGreeting() -> String {
     var what = found
-    let say = func() "{hello}, {what}"
+    let say = func() => "{hello}, {what}"
     what = "Nothing"
     say()
 }

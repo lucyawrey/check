@@ -5,15 +5,15 @@ var state = [=]
 func main() {
   for line in story.script {
     match line {
-      Text(text) => {
+      Text(text) {
         var replaced = text
         for (key, value) in state {
           replaced = replaced.replace("\{{key}}", value)
         }
         print(replaced)
       }
-      Pause => { try input("\npress enter to continue..."); print("") }
-      Input(key) => { state[key] = try input("\n{key}: "); print("") }
+      Pause { try input("\npress enter to continue..."); print("") }
+      Input(key) { state[key] = try input("\n{key}: "); print("") }
     }
   }
 }

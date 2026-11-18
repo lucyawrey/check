@@ -24,7 +24,7 @@ func insert<T: Ordered<T>>(tree: Tree<T>, value: T) -> Tree<T> {
 func inOrder<T>(tree: Tree<T>) -> T[] {
   match tree {
     Leaf => []
-    Node(l, v, r) => {
+    Node(l, v, r) {
       var out = inOrder(l)
       out.push(v)
       for x in inOrder(r) { out.push(x) }
