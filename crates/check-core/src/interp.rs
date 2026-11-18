@@ -70,6 +70,42 @@ pub fn run(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Result<Option<(Span, Option<String>)>, Panic> {
+    let mut interp = start(program, library, info, input, output)?;
+    for stmt in program {
+        match interp.stmt(stmt) {
+            Ok(_) => {}
+            Err(Flow::Panic(p)) => return Err(p),
+            Err(Flow::Stop(span, err)) => return Ok(Some((span, err))),
+            Err(_) => {}
+        }
+    }
+    Ok(None)
+}
+
+/// The value of the data const whose value is node `id`.
+pub fn eval_data(
+    program: &[Stmt],
+    library: &[Stmt],
+    info: &Info,
+    id: NodeId,
+) -> Result<Value, Panic> {
+    let (mut input, mut output) = (std::io::empty(), std::io::sink());
+    let mut interp = start(program, library, info, &mut input, &mut output)?;
+    let name = program.iter().find_map(|s| match s {
+        Stmt::Data(d) if d.value.id == id => Some(&d.name),
+        _ => None,
+    });
+    Ok(interp.const_values.remove(name.unwrap()).unwrap())
+}
+
+/// An interpreter with the program's declarations added and its consts and data values built.
+fn start<'a>(
+    program: &[Stmt],
+    library: &[Stmt],
+    info: &'a Info,
+    input: &'a mut dyn BufRead,
+    output: &'a mut dyn Write,
+) -> Result<Interpreter<'a>, Panic> {
     let mut interp = Interpreter {
         info,
         funcs: HashMap::new(),
@@ -129,15 +165,7 @@ pub fn run(
             return Err(p);
         }
     }
-    for stmt in program {
-        match interp.stmt(stmt) {
-            Ok(_) => {}
-            Err(Flow::Panic(p)) => return Err(p),
-            Err(Flow::Stop(span, err)) => return Ok(Some((span, err))),
-            Err(_) => {}
-        }
-    }
-    Ok(None)
+    Ok(interp)
 }
 
 pub(crate) fn panic<T>(code: Code, span: Span) -> Result<T, Flow> {

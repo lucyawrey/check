@@ -1,0 +1,18 @@
+[package]
+name = "check-serde"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["check"]
+# Checks files against a Check class, with its defaults and `init`; without it, files are read
+# straight from the parse tree.
+check = ["dep:check-core"]
+
+[dependencies]
+check-core = { path = "../check-core", optional = true }
+check-syntax = { path = "../check-syntax" }
+serde = "1.0.229"
+
+[dev-dependencies]
+serde = { version = "1.0.229", features = ["derive"] }

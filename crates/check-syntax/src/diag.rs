@@ -131,6 +131,7 @@ codes! {
     import_cycle => "[units that import each other in a loop]",
     data_folder => "[a folder of data files with no code, which needs Map]",
     bad_data_name => "[a data file whose name isn't a valid name]",
+    not_pure_data => "[a data file a host reads that isn't a .con file]",
     namespace_outside_package => "[a namespace that doesn't start with its package's]",
     misplaced_namespace => "[a namespace line that isn't the first line of the file]",
     external_outside_library => "[an external function outside a library package]",
