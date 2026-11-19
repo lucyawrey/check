@@ -43,7 +43,12 @@
       }
     },
     "configurationDefaults": {
-      "[check]": { "editor.tabSize": 2, "editor.insertSpaces": true, "editor.detectIndentation": false },
+      "[check]": {
+        "editor.tabSize": 2,
+        "editor.insertSpaces": true,
+        "editor.detectIndentation": false,
+        "editor.codeActionsOnSave": { "source.fixAll.check": "explicit" }
+      },
       "[con]": { "editor.tabSize": 2, "editor.insertSpaces": true, "editor.detectIndentation": false }
     }
   },
