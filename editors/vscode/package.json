@@ -28,7 +28,7 @@
     }, {
       "language": "con",
       "scopeName": "source.con",
-      "path": "./syntaxes/con.tmLanguage.json"
+      "path": "./syntaxes/check-object-notation.tmLanguage.json"
     }],
     "configurationDefaults": {
       "[check]": { "editor.tabSize": 2, "editor.insertSpaces": true, "editor.detectIndentation": false },
