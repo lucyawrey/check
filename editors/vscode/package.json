@@ -1,8 +1,11 @@
 {
   "name": "check",
   "displayName": "Check",
-  "description": "Syntax highlighting for the Check language",
+  "description": "[what the extension gives: highlighting, errors and fixes for Check]",
   "version": "0.0.1",
+  "publisher": "lucyawrey",
+  "repository": "https://github.com/lucyawrey/check",
+  "main": "./extension.js",
   "engines": {
     "vscode": "^1.100.0"
   },
@@ -30,9 +33,24 @@
       "scopeName": "source.con",
       "path": "./syntaxes/check-object-notation.tmLanguage.json"
     }],
+    "configuration": {
+      "properties": {
+        "check.serverPath": {
+          "type": "string",
+          "default": "check",
+          "description": "[setting: the check binary the language server runs, for dev builds]"
+        }
+      }
+    },
     "configurationDefaults": {
       "[check]": { "editor.tabSize": 2, "editor.insertSpaces": true, "editor.detectIndentation": false },
       "[con]": { "editor.tabSize": 2, "editor.insertSpaces": true, "editor.detectIndentation": false }
     }
+  },
+  "dependencies": {
+    "vscode-languageclient": "^11.0.0"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^4.1.1"
   }
 }
