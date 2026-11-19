@@ -17,6 +17,10 @@
 - `arrow_before_braces` `=>` before a body in braces
 - `body_without_arrow` a body without braces and without `=>`
 - `var_in_declaration_pattern` `var` inside a `let` or `var` declaration's pattern
+- `let_in_class_header` `let` before a field in a class header, where fields are `let` unless written `var`
+- `readonly_let` `readonly` on a `let` field, which is already read-only
+- `arrow_on_new_line` a `=>` body that starts on the line after
+- `semicolon_in_arrow_body` a `;` in a function's `=>` body, which needs braces for more than one statement
 - `unknown_name` a name that doesn't exist
 - `duplicate_name` a name defined twice in the same block or file
 - `redefined_builtin` redefining or shadowing `Maybe`, `Some`, `None`, `Result`, `Ok` or `Err`
