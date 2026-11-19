@@ -1,5 +1,6 @@
+use std::env;
 use std::fs;
-use std::io::{self, BufReader, Cursor};
+use std::io::{self, BufReader, Cursor, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -82,11 +83,15 @@ fn read(path: &str) -> Option<String> {
     }
 }
 
-fn render(report: &Report, errors_only: bool) -> String {
+fn color() -> bool {
+    io::stderr().is_terminal() && env::var_os("NO_COLOR").is_none()
+}
+
+fn render(report: &Report, errors_only: bool, color: bool) -> String {
     let mut out = String::new();
     for d in &report.diagnostics {
         if !errors_only || d.severity == Severity::Error {
-            out.push_str(&d.render(&report.sources));
+            out.push_str(&d.render(&report.sources, color));
         }
     }
     if let Some(text) = &report.panic_text {
@@ -103,7 +108,7 @@ fn run(path: &str) -> ExitCode {
     let mut input = stdin.lock();
     let mut output = io::stdout();
     let report = run_program(&path, &Disk, false, &mut input, &mut output);
-    eprint!("{}", render(&report, false));
+    eprint!("{}", render(&report, false, color()));
     match report.outcome {
         Outcome::Finished => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
@@ -115,8 +120,9 @@ fn check(path: &str) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let checked = check_program(&path, &Disk, true);
+    let color = color();
     for d in &checked.diagnostics {
-        eprint!("{}", d.render(&checked.sources));
+        eprint!("{}", d.render(&checked.sources, color));
     }
     if checked
         .diagnostics
@@ -178,14 +184,14 @@ fn run_test(dir: &Path) -> Result<(), String> {
             Some(code) if code == expected => Ok(()),
             Some(code) => Err(format!(
                 "expected error {expected}, got {code}\n{}",
-                render(&report, true)
+                render(&report, true, false)
             )),
             None => Err(format!("expected error {expected}, but it ran without one")),
         };
     }
     let mut problems = String::new();
     if error_code.is_some() && !matches!(report.outcome, Outcome::Stopped) {
-        problems.push_str(&render(&report, true));
+        problems.push_str(&render(&report, true, false));
     }
     let expected =
         fs::read_to_string(dir.join("expected.txt")).map_err(|e| format!("expected.txt: {e}"))?;

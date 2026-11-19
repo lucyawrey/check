@@ -30,7 +30,7 @@ impl fmt::Display for Error {
                 panic_text,
             } => {
                 for d in diagnostics.iter().filter(|d| d.severity == Severity::Error) {
-                    write!(f, "{}", d.render(sources))?;
+                    write!(f, "{}", d.render(sources, false))?;
                 }
                 write!(f, "{}", panic_text.as_deref().unwrap_or_default())
             }
