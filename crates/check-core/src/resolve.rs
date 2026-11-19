@@ -739,7 +739,7 @@ impl Resolver<'_> {
                 self.expr(x);
                 self.bind_pattern(pat);
             }
-            ExprKind::For(pat, iter, body) => {
+            ExprKind::For(pat, iter, body, _) => {
                 self.expr(iter);
                 self.scoped(|r| {
                     r.bind_pattern(pat);

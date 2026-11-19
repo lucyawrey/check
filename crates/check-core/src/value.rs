@@ -97,6 +97,7 @@ pub enum Value {
     Func(Rc<Callable>),
     Object(Rc<Record>),
     Shared(Rc<RefCell<Record>>),
+    Ref(Rc<RefCell<Value>>),
     Variant(Rc<Record>),
     Record(Rc<Record>),
     Void,
@@ -121,6 +122,7 @@ impl PartialEq for Value {
             (Value::None, Value::None) | (Value::Void, Value::Void) => true,
             (Value::Range(a, b, x), Value::Range(c, d, y)) => a == c && b == d && x == y,
             (Value::Func(a), Value::Func(b)) => Rc::ptr_eq(a, b),
+            (Value::Ref(a), Value::Ref(b)) => Rc::ptr_eq(a, b),
             (Value::Object(a), Value::Object(b))
             | (Value::Variant(a), Value::Variant(b))
             | (Value::Record(a), Value::Record(b)) => a == b,
@@ -172,6 +174,7 @@ impl Value {
             Value::Set(_) => SET.into(),
             Value::Some(_) | Value::None => MAYBE.into(),
             Value::Shared(r) => r.borrow().ty.clone(),
+            Value::Ref(_) => "Ref".into(),
             Value::Object(r) | Value::Variant(r) | Value::Record(r) => r.ty.clone(),
             Value::Range(..) | Value::Func(_) | Value::Void => "".into(),
         }
@@ -214,6 +217,10 @@ impl Value {
             Value::Shared(r) => match r.try_borrow_mut() {
                 Ok(record) => record.code(true),
                 Err(_) => "...".to_string(),
+            },
+            Value::Ref(v) => match v.try_borrow_mut() {
+                Ok(v) => format!("Ref({})", v.code()),
+                Err(_) => "Ref(...)".to_string(),
             },
             Value::Variant(r) => r.code(false),
             Value::Record(r) => r.code(true),
