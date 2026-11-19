@@ -42,6 +42,20 @@ Install `check` to `~/.cargo/bin`:
 cargo install --path crates/check-cli
 ```
 
+To install `check` and the VS Code extension, which shows errors as you type and offers their fixes (needs Node and the `code` command):
+
+```
+scripts/install-editor.sh
+```
+
+The extension applies tidy's fixes on save. To turn that off, add to VS Code's settings:
+
+```
+"[check]": { "editor.codeActionsOnSave": { "source.fixAll.check": "never" } }
+```
+
+For a dev build, set `check.serverPath` to `target/debug/check`'s full path.
+
 ## Rust tests
 
 ```

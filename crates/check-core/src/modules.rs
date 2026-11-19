@@ -632,6 +632,12 @@ fn is_name(stem: &str) -> bool {
         && !crate::checker::RESERVED_NAMES.contains(&stem)
 }
 
+pub fn is_entry_source(text: &str) -> bool {
+    let mut ignored = Vec::new();
+    let tokens = lexer::lex(text, 0, false, &mut ignored);
+    is_entry(&parser::parse_program(tokens, &mut 0, &mut ignored))
+}
+
 /// An entry file has imports or top-level statements; it's never part of a folder's unit.
 fn is_entry(file: &File) -> bool {
     !file.imports.is_empty()
