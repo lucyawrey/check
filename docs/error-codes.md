@@ -50,6 +50,11 @@
 - `try_maybe_in_result` `try` on a `Maybe` in a function returning a `Result` (suggests `try x.orErr(...)`)
 - `try_error_mismatch` `try` on a `Result` whose error type differs from the function's
 - `assign_to_let` assigning to a `let`
+- `missing_ref` an argument for a `ref` parameter written without `ref` (quick fix: add it)
+- `ref_not_allowed` `ref` on an argument whose parameter isn't `ref`
+- `overlapping_ref` a `ref` argument that overlaps another argument of the same call (`swap(ref a, ref a)`)
+- `ref_rest_or_default` a `ref` parameter that is a rest parameter or has a default
+- `changed_in_for_ref` changing the list a `for ref` loop goes through, inside the loop
 - `assign_to_parameter` assigning to a parameter not written `var`
 - `change_let_collection` changing a `let` list, map or set (`push`, `pop`, `removeAt`, `add`, `remove`)
 - `invalid_key_type` a map key or set item whose type has no exact equality (`Float`, a function, a collection, a `ref class` or anything holding one)
@@ -119,11 +124,14 @@
 - `round_out_of_range` rounding `NaN`, `Infinity` or a `Float` too big for an `Int`
 - `stack_overflow` more than 10,000 nested calls
 - `index_out_of_range` writing to a list index that doesn't exist (`list[9] = x`)
+- `for_ref_element_gone` a `for ref` element whose index is gone when it's written back
 - `missing_key` a compound assignment or nested write to a map key that isn't there (`m[k] += 1`)
 - `const_cycle` a `.conx` value that reaches itself through a function call while it's being built
 
 ## Warnings
 - `unused_var` a `var` that's never reassigned
+- `ref_of_ref_class` `Ref` of a `ref class`, which is already shared
+- `ref_param_of_ref_class` a `ref` parameter of a `ref class` type, which is already shared
 - `shadowed_name` a local that shadows a function or type
 - `repeated_namespace` a `namespace` line that only repeats its package's, which the manifest already sets
 - `interpolated_maybe` interpolating a `T?`
