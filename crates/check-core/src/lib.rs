@@ -5,6 +5,7 @@ pub mod host;
 pub mod interp;
 pub mod modules;
 pub mod resolve;
+pub mod tidy;
 pub mod types;
 pub mod value;
 
@@ -42,7 +43,7 @@ pub fn check_program(entry: &str, files: &dyn Files, allow_private: bool) -> Che
     check_loaded(modules::load(entry, files, allow_private))
 }
 
-fn check_loaded(loaded: Loaded) -> Checked {
+pub(crate) fn check_loaded(loaded: Loaded) -> Checked {
     let Loaded {
         program,
         library,

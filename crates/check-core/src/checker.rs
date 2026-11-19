@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
-use crate::diag::{Code, Diagnostic, Sources, Span};
+use crate::diag::{Code, Diagnostic, Edit, Sources, Span};
 use crate::types::{Show, Subst, Ty};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -213,6 +213,8 @@ pub struct Checker<'s> {
     current_type: Option<String>,
     is_bindings: HashMap<NodeId, Vec<Binding>>,
     defaults: Vec<(Expr, Ty, Option<String>)>,
+    /// The `var` keyword of each local declared with one, by its name's start.
+    var_keywords: HashMap<usize, Span>,
     in_library: bool,
     /// Each generic type's parameter names.
     generics: HashMap<String, Vec<String>>,
@@ -263,6 +265,7 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         current_type: None,
         is_bindings: HashMap::new(),
         defaults: Vec::new(),
+        var_keywords: HashMap::new(),
         in_library: false,
         generics: HashMap::new(),
         interfaces: HashMap::new(),
@@ -1457,7 +1460,12 @@ impl Checker<'_> {
             .collect();
         unused.sort_by_key(|s| s.start);
         for span in unused {
-            self.warn(Code::unused_var, span);
+            let fix = self.var_keywords.get(&span.start).map(|&keyword| Edit {
+                span: keyword,
+                text: "let".to_string(),
+            });
+            let d = Diagnostic::warning(Code::unused_var, span);
+            self.diags.push(d.with_fix(fix.into_iter().collect()));
         }
     }
 
@@ -1493,6 +1501,7 @@ impl Checker<'_> {
     fn stmt(&mut self, stmt: &Stmt) -> Ty {
         match stmt {
             Stmt::Let {
+                keyword,
                 name,
                 span,
                 is_var,
@@ -1500,6 +1509,9 @@ impl Checker<'_> {
                 value,
                 ..
             } => {
+                if *is_var {
+                    self.var_keywords.insert(span.start, *keyword);
+                }
                 let declared = ty.as_ref().map(|t| self.type_from(t));
                 if let (ExprKind::Record(args), Some(Ty::Named(class, _))) =
                     (&value.kind, &declared)
@@ -1508,7 +1520,20 @@ impl Checker<'_> {
                         .first()
                         .is_some_and(|a| matches!(a.value.kind, ExprKind::Spread(_)))
                 {
-                    self.warn(Code::record_beside_class, value.span);
+                    let mut d = Diagnostic::warning(Code::record_beside_class, value.span);
+                    if let Some(TypeExpr::Name(class, type_span)) = ty {
+                        d = d.with_fix(vec![
+                            Edit {
+                                span: Span::new(span.end, type_span.end),
+                                text: String::new(),
+                            },
+                            Edit {
+                                span: Span::new(value.span.start, value.span.start),
+                                text: class.clone(),
+                            },
+                        ]);
+                    }
+                    self.diags.push(d);
                 }
                 let actual = self.expr(value, declared.as_ref());
                 let ty = match declared {
@@ -1563,9 +1588,13 @@ impl Checker<'_> {
                         }
                         if let PatternKind::Variant(None, name, args) = &pattern.kind
                             && name == "Some"
-                            && matches!(args.as_slice(), [p] if matches!(p.kind, PatternKind::Name(_)) && !self.info.variant_patterns.contains(&p.id))
+                            && let [p] = args.as_slice()
+                            && let PatternKind::Name(bound) = &p.kind
+                            && !self.info.variant_patterns.contains(&p.id)
                         {
-                            self.warn(Code::let_else_some, pattern.span);
+                            let d = Diagnostic::warning(Code::let_else_some, pattern.span);
+                            let fix = self.let_else_some_fix(bound, pattern, value, otherwise);
+                            self.diags.push(d.with_fix(fix));
                         }
                     }
                     None => self.report_missing(vec![vec![Cell::Pat(pattern)]], &t, pattern.span),
@@ -1587,6 +1616,41 @@ impl Checker<'_> {
             | Stmt::Data(_) => Ty::Void,
             Stmt::Expr(e) => self.unused(e),
         }
+    }
+
+    /// `let Some(x) = e else { jump }` → `let x = e ?? jump`, when the else body is one
+    /// expression. `e` gets parentheses unless it binds tighter than `??`.
+    fn let_else_some_fix(
+        &self,
+        bound: &str,
+        pattern: &Pattern,
+        value: &Expr,
+        otherwise: &Expr,
+    ) -> Vec<Edit> {
+        let ExprKind::Block(stmts) = &otherwise.kind else {
+            return Vec::new();
+        };
+        let [Stmt::Expr(body)] = stmts.as_slice() else {
+            return Vec::new();
+        };
+        let value_text = self.sources.text(value.span);
+        let value_text = match value.kind {
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Str(_)
+            | ExprKind::Name(_)
+            | ExprKind::This
+            | ExprKind::Call(..)
+            | ExprKind::Method(..)
+            | ExprKind::Field(..)
+            | ExprKind::Index(..) => value_text.to_string(),
+            _ => format!("({value_text})"),
+        };
+        vec![Edit {
+            span: Span::new(pattern.span.start, otherwise.span.end),
+            text: format!("{bound} = {value_text} ?? {}", self.sources.text(body.span)),
+        }]
     }
 
     fn place_name(&mut self, name: &str, span: Span) -> (Ty, Option<Code>) {

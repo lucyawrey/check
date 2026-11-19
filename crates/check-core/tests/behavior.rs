@@ -1281,11 +1281,14 @@ fn a_private_const_is_only_readable_inside_its_type() {
 fn field_modifiers_are_errors_elsewhere() {
     for src in [
         "func f(private var x: Int) -> Int { x }",
-        "class P {\n  readonly let x: Int = 1\n}",
         "class P(x: Int)\nprivate implement P {\n  func f() {}\n}",
     ] {
         assert_eq!(first_error(src), "unexpected_token", "{src}");
     }
+    assert_eq!(
+        first_error("class P {\n  readonly let x: Int = 1\n}"),
+        "readonly_let"
+    );
 }
 
 #[test]
@@ -2331,7 +2334,7 @@ fn a_body_is_braces_or_an_arrow_and_one_line() {
             "enum S { Square }\nmatch S.Square { Square 1.0 }",
             "body_without_arrow",
         ),
-        ("func f(x: Int)\n  => x", "unexpected_token"),
+        ("func f(x: Int)\n  => x", "arrow_on_new_line"),
         (
             "let a = 1\nlet b = 2\nif a = b { print(1) }",
             "assignment_in_condition",
@@ -2371,7 +2374,7 @@ fn an_arrow_line_means_that_line_in_braces() {
     }
     assert_eq!(
         first_error("match 1 {\n  1 => print(1); print(2)\n  _ => print(3)\n}"),
-        "unexpected_token"
+        "semicolon_in_arrow_body"
     );
     assert_eq!(output("let f = func(x: Int) => x * 2; print(f(1))"), "2");
 }
