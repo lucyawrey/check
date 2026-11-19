@@ -8,6 +8,8 @@ use check_core::diag::Severity;
 use check_core::modules::entry_of;
 use check_core::{Files, Outcome, Report, check_program, run_program};
 
+mod lsp;
+
 const STACK_SIZE: usize = 1 << 30;
 
 fn main() -> ExitCode {
@@ -29,6 +31,7 @@ fn dispatch(args: &[String]) -> ExitCode {
             Some((levels, dry_run)) => tidy(path, &levels, dry_run),
             None => usage(),
         },
+        [cmd] if cmd == "lsp" => lsp::run(),
         [path] if Path::new(path).exists() => check(path),
         _ => usage(),
     }
@@ -36,7 +39,7 @@ fn dispatch(args: &[String]) -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: check <path> | check run <path> | check test <folder> | check tidy <path> [--only style,error] [--dry-run]"
+        "usage: check <path> | check run <path> | check test <folder> | check tidy <path> [--only style,error] [--dry-run] | check lsp"
     );
     ExitCode::from(2)
 }

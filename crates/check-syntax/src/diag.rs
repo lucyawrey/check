@@ -276,6 +276,10 @@ impl Sources {
         base
     }
 
+    pub fn files(&self) -> &[Source] {
+        &self.files
+    }
+
     pub fn file(&self, offset: usize) -> &Source {
         let i = self.files.partition_point(|f| f.base <= offset);
         &self.files[i.saturating_sub(1)]
