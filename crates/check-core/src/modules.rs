@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{DataDecl, DataFile, Expr, ExprKind, File, NodeId, Stmt, StrSeg, TypeExpr};
-use crate::diag::{Code, Diagnostic, Sources, Span};
+use crate::diag::{Code, Diagnostic, Edit, Sources, Span};
 use crate::resolve::{SourceFile, resolve};
 use crate::{lexer, parser};
 
@@ -283,6 +283,22 @@ impl<'a> Loader<'a> {
         }
     }
 
+    /// The whole line holding `span`, with its line break and a blank line after it.
+    fn line_with_blank_after(&self, span: Span) -> Span {
+        let file = self.sources.file(span.start);
+        let line_end = |from: usize| file.text[from..].find('\n').map(|i| from + i + 1);
+        let start = file.text[..span.start - file.base]
+            .rfind('\n')
+            .map_or(0, |i| i + 1);
+        let mut end = line_end(span.end - file.base).unwrap_or(file.text.len());
+        if let Some(next) = line_end(end)
+            && file.text[end..next].trim().is_empty()
+        {
+            end = next;
+        }
+        Span::new(file.base + start, file.base + end)
+    }
+
     fn error(&mut self, code: Code, span: Span, detail: Option<String>) {
         let mut d = Diagnostic::error(code, span);
         d.detail = detail;
@@ -389,7 +405,13 @@ impl<'a> Loader<'a> {
         }
         if folder.is_none() {
             if self.files.list(&format!("{key}/")).is_some() {
-                self.error(Code::folder_without_slash, span, None);
+                let quote = Span::new(span.end - 1, span.end - 1);
+                let fix = vec![Edit {
+                    span: quote,
+                    text: "/".to_string(),
+                }];
+                self.diags
+                    .push(Diagnostic::error(Code::folder_without_slash, span).with_fix(fix));
                 return None;
             }
             if self.files.read(&key).is_none() {
@@ -544,10 +566,22 @@ impl<'a> Loader<'a> {
         let namespace = match namespace {
             Some((ns, ns_span)) if !package_ns.is_empty() => {
                 if ns == package_ns {
+                    let fix = vec![Edit {
+                        span: self.line_with_blank_after(ns_span),
+                        text: String::new(),
+                    }];
                     self.diags
-                        .push(Diagnostic::warning(Code::repeated_namespace, ns_span));
+                        .push(Diagnostic::warning(Code::repeated_namespace, ns_span).with_fix(fix));
                 } else if !ns.starts_with(&format!("{package_ns}.")) {
-                    self.error(Code::namespace_outside_package, ns_span, None);
+                    let mut d = Diagnostic::error(Code::namespace_outside_package, ns_span);
+                    if !ns.contains('.') {
+                        let name = ns_span.end - ns.len();
+                        d = d.with_fix(vec![Edit {
+                            span: Span::new(name, name),
+                            text: format!("{package_ns}."),
+                        }]);
+                    }
+                    self.diags.push(d);
                 }
                 ns
             }

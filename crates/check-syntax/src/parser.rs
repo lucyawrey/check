@@ -1,5 +1,5 @@
 use crate::ast::*;
-use crate::diag::{Code, Diagnostic, Span};
+use crate::diag::{Code, Diagnostic, Edit, Span};
 use crate::lexer::{StrPart, Tok, Token};
 
 pub struct Parser<'a> {
@@ -308,8 +308,7 @@ impl Parser<'_> {
         if self.is_sym(";") {
             let span = self.advance().span;
             if matches!(self.peek(), Tok::Newline | Tok::Eof) || self.is_sym("}") {
-                self.diags
-                    .push(Diagnostic::error(Code::trailing_separator, span));
+                self.trailing_separator(span);
             }
             return;
         }
@@ -405,7 +404,7 @@ impl Parser<'_> {
 
     fn let_stmt(&mut self) -> PResult<Stmt> {
         let is_var = self.is_kw("var");
-        self.advance();
+        let keyword = self.advance().span;
         let (name, span) = self.ident()?;
         let ty = if self.eat_sym(":") {
             Some(self.type_expr()?)
@@ -416,6 +415,7 @@ impl Parser<'_> {
         let value = self.expr()?;
         Ok(Stmt::Let {
             id: self.id(),
+            keyword,
             name,
             span,
             is_var,
@@ -739,8 +739,7 @@ impl Parser<'_> {
                 }
                 let comma = p.advance().span;
                 if *p.peek() == Tok::Newline || p.is_sym("}") {
-                    p.diags
-                        .push(Diagnostic::error(Code::trailing_separator, comma));
+                    p.trailing_separator(comma);
                     return Ok(());
                 }
             }
@@ -937,8 +936,7 @@ impl Parser<'_> {
             if self.is_sym(",") {
                 let comma = self.advance().span;
                 if *self.peek() == Tok::Newline || self.is_sym("}") {
-                    self.diags
-                        .push(Diagnostic::error(Code::trailing_separator, comma));
+                    self.trailing_separator(comma);
                 }
             } else {
                 self.end_statement(true);
@@ -999,34 +997,123 @@ impl Parser<'_> {
         if self.is_sym("{") {
             return self.block();
         }
-        if *self.peek() == Tok::Newline && self.next_line_starts_with("=>") {
+        let arrow_on_new_line = *self.peek() == Tok::Newline && self.next_line_starts_with("=>");
+        if arrow_on_new_line {
+            let from = self.prev_span().end;
             self.skip_newlines();
-            return self.error(Code::unexpected_token, self.span());
+            let fix = vec![Edit {
+                span: Span::new(from, self.span().start),
+                text: " ".to_string(),
+            }];
+            self.diags
+                .push(Diagnostic::error(Code::arrow_on_new_line, self.span()).with_fix(fix));
         }
         let arrow = self.span();
         let has_arrow = self.eat_sym("=>");
         if has_arrow && self.is_sym("{") {
-            return self.fix_error(Code::arrow_before_braces, arrow, "{ ... }");
+            let fix = vec![Edit {
+                span: Span {
+                    start: arrow.start,
+                    end: self.span().start,
+                },
+                text: String::new(),
+            }];
+            let mut d = Diagnostic::error(Code::arrow_before_braces, arrow).with_fix(fix);
+            d.detail = Some("{ ... }".to_string());
+            self.diags.push(d);
+            return Err(());
         }
+        let body_on_line = !arrow_on_new_line && !matches!(self.peek(), Tok::Newline | Tok::Eof);
         if has_ret {
-            return self.error(Code::arrow_without_braces, self.span());
+            let mut d = Diagnostic::error(Code::arrow_without_braces, self.span());
+            if body_on_line {
+                d = d.with_fix(self.wrap_fix(arrow.start));
+            }
+            self.diags.push(d);
+            return Err(());
         }
         if !has_arrow {
-            return self.fix_error(Code::body_without_arrow, self.span(), "=> ...");
+            let at = self.span().start;
+            let fix = vec![Edit {
+                span: Span::new(at, at),
+                text: "=> ".to_string(),
+            }];
+            let mut d = Diagnostic::error(Code::body_without_arrow, self.span());
+            if body_on_line {
+                d = d.with_fix(fix);
+            }
+            d.detail = Some("=> ...".to_string());
+            self.diags.push(d);
+            return Err(());
         }
+        let body_start = self.pos;
         let stmt = self.block_line()?;
         if self.is_sym(";") && !is_lambda {
-            return self.fix_error(Code::unexpected_token, self.span(), "{ ...; ... }");
+            let semicolon = self.span();
+            let end_pos = self.pos;
+            self.pos = body_start;
+            let fix = self.wrap_fix(arrow.start);
+            self.pos = end_pos;
+            let d = Diagnostic::error(Code::semicolon_in_arrow_body, semicolon).with_fix(fix);
+            self.diags.push(d);
+            return Err(());
         }
         let span = arrow.to(self.prev_span());
         Ok(self.expr_node(span, ExprKind::Block(vec![stmt])))
     }
 
-    fn fix_error<T>(&mut self, code: Code, span: Span, fix: &str) -> PResult<T> {
-        let mut d = Diagnostic::error(code, span);
-        d.detail = Some(fix.to_string());
-        self.diags.push(d);
-        Err(())
+    /// Reports the current token with a fix that deletes it and the spaces after it, and
+    /// skips it so parsing goes on.
+    fn remove_token(&mut self, code: Code) {
+        let span = self.advance().span;
+        let fix = vec![Edit {
+            span: Span::new(span.start, self.span().start),
+            text: String::new(),
+        }];
+        self.diags.push(Diagnostic::error(code, span).with_fix(fix));
+    }
+
+    /// Where the current line's code ends: before its line break, or before a `}` that closes
+    /// a block opened earlier.
+    fn line_end(&self) -> usize {
+        let mut depth = 0;
+        let mut end = self.span().start;
+        let mut i = 0;
+        loop {
+            match self.peek_at(i) {
+                Tok::Newline | Tok::Eof => return end,
+                Tok::Sym("{") => depth += 1,
+                Tok::Sym("}") if depth == 0 => return end,
+                Tok::Sym("}") => depth -= 1,
+                _ => {}
+            }
+            end = self.tokens[self.pos + i].span.end;
+            i += 1;
+        }
+    }
+
+    /// Wraps the rest of the line in braces, replacing `from` up to the body's start.
+    fn wrap_fix(&self, from: usize) -> Vec<Edit> {
+        let end = self.line_end();
+        vec![
+            Edit {
+                span: Span::new(from, self.span().start),
+                text: "{ ".to_string(),
+            },
+            Edit {
+                span: Span::new(end, end),
+                text: " }".to_string(),
+            },
+        ]
+    }
+
+    fn trailing_separator(&mut self, span: Span) {
+        let fix = vec![Edit {
+            span,
+            text: String::new(),
+        }];
+        self.diags
+            .push(Diagnostic::error(Code::trailing_separator, span).with_fix(fix));
     }
 
     fn next_line_starts_with(&self, sym: &str) -> bool {
@@ -1047,6 +1134,9 @@ impl Parser<'_> {
             } else {
                 (false, false)
             };
+            if fields && !is_private && !is_readonly && p.is_kw("let") {
+                p.remove_token(Code::let_in_class_header);
+            }
             let is_var = p.eat_kw("var");
             let is_rest = p.eat_sym("...");
             let (name, span) = p.ident()?;
@@ -1080,11 +1170,12 @@ impl Parser<'_> {
         let modifies = matches!(self.peek_at(1), Tok::Kw("let" | "var"));
         let is_private = modifies && self.is_soft("private");
         let is_readonly = modifies && self.is_soft("readonly");
+        if is_readonly && matches!(self.peek_at(1), Tok::Kw("let")) {
+            self.remove_token(Code::readonly_let);
+            return Ok((false, false));
+        }
         if is_private || is_readonly {
             self.advance();
-        }
-        if is_readonly && self.is_kw("let") {
-            return self.error(Code::unexpected_token, self.span());
         }
         Ok((is_private, is_readonly))
     }
@@ -1103,8 +1194,7 @@ impl Parser<'_> {
             if self.is_sym(",") {
                 let comma = self.advance().span;
                 if *self.peek() == Tok::Newline || self.is_sym(close) {
-                    self.diags
-                        .push(Diagnostic::error(Code::trailing_separator, comma));
+                    self.trailing_separator(comma);
                 }
             } else if *self.peek() != Tok::Newline && !self.is_sym(close) {
                 return self.expect_sym(close);
@@ -1479,7 +1569,14 @@ impl Parser<'_> {
     fn condition(&mut self) -> PResult<Expr> {
         let cond = self.expr()?;
         if self.is_sym("=") {
-            return self.error(Code::assignment_in_condition, self.span());
+            let span = self.span();
+            let fix = vec![Edit {
+                span,
+                text: "==".to_string(),
+            }];
+            self.diags
+                .push(Diagnostic::error(Code::assignment_in_condition, span).with_fix(fix));
+            return Err(());
         }
         Ok(cond)
     }
@@ -1596,8 +1693,12 @@ impl Parser<'_> {
             }
             if matches!(self.peek_at(ahead), Tok::Kw("else")) {
                 let span = self.tokens[self.pos + ahead].span;
+                let fix = vec![Edit {
+                    span: Span::new(self.prev_span().end, span.start),
+                    text: " ".to_string(),
+                }];
                 self.diags
-                    .push(Diagnostic::error(Code::else_on_new_line, span));
+                    .push(Diagnostic::error(Code::else_on_new_line, span).with_fix(fix));
                 self.pos += ahead;
             }
         }

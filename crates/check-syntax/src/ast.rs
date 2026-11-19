@@ -177,6 +177,8 @@ pub struct Arm {
 pub enum Stmt {
     Let {
         id: NodeId,
+        /// The `let` or `var` keyword.
+        keyword: Span,
         name: String,
         span: Span,
         is_var: bool,

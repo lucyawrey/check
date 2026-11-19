@@ -24,13 +24,21 @@ fn main() -> ExitCode {
 fn dispatch(args: &[String]) -> ExitCode {
     match args {
         [cmd, path] if cmd == "run" => run(path),
-        [cmd, path] if cmd == "check" => check(path),
         [cmd, path] if cmd == "test" => test(Path::new(path)),
-        _ => {
-            eprintln!("usage: check run <file> | check check <file> | check test <folder>");
-            ExitCode::from(2)
-        }
+        [cmd, path, flags @ ..] if cmd == "tidy" => match tidy_options(flags) {
+            Some((levels, dry_run)) => tidy(path, &levels, dry_run),
+            None => usage(),
+        },
+        [path] if Path::new(path).exists() => check(path),
+        _ => usage(),
     }
+}
+
+fn usage() -> ExitCode {
+    eprintln!(
+        "usage: check <path> | check run <path> | check test <folder> | check tidy <path> [--only style,error] [--dry-run]"
+    );
+    ExitCode::from(2)
 }
 
 struct Disk;
@@ -112,6 +120,103 @@ fn run(path: &str) -> ExitCode {
     match report.outcome {
         Outcome::Finished => ExitCode::SUCCESS,
         _ => ExitCode::FAILURE,
+    }
+}
+
+/// `--only` takes `style`, `error` or both, comma-separated; without it, both.
+fn tidy_options(flags: &[String]) -> Option<(Vec<Severity>, bool)> {
+    let mut levels = vec![Severity::Warning, Severity::Error];
+    let mut dry_run = false;
+    let mut flags = flags.iter();
+    while let Some(flag) = flags.next() {
+        match flag.as_str() {
+            "--dry-run" => dry_run = true,
+            "--only" => {
+                levels = flags
+                    .next()?
+                    .split(',')
+                    .map(|level| match level {
+                        "style" => Some(Severity::Warning),
+                        "error" => Some(Severity::Error),
+                        _ => None,
+                    })
+                    .collect::<Option<_>>()?;
+            }
+            _ => return None,
+        }
+    }
+    Some((levels, dry_run))
+}
+
+fn tidy(path: &str, levels: &[Severity], dry_run: bool) -> ExitCode {
+    let Some(path) = entry(path) else {
+        return ExitCode::FAILURE;
+    };
+    let tidied = check_core::tidy::tidy(&path, &Disk, levels);
+    let color = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+    let paint = |style: &str, s: &str| {
+        if color {
+            format!("\x1b[{style}m{s}\x1b[0m")
+        } else {
+            s.to_string()
+        }
+    };
+    for change in &tidied.changes {
+        println!(
+            "{}",
+            paint(
+                "1",
+                &format!("{}:{} {}", change.path, change.line, change.rule)
+            )
+        );
+        for line in change.before.lines() {
+            println!("{}", paint("31", &format!("- {line}")));
+        }
+        for line in change.after.lines() {
+            println!("{}", paint("32", &format!("+ {line}")));
+        }
+    }
+    if !tidied.changes.is_empty() {
+        println!(
+            "[how many fixes tidy made, and in how many files: {} fixes, {} files]",
+            tidied
+                .changes
+                .iter()
+                .map(|c| c.rule.split(", ").count())
+                .sum::<usize>(),
+            tidied.files.len()
+        );
+    }
+    if !dry_run && !tidied.capped {
+        for (file, text) in &tidied.files {
+            if let Err(e) = fs::write(file, text) {
+                eprintln!("{file}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let color = self::color();
+    for d in &tidied.checked.diagnostics {
+        eprint!("{}", d.render(&tidied.checked.sources, color));
+    }
+    if tidied.style_blocked {
+        eprintln!("[style fixes skipped because errors remain that tidy can't fix]");
+    }
+    if tidied.capped {
+        eprintln!("[tidy stopped after 10 passes with fixes still left, and wrote nothing]");
+    }
+    if dry_run && !tidied.changes.is_empty() {
+        eprintln!("[--dry-run found fixes to make and left the files unchanged]");
+    }
+    let errors = tidied
+        .checked
+        .diagnostics
+        .iter()
+        .any(|d| d.severity == Severity::Error);
+    if errors || tidied.capped || (dry_run && !tidied.changes.is_empty()) {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

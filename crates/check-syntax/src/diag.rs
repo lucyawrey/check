@@ -54,6 +54,10 @@ codes! {
     arrow_before_braces => "[=> before a body in braces]",
     body_without_arrow => "[a body without braces and without =>]",
     var_in_declaration_pattern => "[var inside a let or var pattern]",
+    let_in_class_header => "[let in a class header, where fields are let unless written var]",
+    readonly_let => "[readonly on a let field, which is already read-only]",
+    arrow_on_new_line => "[a => body that starts on the line after]",
+    semicolon_in_arrow_body => "[a ; in a => body, which needs braces for more than one statement]",
     unknown_name => "[a name that doesn't exist]",
     duplicate_name => "[a name defined twice in the same block or file]",
     redefined_builtin => "[redefining or shadowing a reserved name]",
@@ -164,12 +168,21 @@ pub enum Severity {
     Warning,
 }
 
+/// Replaces the text at `span` with `text`; empty text deletes it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Edit {
+    pub span: Span,
+    pub text: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub code: Code,
     pub span: Span,
     pub severity: Severity,
     pub detail: Option<String>,
+    /// The tidy fix, applied all together; empty when there's no one obvious fix.
+    pub fix: Vec<Edit>,
 }
 
 impl Diagnostic {
@@ -179,6 +192,7 @@ impl Diagnostic {
             span,
             severity: Severity::Error,
             detail: None,
+            fix: Vec::new(),
         }
     }
 
@@ -188,7 +202,13 @@ impl Diagnostic {
             span,
             severity: Severity::Warning,
             detail: None,
+            fix: Vec::new(),
         }
+    }
+
+    pub fn with_fix(mut self, fix: Vec<Edit>) -> Self {
+        self.fix = fix;
+        self
     }
 
     /// `color` adds ANSI colors in rustc's scheme.
@@ -234,7 +254,8 @@ impl Diagnostic {
 pub struct Source {
     pub path: String,
     pub text: String,
-    base: usize,
+    /// The offset of the file's first byte in spans.
+    pub base: usize,
 }
 
 /// Every file gets its own range of offsets, so a span alone says which file it's in.

@@ -1,4 +1,4 @@
-use crate::diag::{Code, Diagnostic, Span};
+use crate::diag::{Code, Diagnostic, Edit, Span};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tok {
@@ -67,6 +67,25 @@ const SYMBOLS: &[&str] = &[
 
 const FOREIGN: &[&str] = &["&&", "||", "%", "!"];
 
+/// A number with an uppercase prefix or exponent (`0XFF`, `1E3`) written the one way, when
+/// that's a valid number.
+fn lowercase_number(text: &str) -> Option<String> {
+    let lower = match text.as_bytes() {
+        [b'0', b'X' | b'B' | b'O', ..] => {
+            format!("0{}{}", text[1..2].to_ascii_lowercase(), &text[2..])
+        }
+        _ => text.replacen('E', "e", 1),
+    };
+    let digits: String = lower.chars().filter(|c| *c != '_').collect();
+    let valid = match digits.get(..2) {
+        Some("0x") => i64::from_str_radix(&digits[2..], 16).is_ok(),
+        Some("0b") => i64::from_str_radix(&digits[2..], 2).is_ok(),
+        Some("0o") => i64::from_str_radix(&digits[2..], 8).is_ok(),
+        _ => digits.parse::<f64>().is_ok(),
+    };
+    (lower != text && valid).then_some(lower)
+}
+
 const CONTINUES_AFTER: &[&str] = &[
     "+", "-", "*", "/", "**", "==", "!=", "<", ">", "<=", ">=", "<<", ">>", "&", "|", "^", "??",
     "..", "..=", "=", "+=", "-=", "*=", "/=", "->", "=>", "(", "[", "{", ".", "?.",
@@ -104,6 +123,47 @@ impl Lexer<'_> {
 
     fn peek(&self, ahead: usize) -> u8 {
         *self.src.get(self.pos + ahead).unwrap_or(&0)
+    }
+
+    /// Replaces a foreign operator with its word: one space each side of `and`, `or` and `mod`
+    /// (none at a line's start or end), and a space after `not`.
+    fn foreign_fix(&self, sym: &str, start: usize) -> Edit {
+        let word = match sym {
+            "&&" => "and",
+            "||" => "or",
+            "%" => "mod",
+            _ => "not",
+        };
+        let is_space = |b: u8| b == b' ' || b == b'\t';
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut back = start;
+        while back > 0 && is_space(self.src[back - 1]) {
+            back -= 1;
+        }
+        let line_start = back == 0 || self.src[back - 1] == b'\n';
+        let from = if word != "not" && !line_start {
+            back
+        } else {
+            start
+        };
+        let mut to = self.pos;
+        while to < self.src.len() && is_space(self.src[to]) {
+            to += 1;
+        }
+        let left = if word == "not" {
+            from > 0 && is_word(self.src[from - 1])
+        } else {
+            !line_start
+        };
+        let right = to < self.src.len() && !matches!(self.src[to], b'\n' | b'\r');
+        Edit {
+            span: Span::new(self.base + from, self.base + to),
+            text: format!(
+                "{}{word}{}",
+                if left { " " } else { "" },
+                if right { " " } else { "" }
+            ),
+        }
     }
 
     fn error(&mut self, code: Code, start: usize) {
@@ -147,7 +207,9 @@ impl Lexer<'_> {
                     Some(sym) => {
                         self.pos += sym.len();
                         if FOREIGN.contains(sym) && !(*sym == "!" && self.peek(0) == b'=') {
-                            self.error(Code::foreign_operator, start);
+                            let fix = vec![self.foreign_fix(sym, start)];
+                            let d = Diagnostic::error(Code::foreign_operator, self.span(start));
+                            self.diags.push(d.with_fix(fix));
                         }
                         out.push(Token {
                             tok: Tok::Sym(sym),
@@ -246,7 +308,14 @@ impl Lexer<'_> {
             while self.peek(0).is_ascii_alphanumeric() || self.peek(0) == b'_' {
                 self.pos += 1;
             }
-            self.error(Code::malformed_number, start);
+            let mut d = Diagnostic::error(Code::malformed_number, self.span(start));
+            if let Some(lower) = lowercase_number(&self.text[start..self.pos]) {
+                d = d.with_fix(vec![Edit {
+                    span: self.span(start),
+                    text: lower,
+                }]);
+            }
+            self.diags.push(d);
             return Token {
                 tok: Tok::Int(0),
                 span: self.span(start),
