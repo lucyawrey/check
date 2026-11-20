@@ -2644,6 +2644,19 @@ fn a_ref_where_its_value_is_expected_suggests_value() {
             Some("r.value".to_string())
         )
     );
+    for (src, value) in [
+        ("print(r + 1)", "r.value"),
+        ("print(1 < r)", "r.value"),
+        ("var v = r\nv += 1", "v.value"),
+    ] {
+        let src = format!("let r = Ref(1)\n{src}");
+        assert_eq!(
+            diagnostics(&src, Severity::Error),
+            ["ref_where_value_expected"],
+            "{src}"
+        );
+        assert_eq!(error_and_fix(&src).1.as_deref(), Some(value), "{src}");
+    }
 }
 
 #[test]
