@@ -1734,10 +1734,10 @@ impl Checker<'_> {
             };
             return (var.ty.clone(), Some(code));
         }
+        var.reassigned = true;
         if captured {
             return (var.ty.clone(), Some(Code::assign_to_captured));
         }
-        var.reassigned = true;
         var.list_len = None;
         (var.ty.clone(), None)
     }

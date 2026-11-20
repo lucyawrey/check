@@ -1502,7 +1502,10 @@ impl Parser<'_> {
             _ => return self.power(),
         };
         let start = self.advance().span;
-        if op == UnOp::Neg && *self.peek() == Tok::Int(i64::MIN) {
+        if op == UnOp::Neg
+            && *self.peek() == Tok::Int(i64::MIN)
+            && *self.peek_at(1) != Tok::Sym("**")
+        {
             let end = self.advance().span;
             return Ok(self.expr_node(start.to(end), ExprKind::Int(i64::MIN)));
         }

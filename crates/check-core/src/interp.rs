@@ -402,7 +402,9 @@ impl Interpreter<'_> {
         let slot = match root {
             Root::Var(name) => match self.slot(name) {
                 Some(slot) => slot,
-                None => return Ok(()),
+                None => {
+                    return internal(&format!("no variable `{name}` to write"), Span::default());
+                }
             },
             Root::Value(v) => v,
         };
@@ -1550,7 +1552,12 @@ impl Interpreter<'_> {
                             };
                             return Ok(());
                         }
-                        _ => return Ok(()),
+                        _ => {
+                            return internal(
+                                &format!("`{name}` on a value that isn't a collection"),
+                                span,
+                            );
+                        }
                     };
                     out = match (name, arg.take()) {
                         ("push", Some(v)) => {
@@ -1562,7 +1569,7 @@ impl Interpreter<'_> {
                             Ok(i) if i < items.len() => Value::Some(Rc::new(items.remove(i))),
                             _ => Value::None,
                         },
-                        _ => Value::Void,
+                        _ => return internal(&format!("`{name}` with the wrong argument"), span),
                     };
                     Ok(())
                 })
@@ -1575,12 +1582,13 @@ impl Interpreter<'_> {
     }
 
     fn builtin_method(&mut self, recv: Value, name: &str, args: Vec<Value>, span: Span) -> Eval {
-        let size = match &recv {
+        let scanned = match &recv {
+            _ if !matches!(name, "contains" | "join" | "enumerate" | "keys" | "values") => 1,
             Value::List(items) | Value::Set(items) => items.len(),
             Value::Map(entries) => entries.len(),
             _ => 1,
         };
-        self.spend(size as u64, span)?;
+        self.spend(scanned as u64, span)?;
         let arg_str = |i: usize| args.get(i).map(Value::display).unwrap_or_default();
         Ok(match (recv, name) {
             (Value::List(items), "length") => Value::Int(items.len() as i64),

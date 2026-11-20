@@ -2808,6 +2808,7 @@ fn a_lambda_cant_change_what_it_captured() {
         first_error("func f() {\n  var xs = [1]\n  let add = func(n: Int) { xs.push(n) }\n}"),
         "assign_to_captured"
     );
+    assert!(warnings("var n = 0\nlet f = func() { n += 1 }").is_empty());
     let own = "let f = func() -> Int {\n  var n = 0\n  n += 1\n  n\n}\nprint(f())";
     assert_eq!(output(own), "1");
 }
@@ -2831,11 +2832,15 @@ fn the_smallest_int_can_be_written() {
         "-9223372036854775808"
     );
     assert_eq!(first_error("print(9223372036854775808)"), "literal_too_big");
+    assert_eq!(
+        first_error("print(-9223372036854775808 ** 1)"),
+        "literal_too_big"
+    );
 }
 
 /// Loads `item.con` while the schema unit's `stock.conx` holds `stock`, and returns the panic
-/// code: loading builds every data value in the unit.
-fn data_panic(stock: &str) -> String {
+/// code if loading panicked: loading builds every data value in the unit.
+fn data_panic(stock: &str) -> Option<String> {
     let files = MemFiles(HashMap::from([
         (
             "shop/shop.check".to_string(),
@@ -2848,7 +2853,7 @@ fn data_panic(stock: &str) -> String {
         Err(Report {
             outcome: Outcome::Panicked(code),
             ..
-        }) => code.to_string(),
+        }) => Some(code.to_string()),
         Err(r) => panic!(
             "{:?}",
             r.diagnostics
@@ -2856,23 +2861,26 @@ fn data_panic(stock: &str) -> String {
                 .map(|d| d.code.to_string())
                 .collect::<Vec<_>>()
         ),
-        Ok(_) => panic!("loaded"),
+        Ok(_) => None,
     }
 }
 
 #[test]
 fn loading_data_stops_on_a_failed_try_or_an_endless_loop() {
     assert_eq!(
-        data_panic("[Item(\"sword\", try Int.parse(\"x\"))]"),
-        "data_try_failed"
+        data_panic("[Item(\"sword\", try Int.parse(\"x\"))]").as_deref(),
+        Some("data_try_failed")
     );
     assert_eq!(
-        data_panic("[Item(\"sword\", { loop { } })]"),
-        "out_of_steps"
+        data_panic("[Item(\"sword\", { loop { } })]").as_deref(),
+        Some("out_of_steps")
     );
     // Few loop passes, but each `contains` looks at 100,000 items.
     let busy = "[Item(\"sword\", {\n  var xs: List<Int> = []\n  for i in 0..100000 { xs.push(i) }\n  var n = 0\n  for j in 0..200 { if xs.contains(-1) { n += 1 } }\n  n\n})]";
-    assert_eq!(data_panic(busy), "out_of_steps");
+    assert_eq!(data_panic(busy).as_deref(), Some("out_of_steps"));
+    // `length()` doesn't scan, so it costs one step however long the list is.
+    let fine = "[Item(\"sword\", {\n  var xs: List<Int> = []\n  for i in 0..5000 { xs.push(i) }\n  var i = 0\n  while i < xs.length() { i += 1 }\n  i\n})]";
+    assert_eq!(data_panic(fine), None);
 }
 
 #[test]
