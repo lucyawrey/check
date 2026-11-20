@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::ast::*;
 use crate::diag::{Code, Diagnostic, Edit, Span};
 use crate::lexer::{StrPart, Tok, Token};
@@ -1677,7 +1679,7 @@ impl Parser<'_> {
                 let body = self.code_body(ret.is_some(), true)?;
                 return Ok(self.expr_node(
                     span.to(body.span),
-                    ExprKind::Lambda(params, ret, Box::new(body)),
+                    ExprKind::Lambda(params, ret, Arc::new(body)),
                 ));
             }
             Tok::Kw("if") => return self.if_expr(span),

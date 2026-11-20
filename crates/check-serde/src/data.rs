@@ -40,9 +40,8 @@ impl From<check_core::value::Value> for Data {
             Value::Float(n) => Data::Float(n),
             Value::Bool(b) => Data::Bool(b),
             Value::Str(s) => Data::Str(s.to_string()),
-            Value::List(items) | Value::Set(items) => {
-                Data::List(items.iter().cloned().map(Data::from).collect())
-            }
+            Value::List(items) => Data::List(items.iter().cloned().map(Data::from).collect()),
+            Value::Set(items) => Data::List(items.iter().cloned().map(Data::from).collect()),
             Value::Map(entries) => Data::Map(
                 entries
                     .iter()

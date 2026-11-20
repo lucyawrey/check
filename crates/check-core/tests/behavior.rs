@@ -2779,7 +2779,7 @@ fn deep_programs_reach_the_call_limit_without_overflowing() {
     };
     assert_eq!(output(&list(200_000, "let m = l\nprint(l == m)")), "true");
     assert_eq!(
-        output(&list(20_000, "let s = \"{l}\"\nprint(\"done\")")),
+        output(&list(200_000, "let s = \"{l}\"\nprint(\"done\")")),
         "done"
     );
 }
@@ -2878,6 +2878,9 @@ fn loading_data_stops_on_a_failed_try_or_an_endless_loop() {
     // Few loop passes, but each `contains` looks at 100,000 items.
     let busy = "[Item(\"sword\", {\n  var xs: List<Int> = []\n  for i in 0..100000 { xs.push(i) }\n  var n = 0\n  for j in 0..200 { if xs.contains(-1) { n += 1 } }\n  n\n})]";
     assert_eq!(data_panic(busy).as_deref(), Some("out_of_steps"));
+    // Map inserts are hashed, so this is quick (it took minutes with linear lookups).
+    let inserts = "[Item(\"sword\", {\n  var m: Map<Int, Int> = [=]\n  for i in 0..100000 { m[i] = i }\n  m.length()\n})]";
+    assert_eq!(data_panic(inserts), None);
     // `length()` doesn't scan, so it costs one step however long the list is.
     let fine = "[Item(\"sword\", {\n  var xs: List<Int> = []\n  for i in 0..5000 { xs.push(i) }\n  var i = 0\n  while i < xs.length() { i += 1 }\n  i\n})]";
     assert_eq!(data_panic(fine), None);
@@ -2887,4 +2890,27 @@ fn loading_data_stops_on_a_failed_try_or_an_endless_loop() {
 fn nan_matches_no_float_range() {
     let src = "let x = 0.0 / 0.0\nprint(match x { 0.0..1.0 => \"in\", _ => \"out\" })";
     assert_eq!(output(src), "out");
+}
+
+#[test]
+fn maps_and_sets_find_every_kind_of_key_and_keep_their_order() {
+    let src = "enum Dir { Up, Down }\nlet keys = [true = 1, false = 2]\nlet dirs = [Dir.Up = 1, Dir.Down = 2]\nlet pairs = [(1, \"x\") = 1, (2, \"y\") = 2]\nclass P(x: Int)\nlet points = [P(1) = 1, P(2) = 2]\nprint(\"{keys[false]} {dirs[Dir.Down]} {pairs[(2, \"y\")]} {points[P(1)]}\")\nvar s = Set([3, 1, 2])\ns.remove(1)\ns.add(3)\ns.add(4)\nvar n = [\"a\" = 1, \"b\" = 2, \"c\" = 3]\nn.remove(\"a\")\nn[\"a\"] = 4\nprint(\"{s} {n}\")";
+    assert_eq!(
+        output(src),
+        "Some(2) Some(2) Some(2) Some(1)\nSet([3, 2, 4]) [\"b\" = 2, \"c\" = 3, \"a\" = 4]"
+    );
+}
+
+#[test]
+fn a_lambda_keeps_what_it_captured_when_it_was_made() {
+    let src = "var g = 1\nlet f = func() -> Int { g }\ng = 2\nvar fs: List<func() -> Int> = []\nfor i in 0..3 { fs.push(func() => i * 10) }\nfunc outer() -> func() -> func() -> Int {\n  let x = 5\n  func() => func() => x + 1\n}\nprint(\"{f()} {fs.map(func(h) => h())} {outer()()()}\")";
+    assert_eq!(output(src), "1 [0, 10, 20] 6");
+}
+
+#[test]
+fn a_lambda_changes_shared_values_it_captured_and_calls_its_own_captures() {
+    let src = "ref class Box(var x: Int)\nfunc g() -> Int { 1 }\nfunc main() {\n  let r = Ref([1])\n  let b = Box(1)\n  let g = func() => 2\n  let f = func() {\n    r.push(2)\n    b.x = 7\n  }\n  f()\n  let h = func() => g()\n  print(\"{r} {b} {h()}\")\n}\nmain()";
+    assert_eq!(output(src), "Ref([1, 2]) Box(x = 7) 2");
+    let callback = "ref class Player {\n  var score: Int = 0\n  func bump() -> func() { func() { this.score += 1 } }\n}\nlet p = Player()\np.bump()()\nprint(p.score)";
+    assert_eq!(output(callback), "1");
 }

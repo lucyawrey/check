@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::ast::*;
 use crate::checker::BUILT_IN_TYPES;
@@ -705,7 +706,8 @@ impl Resolver<'_> {
                 if let Some(t) = ret {
                     r.type_expr(t);
                 }
-                r.expr(body);
+                // Freshly parsed, so the body isn't shared yet and this doesn't copy it.
+                r.expr(Arc::make_mut(body));
             }),
             ExprKind::Block(stmts) => self.scoped(|r| {
                 for s in stmts.iter_mut() {

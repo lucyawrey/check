@@ -8,7 +8,9 @@ use crate::ast::*;
 use crate::checker::{EQ, Info, PRINTABLE, RESULT, Resolved, SET};
 use crate::diag::{Code, Span};
 use crate::host::{self, Io};
-use crate::value::{Callable, Record, Value, map_code, map_get};
+use indexmap::{IndexMap, IndexSet};
+
+use crate::value::{Callable, Record, Value, write_items, write_map};
 
 pub struct Panic {
     pub code: Code,
@@ -56,8 +58,11 @@ enum Step {
     Index(Value, Span),
 }
 
+#[derive(Default)]
 struct Frame {
     scopes: Vec<HashMap<String, Value>>,
+    /// A lambda call's captured variables, read after the frame's own scopes and never written.
+    captured: Option<Rc<HashMap<String, Value>>>,
 }
 
 pub struct Interpreter<'a> {
@@ -154,7 +159,7 @@ fn start<'a>(
         const_values: HashMap::new(),
         building: HashSet::new(),
         globals: HashMap::new(),
-        frames: vec![Frame { scopes: Vec::new() }],
+        frames: vec![Frame::default()],
         depth: 0,
         printing: Vec::new(),
         budget: Some(DATA_BUDGET),
@@ -283,21 +288,11 @@ fn descend<'s>(v: &mut Value, steps: &'s [Step], f: Writer) -> Descent<'s> {
                 None => panic(Code::index_out_of_range, *span),
             }
         }
-        (Value::Map(entries), Step::Index(key, span)) => {
-            match Rc::make_mut(entries).iter_mut().find(|(k, _)| k == key) {
-                Some((_, v)) => descend(v, rest, f),
-                None => panic(Code::missing_key, *span),
-            }
-        }
+        (Value::Map(entries), Step::Index(key, span)) => match Rc::make_mut(entries).get_mut(key) {
+            Some(v) => descend(v, rest, f),
+            None => panic(Code::missing_key, *span),
+        },
         _ => Ok(None),
-    }
-}
-
-/// Sets `key` to `value`, keeping its place if it's there and adding it at the end if not.
-fn map_insert(entries: &mut Vec<(Value, Value)>, key: Value, value: Value) {
-    match entries.iter_mut().find(|(k, _)| *k == key) {
-        Some((_, v)) => *v = value,
-        None => entries.push((key, value)),
     }
 }
 
@@ -392,9 +387,20 @@ impl Interpreter<'_> {
                 steps.push(Step::Index(key, e.span));
                 Ok(root)
             }
-            ExprKind::Name(name) => Ok(Root::Var(name.clone())),
-            ExprKind::This => Ok(Root::Var("this".to_string())),
+            ExprKind::Name(name) => Ok(self.root(name)),
+            ExprKind::This => Ok(self.root("this")),
             _ => Ok(Root::Value(self.expr(e)?)),
+        }
+    }
+
+    /// A write path's variable. A lambda's captured variable is a copy that writes can only reach
+    /// through (the checker allows only paths into a `Ref` or `ref class`), so it starts there.
+    fn root(&self, name: &str) -> Root {
+        let frame = self.frames.last().expect("frame");
+        let own = frame.scopes.iter().any(|s| s.contains_key(name));
+        match frame.captured.as_ref().and_then(|c| c.get(name)) {
+            Some(v) if !own => Root::Value(v.clone()),
+            _ => Root::Var(name.to_string()),
         }
     }
 
@@ -496,62 +502,77 @@ impl Interpreter<'_> {
         self.funcs[key].clone()
     }
 
-    fn texts(&mut self, items: &[Value], span: Span) -> Result<String, Flow> {
-        let mut parts = Vec::with_capacity(items.len());
-        for item in items {
-            parts.push(self.text(item, true, span)?);
-        }
-        Ok(parts.join(", "))
-    }
-
     /// How `print` and interpolation show a value, through `toString()` where it's `Printable`.
     fn text(&mut self, v: &Value, quoted: bool, span: Span) -> Result<String, Flow> {
-        grow(|| self.text_inner(v, quoted, span))
+        let mut out = String::new();
+        self.write_text(v, quoted, span, &mut out)?;
+        Ok(out)
     }
 
-    fn text_inner(&mut self, v: &Value, quoted: bool, span: Span) -> Result<String, Flow> {
+    /// Writes [`Interpreter::text`] into `out`, so nested values share one buffer.
+    fn write_text(
+        &mut self,
+        v: &Value,
+        quoted: bool,
+        span: Span,
+        out: &mut String,
+    ) -> Result<(), Flow> {
+        grow(|| self.write_text_inner(v, quoted, span, out))
+    }
+
+    fn write_text_inner(
+        &mut self,
+        v: &Value,
+        quoted: bool,
+        span: Span,
+        out: &mut String,
+    ) -> Result<(), Flow> {
         if self.implements(&v.tag(), PRINTABLE) {
             let decl = self.find_method(v, "toString");
-            return Ok(self
+            let text = self
                 .run_decl(&decl, Vec::new(), Some(v.clone()), span, &[])?
-                .0
-                .display());
+                .0;
+            out.push_str(&text.display());
+            return Ok(());
         }
-        Ok(match v {
-            Value::List(items) => format!("[{}]", self.texts(items, span)?),
-            Value::Set(items) => format!("Set([{}])", self.texts(items, span)?),
-            Value::Map(entries) => {
-                let mut parts = Vec::with_capacity(entries.len());
-                for (k, v) in entries.iter() {
-                    parts.push((self.text(k, true, span)?, self.text(v, true, span)?));
-                }
-                map_code(parts.into_iter())
-            }
+        let field = |f: &Value, out: &mut String| self.write_text(f, true, span, out);
+        match v {
+            Value::List(items) => write_items(out, "[", items.iter(), "]", field),
+            Value::Set(items) => write_items(out, "Set([", items.iter(), "])", field),
+            Value::Map(entries) => write_map(out, entries.iter(), field),
             Value::Some(inner) if !matches!(**inner, Value::Void) => {
-                format!("Some({})", self.text(inner, true, span)?)
+                write_items(out, "Some(", [&**inner].into_iter(), ")", field)
             }
-            Value::Object(r) | Value::Record(r) => {
-                r.code_with(true, |f| self.text(f, true, span))?
-            }
-            Value::Variant(r) => r.code_with(false, |f| self.text(f, true, span))?,
+            Value::Object(r) | Value::Record(r) => r.write_with(true, out, field),
+            Value::Variant(r) => r.write_with(false, out, field),
             Value::Shared(r) => {
                 let address = Rc::as_ptr(r) as usize;
                 if self.printing.contains(&address) {
-                    return Ok("...".to_string());
+                    out.push_str("...");
+                    return Ok(());
                 }
+                // A copy, so `toString()` on a field can change this object while it's printed.
                 let record = r.borrow().clone();
                 self.printing.push(address);
-                let text = record.code_with(true, |f| self.text(f, true, span));
+                let done =
+                    record.write_with(true, out, |f, out| self.write_text(f, true, span, out));
                 self.printing.pop();
-                text?
+                done
             }
             Value::Ref(r) => {
+                // A copy, as for `Shared`: printing can run code that changes it.
                 let inner = r.borrow().clone();
-                format!("Ref({})", self.text(&inner, true, span)?)
+                write_items(out, "Ref(", [&inner].into_iter(), ")", field)
             }
-            Value::Str(_) if !quoted => v.display(),
-            _ => v.code(),
-        })
+            Value::Str(_) if !quoted => {
+                out.push_str(&v.display());
+                Ok(())
+            }
+            _ => {
+                v.write_code(out);
+                Ok(())
+            }
+        }
     }
 
     fn construct(&mut self, class_name: &str, args: &[Arg], span: Span) -> Eval {
@@ -615,6 +636,7 @@ impl Interpreter<'_> {
         let scope = HashMap::from([("this".to_string(), this)]);
         self.frames.push(Frame {
             scopes: vec![scope],
+            captured: None,
         });
         let result = self.expr(init.body.as_ref().expect("init has a body"));
         let mut frame = self.frames.pop().expect("frame");
@@ -782,8 +804,20 @@ impl Interpreter<'_> {
         self.globals.get_mut(name)
     }
 
+    /// A variable's value: the frame's own scopes, then a lambda's captures, then globals.
+    fn variable(&self, name: &str) -> Option<&Value> {
+        let frame = self.frames.last().expect("frame");
+        frame
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.get(name))
+            .or_else(|| frame.captured.as_ref().and_then(|c| c.get(name)))
+            .or_else(|| self.globals.get(name))
+    }
+
     fn lookup(&mut self, name: &str) -> Option<Value> {
-        if let Some(v) = self.slot(name) {
+        if let Some(v) = self.variable(name) {
             return Some(v.clone());
         }
         if let Some(decl) = self.funcs.get(name) {
@@ -829,7 +863,7 @@ impl Interpreter<'_> {
                     self.write_steps(&mut root, init, &mut |slot| {
                         through_ref(slot, |slot| match slot {
                             Value::Map(entries) => {
-                                map_insert(Rc::make_mut(entries), key.clone(), rhs.clone());
+                                Rc::make_mut(entries).insert(key.clone(), rhs.clone());
                                 Ok(())
                             }
                             _ => descend(slot, std::slice::from_ref(last), &mut |v| {
@@ -1000,11 +1034,11 @@ impl Interpreter<'_> {
                 Ok(Value::List(Rc::new(values)))
             }
             ExprKind::Map(items) => {
-                let mut entries = Vec::with_capacity(items.len());
+                let mut entries = IndexMap::with_capacity(items.len());
                 for (k, v) in items {
                     let k = self.expr(k)?;
                     let v = self.expr(v)?;
-                    map_insert(&mut entries, k, v);
+                    entries.insert(k, v);
                 }
                 Ok(Value::Map(Rc::new(entries)))
             }
@@ -1041,7 +1075,7 @@ impl Interpreter<'_> {
                     (Value::List(items), Value::Int(i)) => {
                         usize::try_from(i).ok().and_then(|i| items.get(i).cloned())
                     }
-                    (Value::Map(entries), key) => map_get(&entries, &key).cloned(),
+                    (Value::Map(entries), key) => entries.get(&key).cloned(),
                     _ => None,
                 };
                 let unwrapped = self.info.unwrapped_index.contains(&expr.id);
@@ -1055,10 +1089,15 @@ impl Interpreter<'_> {
                 }
             }
             ExprKind::Lambda(params, _, body) => {
-                let mut captured = self.globals.clone();
-                for scope in &self.frames.last().expect("frame").scopes {
-                    captured.extend(scope.iter().map(|(k, v)| (k.clone(), v.clone())));
-                }
+                let captured = info
+                    .captures
+                    .get(&expr.id)
+                    .map_or_else(HashMap::new, |names| {
+                        names
+                            .iter()
+                            .filter_map(|n| Some((n.clone(), self.lookup(n)?)))
+                            .collect()
+                    });
                 let sig = self
                     .info
                     .signatures
@@ -1067,8 +1106,8 @@ impl Interpreter<'_> {
                     .unwrap_or_default();
                 Ok(Value::Func(Rc::new(Callable::Lambda {
                     params: params.clone(),
-                    body: Rc::new((**body).clone()),
-                    captured,
+                    body: body.clone(),
+                    captured: Rc::new(captured),
                     sig,
                 })))
             }
@@ -1184,16 +1223,18 @@ impl Interpreter<'_> {
             }
             ExprKind::For(pattern, iter, body, false) => {
                 let wraps = self.info.wrapping.contains(&expr.id);
+                // Each holds its collection's `Rc`, so the loop walks the collection as it was
+                // when the loop started, without copying it.
                 let items: Box<dyn Iterator<Item = Value>> = match self.expr(iter)? {
                     Value::Range(lo, hi, false) => Box::new((lo..hi).map(Value::Int)),
                     Value::Range(lo, hi, true) => Box::new((lo..=hi).map(Value::Int)),
-                    Value::List(items) | Value::Set(items) => {
-                        Box::new((*items).clone().into_iter())
-                    }
-                    Value::Map(entries) => {
-                        Box::new((*entries).clone().into_iter().map(|(k, v)| pair(k, v)))
-                    }
-                    _ => Box::new(std::iter::empty()),
+                    Value::List(items) => Box::new((0..items.len()).map(move |i| items[i].clone())),
+                    Value::Set(items) => Box::new((0..items.len()).map(move |i| items[i].clone())),
+                    Value::Map(entries) => Box::new((0..entries.len()).map(move |i| {
+                        let (k, v) = entries.get_index(i).expect("in range");
+                        pair(k.clone(), v.clone())
+                    })),
+                    v => return internal(&format!("`for` over {}", v.code()), iter.span),
                 };
                 for item in items {
                     self.spend(1, expr.span)?;
@@ -1291,7 +1332,7 @@ impl Interpreter<'_> {
 
     fn call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Eval {
         if let ExprKind::Name(name) = &callee.kind
-            && self.slot(name).is_none()
+            && self.variable(name).is_none()
         {
             if let Some(decl) = self.funcs.get(name).cloned() {
                 return self.call_named(&decl, args, span, None);
@@ -1311,12 +1352,7 @@ impl Interpreter<'_> {
                     let Value::List(items) = self.expr(&args[0].value)? else {
                         return Ok(Value::Void);
                     };
-                    let mut set = Vec::new();
-                    for item in items.iter() {
-                        if !set.contains(item) {
-                            set.push(item.clone());
-                        }
-                    }
+                    let set: IndexSet<Value> = items.iter().cloned().collect();
                     return Ok(Value::Set(Rc::new(set)));
                 }
                 "Ref" => {
@@ -1393,7 +1429,11 @@ impl Interpreter<'_> {
         if let Some(this) = this {
             scope.insert("this".to_string(), this);
         }
-        self.enter_keeping(vec![scope], body, span, keep)
+        let frame = Frame {
+            scopes: vec![scope],
+            captured: None,
+        };
+        self.enter_keeping(frame, body, span, keep)
     }
 
     fn bind_args(&mut self, params: &[Param], args: &[Arg]) -> Result<Bound, Flow> {
@@ -1433,7 +1473,7 @@ impl Interpreter<'_> {
                     None => match &p.default {
                         Some(d) => {
                             // A default sees the names where it's declared, not the caller's locals.
-                            self.frames.push(Frame { scopes: Vec::new() });
+                            self.frames.push(Frame::default());
                             let v = self.expr(d);
                             self.frames.pop();
                             v?
@@ -1459,20 +1499,19 @@ impl Interpreter<'_> {
                 captured,
                 ..
             } => {
-                let scope = params.iter().map(|p| p.name.clone()).zip(values).collect();
+                let frame = Frame {
+                    scopes: vec![params.iter().map(|p| p.name.clone()).zip(values).collect()],
+                    captured: Some(captured.clone()),
+                };
                 let body = body.clone();
-                self.enter(vec![captured.clone(), scope], &body, span)
+                Ok(self.enter_keeping(frame, &body, span, &[])?.0)
             }
         }
     }
 
-    fn enter(&mut self, scopes: Vec<HashMap<String, Value>>, body: &Expr, span: Span) -> Eval {
-        Ok(self.enter_keeping(scopes, body, span, &[])?.0)
-    }
-
     fn enter_keeping(
         &mut self,
-        scopes: Vec<HashMap<String, Value>>,
+        frame: Frame,
         body: &Expr,
         span: Span,
         keep: &[String],
@@ -1482,7 +1521,7 @@ impl Interpreter<'_> {
         }
         self.spend(1, span)?;
         self.depth += 1;
-        self.frames.push(Frame { scopes });
+        self.frames.push(frame);
         let result = self.expr(body);
         let mut frame = self.frames.pop().expect("frame");
         let kept = keep
@@ -1529,26 +1568,19 @@ impl Interpreter<'_> {
                             Rc::make_mut(list)
                         }
                         (Value::Map(entries), Some(key)) => {
-                            let entries = Rc::make_mut(entries);
-                            let i = entries.iter().position(|(k, _)| *k == key);
-                            out = i
-                                .map_or(Value::None, |i| Value::Some(Rc::new(entries.remove(i).1)));
+                            out = match Rc::make_mut(entries).shift_remove(&key) {
+                                Some(v) => Value::Some(Rc::new(v)),
+                                None => Value::None,
+                            };
                             return Ok(());
                         }
                         (Value::Set(set), Some(item)) => {
                             let set = Rc::make_mut(set);
-                            let i = set.iter().position(|x| *x == item);
-                            out = match (name, i) {
-                                ("add", None) => {
-                                    set.push(item);
-                                    Value::Void
-                                }
-                                ("add", Some(_)) => Value::Void,
-                                (_, Some(i)) => {
-                                    set.remove(i);
-                                    Value::Bool(true)
-                                }
-                                (_, None) => Value::Bool(false),
+                            out = if name == "add" {
+                                set.insert(item);
+                                Value::Void
+                            } else {
+                                Value::Bool(set.shift_remove(&item))
                             };
                             return Ok(());
                         }
@@ -1583,9 +1615,8 @@ impl Interpreter<'_> {
 
     fn builtin_method(&mut self, recv: Value, name: &str, args: Vec<Value>, span: Span) -> Eval {
         let scanned = match &recv {
-            _ if !matches!(name, "contains" | "join" | "enumerate" | "keys" | "values") => 1,
-            Value::List(items) | Value::Set(items) => items.len(),
-            Value::Map(entries) => entries.len(),
+            Value::List(items) if matches!(name, "contains" | "join" | "enumerate") => items.len(),
+            Value::Map(entries) if matches!(name, "keys" | "values") => entries.len(),
             _ => 1,
         };
         self.spend(scanned as u64, span)?;
@@ -1613,7 +1644,7 @@ impl Interpreter<'_> {
             (Value::Map(entries), "length") => Value::Int(entries.len() as i64),
             (Value::Map(entries), "isEmpty") => Value::Bool(entries.is_empty()),
             (Value::Map(entries), "contains") => {
-                Value::Bool(args.first().is_some_and(|k| map_get(&entries, k).is_some()))
+                Value::Bool(args.first().is_some_and(|k| entries.contains_key(k)))
             }
             (Value::Map(entries), "keys") => {
                 Value::List(Rc::new(entries.iter().map(|(k, _)| k.clone()).collect()))

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::diag::Span;
 
 pub type NodeId = usize;
@@ -282,7 +284,8 @@ pub enum ExprKind {
     Method(Box<Expr>, String, Vec<Arg>),
     Field(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
-    Lambda(Vec<Param>, Option<TypeExpr>, Box<Expr>),
+    /// The body is shared, so a lambda value holds it without copying.
+    Lambda(Vec<Param>, Option<TypeExpr>, Arc<Expr>),
     Block(Vec<Stmt>),
     If(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
     Match(Box<Expr>, Vec<Arm>),

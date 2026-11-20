@@ -1,8 +1,12 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+
+use indexmap::{IndexMap, IndexSet};
 use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::{Expr, FuncDecl, Param};
 use crate::checker::{MAP, MAYBE, SET};
@@ -11,8 +15,9 @@ pub enum Callable {
     Named(Rc<FuncDecl>, String),
     Lambda {
         params: Vec<Param>,
-        body: Rc<Expr>,
-        captured: HashMap<String, Value>,
+        body: Arc<Expr>,
+        /// What the lambda read from outside, as it was when the lambda was made.
+        captured: Rc<HashMap<String, Value>>,
         sig: String,
     },
 }
@@ -45,7 +50,12 @@ impl Drop for Record {
                         pending.append(&mut r.into_inner().fields);
                     }
                 }
-                Value::List(items) | Value::Set(items) => {
+                Value::List(items) => {
+                    if let Ok(items) = Rc::try_unwrap(items) {
+                        pending.extend(items);
+                    }
+                }
+                Value::Set(items) => {
                     if let Ok(items) = Rc::try_unwrap(items) {
                         pending.extend(items);
                     }
@@ -79,31 +89,30 @@ impl Record {
         }
     }
 
-    fn code(&self, always_parens: bool) -> String {
-        match self.code_with(always_parens, |v| Ok::<_, Infallible>(v.code())) {
-            Ok(text) => text,
-            Err(never) => match never {},
-        }
-    }
-
-    /// The record as code, with `field` giving each field's text.
-    pub fn code_with<E>(
+    /// Writes the record as code, with `field` writing each field's text.
+    pub fn write_with<E>(
         &self,
         always_parens: bool,
-        mut field: impl FnMut(&Value) -> Result<String, E>,
-    ) -> Result<String, E> {
+        out: &mut String,
+        mut field: impl FnMut(&Value, &mut String) -> Result<(), E>,
+    ) -> Result<(), E> {
+        out.push_str(&self.name);
         if self.fields.is_empty() && !always_parens {
-            return Ok(self.name.to_string());
+            return Ok(());
         }
-        let mut fields = Vec::with_capacity(self.fields.len());
+        out.push('(');
         for (i, v) in self.fields.iter().enumerate() {
-            let text = field(v)?;
-            fields.push(match &self.field_names {
-                Some(names) => format!("{} = {text}", names[i]),
-                None => text,
-            });
+            if i > 0 {
+                out.push_str(", ");
+            }
+            if let Some(names) = &self.field_names {
+                out.push_str(&names[i]);
+                out.push_str(" = ");
+            }
+            field(v, out)?;
         }
-        Ok(format!("{}({})", self.name, fields.join(", ")))
+        out.push(')');
+        Ok(())
     }
 
     pub fn unnamed(field_names: Option<Rc<[Rc<str>]>>, fields: Vec<Value>) -> Record {
@@ -130,9 +139,9 @@ pub enum Value {
     Str(Rc<str>),
     List(Rc<Vec<Value>>),
     /// Entries in insertion order.
-    Map(Rc<Vec<(Value, Value)>>),
+    Map(Rc<IndexMap<Value, Value>>),
     /// Items in insertion order.
-    Set(Rc<Vec<Value>>),
+    Set(Rc<IndexSet<Value>>),
     Some(Rc<Value>),
     None,
     Range(i64, i64, bool),
@@ -143,6 +152,27 @@ pub enum Value {
     Variant(Rc<Record>),
     Record(Rc<Record>),
     Void,
+}
+
+// `==` is exact for the types a map key or set item can have (`invalid_key_type` rules out
+// `Float` and everything else whose `==` is looser), so it's an equivalence for those.
+impl Eq for Value {}
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Value::Int(n) => n.hash(state),
+            Value::Bool(b) => b.hash(state),
+            Value::Str(s) => s.hash(state),
+            Value::Some(v) => v.hash(state),
+            Value::Object(r) | Value::Variant(r) | Value::Record(r) => {
+                r.name.hash(state);
+                r.fields.hash(state);
+            }
+            // Never a key, so one hash for all is correct, if slow.
+            _ => {}
+        }
+    }
 }
 
 impl PartialEq for Value {
@@ -162,10 +192,8 @@ impl Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
-            (Value::Map(a), Value::Map(b)) => {
-                a.len() == b.len() && a.iter().all(|(k, v)| map_get(b, k) == Some(v))
-            }
-            (Value::Set(a), Value::Set(b)) => a.len() == b.len() && a.iter().all(|x| b.contains(x)),
+            (Value::Map(a), Value::Map(b)) => a == b,
+            (Value::Set(a), Value::Set(b)) => a == b,
             (Value::Some(a), Value::Some(b)) => a == b,
             (Value::None, Value::None) | (Value::Void, Value::Void) => true,
             (Value::Range(a, b, x), Value::Range(c, d, y)) => a == c && b == d && x == y,
@@ -236,62 +264,94 @@ impl Value {
     }
 
     pub fn code(&self) -> String {
-        crate::interp::grow(|| self.code_inner())
+        let mut out = String::new();
+        self.write_code(&mut out);
+        out
     }
 
-    fn code_inner(&self) -> String {
-        match self {
-            Value::Int(n) => n.to_string(),
-            Value::Float(f) => float_text(*f),
-            Value::Bool(b) => b.to_string(),
-            Value::Str(s) => quote(s),
-            Value::List(items) => format!(
-                "[{}]",
-                items.iter().map(Value::code).collect::<Vec<_>>().join(", ")
-            ),
-            Value::Map(entries) => map_code(entries.iter().map(|(k, v)| (k.code(), v.code()))),
-            Value::Set(items) => format!(
-                "Set([{}])",
-                items.iter().map(Value::code).collect::<Vec<_>>().join(", ")
-            ),
-            Value::Some(v) => match &**v {
-                Value::Void => "Some()".to_string(),
-                inner => format!("Some({})", inner.code()),
-            },
-            Value::None => "None".to_string(),
+    /// Writes the value as code into `out`; nested values write into the same buffer, so deep
+    /// values take time in proportion to their size.
+    pub fn write_code(&self, out: &mut String) {
+        let field = |v: &Value, out: &mut String| {
+            v.write_code(out);
+            Ok::<_, Infallible>(())
+        };
+        crate::interp::grow(|| match self {
+            Value::Int(n) => out.push_str(&n.to_string()),
+            Value::Float(f) => out.push_str(&float_text(*f)),
+            Value::Bool(b) => out.push_str(&b.to_string()),
+            Value::Str(s) => out.push_str(&quote(s)),
+            Value::List(items) => done(write_items(out, "[", items.iter(), "]", field)),
+            Value::Map(entries) => done(write_map(out, entries.iter(), field)),
+            Value::Set(items) => done(write_items(out, "Set([", items.iter(), "])", field)),
+            Value::Some(v) => done(write_items(out, "Some(", [&**v].into_iter(), ")", field)),
+            Value::None => out.push_str("None"),
             Value::Range(a, b, inclusive) => {
-                format!("{a}..{}{b}", if *inclusive { "=" } else { "" })
+                let eq = if *inclusive { "=" } else { "" };
+                out.push_str(&format!("{a}..{eq}{b}"))
             }
             Value::Func(f) => match &**f {
-                Callable::Named(_, sig) | Callable::Lambda { sig, .. } => sig.clone(),
+                Callable::Named(_, sig) | Callable::Lambda { sig, .. } => out.push_str(sig),
             },
-            Value::Object(r) => r.code(true),
+            Value::Object(r) | Value::Record(r) => done(r.write_with(true, out, field)),
             Value::Shared(r) => match r.try_borrow_mut() {
-                Ok(record) => record.code(true),
-                Err(_) => "...".to_string(),
+                Ok(record) => done(record.write_with(true, out, field)),
+                Err(_) => out.push_str("..."),
             },
             Value::Ref(v) => match v.try_borrow_mut() {
-                Ok(v) => format!("Ref({})", v.code()),
-                Err(_) => "Ref(...)".to_string(),
+                Ok(v) => done(write_items(out, "Ref(", [&*v].into_iter(), ")", field)),
+                Err(_) => out.push_str("Ref(...)"),
             },
-            Value::Variant(r) => r.code(false),
-            Value::Record(r) => r.code(true),
-            Value::Void => String::new(),
+            Value::Variant(r) => done(r.write_with(false, out, field)),
+            Value::Void => {}
+        });
+    }
+}
+
+fn done(written: Result<(), Infallible>) {
+    let Ok(()) = written;
+}
+
+/// Writes `items` between `open` and `close`, separated by commas, with `item` writing each.
+pub fn write_items<'v, E>(
+    out: &mut String,
+    open: &str,
+    items: impl Iterator<Item = &'v Value>,
+    close: &str,
+    mut item: impl FnMut(&Value, &mut String) -> Result<(), E>,
+) -> Result<(), E> {
+    out.push_str(open);
+    for (i, v) in items.enumerate() {
+        if i > 0 {
+            out.push_str(", ");
         }
+        item(v, out)?;
     }
+    out.push_str(close);
+    Ok(())
 }
 
-pub fn map_get<'m>(entries: &'m [(Value, Value)], key: &Value) -> Option<&'m Value> {
-    entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
-}
-
-pub fn map_code(entries: impl Iterator<Item = (String, String)>) -> String {
-    let parts: Vec<String> = entries.map(|(k, v)| format!("{k} = {v}")).collect();
-    if parts.is_empty() {
-        "[=]".to_string()
-    } else {
-        format!("[{}]", parts.join(", "))
+/// Writes a map literal, `[=]` when it's empty, with `item` writing each key and value.
+pub fn write_map<'v, E>(
+    out: &mut String,
+    entries: impl ExactSizeIterator<Item = (&'v Value, &'v Value)>,
+    mut item: impl FnMut(&Value, &mut String) -> Result<(), E>,
+) -> Result<(), E> {
+    if entries.len() == 0 {
+        out.push_str("[=]");
+        return Ok(());
     }
+    out.push('[');
+    for (i, (k, v)) in entries.enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        item(k, out)?;
+        out.push_str(" = ");
+        item(v, out)?;
+    }
+    out.push(']');
+    Ok(())
 }
 
 pub fn float_text(f: f64) -> String {
