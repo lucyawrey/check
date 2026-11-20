@@ -393,6 +393,16 @@ impl Parser<'_> {
         if self.is_kw("func") && matches!(self.peek_at(1), Tok::Ident(_)) {
             return Ok(Stmt::Func(self.func_decl(false, false)?));
         }
+        if self.is_soft("ref")
+            && matches!(self.peek_at(1), Tok::Ident(_))
+            && matches!(self.peek_at(2), Tok::Sym("="))
+        {
+            self.advance();
+            let (name, span) = self.ident()?;
+            self.advance();
+            let target = self.expr()?;
+            return Ok(Stmt::RefLet { name, span, target });
+        }
         let target = self.expr()?;
         let op = match self.peek() {
             Tok::Sym("=") => None,

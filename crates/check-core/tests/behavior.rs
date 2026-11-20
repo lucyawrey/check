@@ -2796,6 +2796,74 @@ fn a_change_through_a_shared_isnt_a_reassignment() {
     );
 }
 
+const GAME: &str =
+    "class Pos(var x: Int, var y: Int)\nclass Game(var players: Pos[], var score: Int)\n";
+
+#[test]
+fn a_ref_binding_changes_the_original() {
+    let src = format!(
+        "{GAME}func moved(g: Game) -> Game {{\n  var game = g\n  ref p = game.players[1]\n  p.x += 1\n  p.y = 7\n  return game\n}}\n\
+        var game = Game([Pos(0, 0), Pos(1, 1)], 0)\ngame = moved(game)\n\
+        for i in 0..3 {{\n  ref first = game.players[0]\n  first = Pos(i, i)\n  if i == 1 {{ break }}\n}}\n\
+        ref s = game.score\ns += 5\nprint(game)"
+    );
+    assert_eq!(
+        output(&src),
+        "Game(players = [Pos(x = 1, y = 1), Pos(x = 2, y = 7)], score = 5)"
+    );
+}
+
+#[test]
+fn nested_ref_bindings_write_back_innermost_first() {
+    let src = "class Row(var cells: Int[])\nfunc fill() -> Row[] {\n  var rows = [Row([0, 0])]\n  if true {\n    ref row = rows[0]\n    ref cell = row.cells[1]\n    cell = 9\n    return rows\n  }\n  rows\n}\nprint(fill())";
+    assert_eq!(output(src), "[Row(cells = [0, 9])]");
+}
+
+#[test]
+fn until_its_last_use_a_ref_binding_is_the_only_way_to_its_target() {
+    for rest in [
+        "print(game.players)",
+        "game.players.push(Pos(0, 0))",
+        "print(game)",
+    ] {
+        let src = format!(
+            "{GAME}var game = Game([Pos(0, 0)], 0)\nref p = game.players[0]\n{rest}\np.x = 1"
+        );
+        assert_eq!(first_error(&src), "ref_binding_overlap", "{rest}");
+    }
+    let apart = format!(
+        "{GAME}var game = Game([Pos(0, 0)], 0)\nref p = game.players[0]\ngame.score = 2\np.x = 1\nprint(game)"
+    );
+    assert_eq!(
+        output(&apart),
+        "Game(players = [Pos(x = 1, y = 0)], score = 2)"
+    );
+    let captured = format!(
+        "{GAME}var game = Game([Pos(0, 0)], 0)\nref p = game.players[0]\nlet f = func() {{ print(p) }}"
+    );
+    assert_eq!(first_error(&captured), "ref_binding_captured");
+}
+
+#[test]
+fn a_ref_binding_needs_a_var_place() {
+    assert_eq!(
+        first_error(&format!("{GAME}let game = Game([], 0)\nref s = game.score")),
+        "assign_to_let"
+    );
+    panics_with(
+        &format!("{GAME}var game = Game([], 0)\nref p = game.players[3]"),
+        "index_out_of_range",
+    );
+}
+
+#[test]
+fn ref_and_shared_still_name_variables() {
+    assert_eq!(
+        output("var ref = 1\nref = 2\nlet shared = ref + 1\nprint(shared)"),
+        "3"
+    );
+}
+
 #[test]
 fn a_ref_parameter_of_a_shared_class_is_a_warning() {
     let src = "shared class P(var n: Int)\nfunc f(ref p: P) { p.n = 2 }";

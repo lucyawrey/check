@@ -37,6 +37,8 @@ pub struct Info {
     pub aliases: HashMap<String, String>,
     /// Each type's interfaces, their parents included.
     pub implements: HashMap<String, HashSet<String>>,
+    /// Each `ref` binding, by its target, and how many statements after it its last use is.
+    pub ref_ends: HashMap<NodeId, usize>,
     /// Methods whose body changes `this`, so calls write it back, with where the body starts.
     pub changes_this: HashMap<String, Span>,
 }
@@ -382,7 +384,8 @@ impl Checker<'_> {
         }
         self.current_type = None;
         let interface_methods = self.check_signatures(own_methods);
-        for stmt in program {
+        for (i, stmt) in program.iter().enumerate() {
+            self.ref_binding(stmt, &program[i + 1..]);
             self.stmt(stmt);
         }
         self.check_bounds(0);
@@ -1685,6 +1688,22 @@ impl Checker<'_> {
                 self.assign(target, *op, value, *span);
                 Ty::Void
             }
+            Stmt::RefLet { name, span, target } => {
+                let (ty, err) = self.place(target);
+                if let Some(code) = err {
+                    self.error(code, target.span);
+                }
+                let var = Var {
+                    ty,
+                    mutable: true,
+                    kind: VarKind::Local,
+                    span: *span,
+                    reassigned: true,
+                    list_len: None,
+                };
+                self.declare(name, *span, var);
+                Ty::Void
+            }
             Stmt::LetPattern {
                 pattern,
                 is_var,
@@ -2240,6 +2259,7 @@ impl Checker<'_> {
         self.scopes.push(HashMap::new());
         let mut last = Ty::Void;
         for (i, stmt) in stmts.iter().enumerate() {
+            self.ref_binding(stmt, &stmts[i + 1..]);
             let is_last = i + 1 == stmts.len();
             last = match (stmt, is_last) {
                 (Stmt::Expr(e), true) => self.expr(e, expected),
@@ -2265,7 +2285,8 @@ impl Checker<'_> {
         match &expr.kind {
             ExprKind::Block(stmts) => {
                 self.scopes.push(HashMap::new());
-                for stmt in stmts {
+                for (i, stmt) in stmts.iter().enumerate() {
+                    self.ref_binding(stmt, &stmts[i + 1..]);
                     self.stmt(stmt);
                 }
                 self.finish_scope();
@@ -4287,22 +4308,40 @@ impl Checker<'_> {
                     index_exprs(other, &mut readers);
                 }
             }
-            let reads = readers.iter().any(|r| {
-                let mut bases = Vec::new();
-                find_expr(r, &mut |x, _| {
-                    if bases.contains(&(x as *const Expr)) {
-                        return false;
-                    }
-                    let Some(p) = ref_path(x) else {
-                        return false;
-                    };
-                    path_bases(x, &mut bases);
-                    overlaps(&p, path)
-                })
-                .is_some()
-            });
+            let reads = readers.iter().any(|r| uses_path(r, path).is_some());
             if reads || refs[..i].iter().any(|(_, p)| overlaps(p, path)) {
                 self.error(Code::overlapping_ref, e.span);
+            }
+        }
+    }
+
+    /// `ref name = target` lasts until its last use. Until then, the rest of its block reaches
+    /// the target only through `name`, and no lambda captures `name`.
+    fn ref_binding(&mut self, stmt: &Stmt, rest: &[Stmt]) {
+        let Stmt::RefLet { name, target, .. } = stmt else {
+            return;
+        };
+        let live = ref_end(name, rest).map_or(0, |k| k + 1);
+        self.info.ref_ends.insert(target.id, live);
+        let Some(path) = ref_path(target) else {
+            return;
+        };
+        for e in rest[..live].iter().flat_map(stmt_exprs) {
+            if let Some(hit) = uses_path(e, &path) {
+                self.error(Code::ref_binding_overlap, hit.span);
+            }
+            let captures = find_expr(e, &mut |x, _| {
+                let ExprKind::Lambda(_, _, body) = &x.kind else {
+                    return false;
+                };
+                find_expr(
+                    body,
+                    &mut |y, _| matches!(&y.kind, ExprKind::Name(n) if n == name),
+                )
+                .is_some()
+            });
+            if let Some(hit) = captures {
+                self.error(Code::ref_binding_captured, hit.span);
             }
         }
     }
@@ -4437,6 +4476,7 @@ fn find_expr<'a>(e: &'a Expr, hit: &mut dyn FnMut(&Expr, bool) -> bool) -> Optio
                         kids.push(value);
                     }
                     Stmt::Let { value, .. } | Stmt::LetPattern { value, .. } => kids.push(value),
+                    Stmt::RefLet { target, .. } => kids.push(target),
                     Stmt::Expr(x) => kids.push(x),
                     _ => {}
                 }
@@ -4501,6 +4541,63 @@ fn ref_path(e: &Expr) -> Option<RefPath<'_>> {
             Some((root, steps))
         }
         _ => None,
+    }
+}
+
+/// The first path in `e` that overlaps `path`, not counting the shorter paths inside a path.
+fn uses_path<'a>(e: &'a Expr, path: &RefPath) -> Option<&'a Expr> {
+    let mut bases = Vec::new();
+    find_expr(e, &mut |x, _| {
+        if bases.contains(&(x as *const Expr)) {
+            return false;
+        }
+        let Some(p) = ref_path(x) else {
+            return false;
+        };
+        path_bases(x, &mut bases);
+        overlaps(&p, path)
+    })
+}
+
+/// The index in `rest` of the last statement that uses `name`, counting uses of the `ref`
+/// bindings made from it, which write back into it.
+fn ref_end(name: &str, rest: &[Stmt]) -> Option<usize> {
+    let mut end = None;
+    for (j, s) in rest.iter().enumerate() {
+        let mentions = |e: &Expr| {
+            find_expr(
+                e,
+                &mut |x, _| matches!(&x.kind, ExprKind::Name(n) if n == name),
+            )
+            .is_some()
+        };
+        if stmt_exprs(s).into_iter().any(mentions) {
+            end = Some(j);
+        }
+        if let Stmt::RefLet {
+            name: inner,
+            target,
+            ..
+        } = s
+            && ref_path(target).is_some_and(|(root, _)| root == name)
+            && let Some(k) = ref_end(inner, &rest[j + 1..])
+        {
+            end = Some(j + 1 + k);
+        }
+    }
+    end
+}
+
+fn stmt_exprs(s: &Stmt) -> Vec<&Expr> {
+    match s {
+        Stmt::Assign { target, value, .. } => vec![target, value],
+        Stmt::Let { value, .. } => vec![value],
+        Stmt::LetPattern {
+            value, otherwise, ..
+        } => std::iter::once(value).chain(otherwise).collect(),
+        Stmt::RefLet { target, .. } => vec![target],
+        Stmt::Expr(e) => vec![e],
+        _ => Vec::new(),
     }
 }
 

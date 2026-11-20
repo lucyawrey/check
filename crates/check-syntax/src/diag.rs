@@ -99,6 +99,8 @@ codes! {
     assign_to_parameter => "[assigning to a parameter not written var]",
     change_let_collection => "[changing a let list, map or set]",
     changes_let => "[calling a method that changes its value on a let]",
+    ref_binding_overlap => "[using what a ref binding points to other than through it]",
+    ref_binding_captured => "[a lambda capturing a ref binding]",
     interface_changes_this => "[an interface method whose implementation changes this]",
     break_outside_loop => "[break or continue outside a loop]",
     return_outside_function => "[return outside a function]",

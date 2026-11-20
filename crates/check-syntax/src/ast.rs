@@ -194,6 +194,12 @@ pub enum Stmt {
         value: Expr,
         span: Span,
     },
+    /// `ref name = target`: `name` is the place `target` names, until its block ends.
+    RefLet {
+        name: String,
+        span: Span,
+        target: Expr,
+    },
     LetPattern {
         pattern: Pattern,
         is_var: bool,

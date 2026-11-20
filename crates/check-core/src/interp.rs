@@ -35,6 +35,8 @@ type ArgValue = (Option<Rc<str>>, Value, Option<Place>);
 type Place = (Root, Vec<Step>);
 
 type Bound = (Vec<Value>, Vec<Option<Place>>);
+/// Live `ref` bindings: name, place, and the statement of its last use.
+type Bindings<'s> = Vec<(&'s String, Place, usize)>;
 
 type Writer<'f> = &'f mut dyn FnMut(&mut Value) -> Result<(), Flow>;
 
@@ -103,8 +105,9 @@ pub fn run(
         Err(_) => unreachable!("start returns only stops and panics"),
     };
     interp.budget = None;
-    for stmt in program {
-        match interp.stmt(stmt) {
+    let mut bound = Vec::new();
+    for i in 0..program.len() {
+        match interp.step(program, i, &mut bound) {
             Ok(_) => {}
             Err(Flow::Panic(p)) => return Err(p),
             Err(Flow::Stop(span, err)) => return Ok(Some((span, err))),
@@ -912,24 +915,74 @@ impl Interpreter<'_> {
             | Stmt::Implement(_)
             | Stmt::Interface(_)
             | Stmt::Data(_) => Ok(Value::Void),
+            Stmt::RefLet { .. } => unreachable!("blocks and the program bind refs themselves"),
             Stmt::Expr(e) => self.scoped(|i| i.expr(e)),
         }
     }
 
     fn block(&mut self, stmts: &[Stmt]) -> Eval {
         self.frame().scopes.push(HashMap::new());
+        let mut bound = Vec::new();
         let mut last = Ok(Value::Void);
-        for stmt in stmts {
-            last = self.stmt(stmt);
+        for i in 0..stmts.len() {
+            last = self.step(stmts, i, &mut bound);
             if last.is_err() {
                 break;
             }
         }
-        if matches!(stmts.last(), Some(Stmt::Let { .. } | Stmt::Assign { .. })) {
+        if matches!(
+            stmts.last(),
+            Some(Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::RefLet { .. })
+        ) {
             last = last.map(|_| Value::Void);
+        }
+        // Leaving early writes back the bindings still live, unless a panic ends the program.
+        if !matches!(last, Err(Flow::Panic(_)))
+            && let Err(flow) = self.write_refs(&mut bound, usize::MAX)
+        {
+            last = Err(flow);
         }
         self.frame().scopes.pop();
         last
+    }
+
+    /// Runs `stmts[i]`, then writes back the `ref` bindings whose last use it is.
+    fn step<'s>(&mut self, stmts: &'s [Stmt], i: usize, bound: &mut Bindings<'s>) -> Eval {
+        let value = match &stmts[i] {
+            Stmt::RefLet { name, target, .. } => {
+                let place = self.bind_ref(name, target)?;
+                bound.push((name, place, i + self.info.ref_ends[&target.id]));
+                Value::Void
+            }
+            stmt => self.stmt(stmt)?,
+        };
+        self.write_refs(bound, i)?;
+        Ok(value)
+    }
+
+    /// Writes back the `ref` bindings that end by statement `i`, innermost first.
+    fn write_refs(&mut self, bound: &mut Bindings, i: usize) -> Result<(), Flow> {
+        for k in (0..bound.len()).rev() {
+            if bound[k].2 > i {
+                continue;
+            }
+            let (name, (mut root, steps), _) = bound.remove(k);
+            let value = self.lookup(name).unwrap_or(Value::Void);
+            self.write_steps(&mut root, &steps, &mut |slot| {
+                *slot = value.clone();
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Copies the place `target` names into `name`, resolving it once, and returns the place.
+    fn bind_ref(&mut self, name: &str, target: &Expr) -> Result<Place, Flow> {
+        let mut steps = Vec::new();
+        let mut root = self.path(target, &mut steps)?;
+        let value = self.read_steps(&mut root, &steps)?;
+        self.define(name, value);
+        Ok((root, steps))
     }
 
     fn expr(&mut self, expr: &Expr) -> Eval {
