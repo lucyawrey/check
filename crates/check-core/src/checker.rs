@@ -394,6 +394,7 @@ impl Checker<'_> {
             self.ensure_checked(&name, Span::default());
         }
         self.settle_changes(interface_methods);
+        self.changed_copies(program);
         let consts: Vec<String> = self.consts.keys().cloned().collect();
         for key in consts {
             self.const_type(&key);
@@ -2276,6 +2277,7 @@ impl Checker<'_> {
                 last = Ty::Void;
             }
         }
+        self.changed_copies(stmts);
         self.finish_scope();
         last
     }
@@ -2289,6 +2291,7 @@ impl Checker<'_> {
                     self.ref_binding(stmt, &stmts[i + 1..]);
                     self.stmt(stmt);
                 }
+                self.changed_copies(stmts);
                 self.finish_scope();
             }
             ExprKind::If(cond, then, otherwise) => {
@@ -4315,6 +4318,121 @@ impl Checker<'_> {
         }
     }
 
+    /// Warns about a `var` copied from a field, index or map lookup whose last change is never
+    /// read. Reads in a loop or branch with the change count as after it, and a var a lambda
+    /// captures never warns.
+    fn changed_copies(&mut self, stmts: &[Stmt]) {
+        for (i, stmt) in stmts.iter().enumerate() {
+            let Stmt::Let {
+                keyword,
+                name,
+                is_var: true,
+                ty,
+                value,
+                ..
+            } = stmt
+            else {
+                continue;
+            };
+            let Some(copied) = copied_path(value) else {
+                continue;
+            };
+            let shared = self
+                .scopes
+                .last()
+                .and_then(|s| s.get(name))
+                .is_none_or(|v| {
+                    let t = self.subst.shallow(&v.ty);
+                    self.is_shared_class(&t) || matches!(t, Ty::Named(n, _) if n == SHARED)
+                });
+            if shared {
+                continue;
+            }
+            let mut unread = None;
+            for s in &stmts[i + 1..] {
+                let uses = self.copy_uses(name, s);
+                if uses.captured {
+                    unread = None;
+                    break;
+                }
+                unread = match uses.change {
+                    Some(_) if uses.read && uses.branches => None,
+                    Some(change) => Some(change),
+                    None if uses.read => None,
+                    None => unread,
+                };
+            }
+            let Some(change) = unread else {
+                continue;
+            };
+            let mut d = Diagnostic::warning(Code::changed_copy, change);
+            if ty.is_none() && std::ptr::eq(copied, value) {
+                d = d.with_quick_fix(vec![Edit {
+                    span: *keyword,
+                    text: "ref".to_string(),
+                }]);
+            }
+            self.diags.push(d);
+        }
+    }
+
+    /// How statement `s` uses the var `name`: its last change's span (a write into it, or a call
+    /// that changes it), whether it reads it otherwise, and whether it can run its parts in
+    /// another order (a loop or branch).
+    fn copy_uses(&self, name: &str, s: &Stmt) -> CopyUses {
+        let mut changed_roots: Vec<*const Expr> = Vec::new();
+        let mut uses = CopyUses::default();
+        let exprs = stmt_exprs(s);
+        if let Stmt::Assign { target, .. } = s
+            && let Some(root) = steps_root(target, name)
+        {
+            changed_roots.push(root);
+            uses.change = Some(target.span);
+        }
+        for e in &exprs {
+            find_expr(e, &mut |x, assigned| {
+                match &x.kind {
+                    ExprKind::Method(recv, m, _) if self.changes_receiver(x.id, m) => {
+                        if let Some(root) = path_root(recv, name) {
+                            changed_roots.push(root);
+                            uses.change = Some(x.span);
+                        }
+                    }
+                    ExprKind::Lambda(_, _, body) => {
+                        uses.captured |= find_expr(body, &mut |y, _| is_name(y, name)).is_some();
+                    }
+                    ExprKind::If(..)
+                    | ExprKind::Match(..)
+                    | ExprKind::While(..)
+                    | ExprKind::Loop(_)
+                    | ExprKind::For(..) => uses.branches = true,
+                    _ if assigned => {
+                        if let Some(root) = steps_root(x, name) {
+                            changed_roots.push(root);
+                            uses.change = Some(x.span);
+                        }
+                    }
+                    _ => {}
+                }
+                false
+            });
+        }
+        for e in &exprs {
+            find_expr(e, &mut |x, _| {
+                uses.read |= is_name(x, name) && !changed_roots.contains(&(x as *const Expr));
+                false
+            });
+        }
+        uses
+    }
+
+    fn changes_receiver(&self, id: NodeId, method: &str) -> bool {
+        match self.info.resolved.get(&id) {
+            Some(Resolved::Method(key)) => self.funcs.get(key).is_some_and(|f| f.changes_this),
+            _ => MUTATING.contains(&method),
+        }
+    }
+
     /// `ref name = target` lasts until its last use. Until then, the rest of its block reaches
     /// the target only through `name`, and no lambda captures `name`.
     fn ref_binding(&mut self, stmt: &Stmt, rest: &[Stmt]) {
@@ -4586,6 +4704,44 @@ fn ref_end(name: &str, rest: &[Stmt]) -> Option<usize> {
         }
     }
     end
+}
+
+#[derive(Default)]
+struct CopyUses {
+    change: Option<Span>,
+    read: bool,
+    branches: bool,
+    captured: bool,
+}
+
+/// The field, index or map lookup `e` copies, also through `??`, `try` and `.orPanic`.
+fn copied_path(e: &Expr) -> Option<&Expr> {
+    match &e.kind {
+        ExprKind::Field(..) | ExprKind::Index(..) if ref_path(e).is_some() => Some(e),
+        ExprKind::Binary(BinOp::Coalesce, x, _) | ExprKind::Unary(UnOp::Try, x) => copied_path(x),
+        ExprKind::Method(x, m, _) if m == "orPanic" => copied_path(x),
+        _ => None,
+    }
+}
+
+fn is_name(e: &Expr, name: &str) -> bool {
+    matches!(&e.kind, ExprKind::Name(n) if n == name)
+}
+
+/// The `name` a path starts from, if `e` is a path rooted in it.
+fn path_root<'a>(e: &'a Expr, name: &str) -> Option<&'a Expr> {
+    match &e.kind {
+        ExprKind::Field(base, _) | ExprKind::Index(base, _) => path_root(base, name),
+        _ => is_name(e, name).then_some(e),
+    }
+}
+
+/// Like `path_root`, for a path with at least one field or index after the name.
+fn steps_root<'a>(e: &'a Expr, name: &str) -> Option<&'a Expr> {
+    match &e.kind {
+        ExprKind::Field(base, _) | ExprKind::Index(base, _) => path_root(base, name),
+        _ => None,
+    }
 }
 
 fn stmt_exprs(s: &Stmt) -> Vec<&Expr> {

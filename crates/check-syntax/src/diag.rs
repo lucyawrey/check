@@ -170,6 +170,7 @@ codes! {
     index_out_of_range => "[a list index that doesn't exist, where a value is needed]",
     for_ref_element_gone => "[a for ref element whose index is gone when it's written back]",
     unused_var => "[a var that's never reassigned]",
+    changed_copy => "[changing a copy that's never used again]",
     shared_wraps_shared_class => "[Shared of a shared class, which is already shared]",
     ref_param_of_shared_class => "[a ref parameter of a shared class, which is already shared]",
     shadowed_name => "[a local that shadows a function or type]",

@@ -140,6 +140,7 @@
 
 ## Warnings
 - `unused_var` a `var` that's never reassigned
+- `changed_copy` changing a `var` copied from a field, index or map lookup, where the change is never read (quick fix for a plain path: `ref` in place of `var`)
 - `shared_wraps_shared_class` `Shared` of a `shared class`, which is already shared
 - `ref_param_of_shared_class` a `ref` parameter of a `shared class` type, which is already shared
 - `shadowed_name` a local that shadows a function or type

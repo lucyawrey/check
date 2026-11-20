@@ -2865,6 +2865,68 @@ fn ref_and_shared_still_name_variables() {
 }
 
 #[test]
+fn changing_a_copy_that_is_never_read_warns() {
+    let warned = [
+        "var c = ps[0] ?? P(0)\nc.n += 1",
+        "var c = ps[0] ?? P(0)\nprint(c)\nc.n += 1",
+        "var c = ps[0].orPanic()\nc.n = 2",
+        "var c = box.p\nc.n += 1",
+        "var c = box.p\nc.bump()",
+    ];
+    for src in warned {
+        let src = format!("{COPIES}{src}");
+        assert!(
+            warnings(&src).contains(&"changed_copy".to_string()),
+            "{src}"
+        );
+    }
+    let quiet = [
+        "var c = box.p\nc.n += 1\nprint(c.n)",
+        "var c = box.p\nc.n += 1\nbox.p = c",
+        "var c = box.p\nif true { c.n = 1 } else { print(c) }",
+        "var c = box.p\nfor i in 0..2 {\n  print(c.n)\n  c.n += i\n}",
+        "var c = box.p\nc.n = 1\nlet f = func() { print(c) }",
+        "var c = box.p\nprint(c.doubled())",
+    ];
+    for src in quiet {
+        let src = format!("{COPIES}{src}");
+        assert!(
+            !warnings(&src).contains(&"changed_copy".to_string()),
+            "{src}"
+        );
+    }
+}
+
+#[test]
+fn a_changed_copy_of_a_plain_path_offers_a_ref_binding() {
+    let warned = |src: &str| {
+        let src = format!("{COPIES}{src}");
+        let report = run_source(
+            "test.check",
+            &src,
+            &mut Cursor::new(Vec::new()),
+            &mut Vec::new(),
+        );
+        let d = report
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code.to_string() == "changed_copy");
+        d.expect("warned")
+            .fix
+            .iter()
+            .map(|e| e.text.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(warned("var c = box.p\nc.n += 1"), ["ref"]);
+    assert_eq!(
+        warned("var c = ps[0] ?? P(0)\nc.n += 1"),
+        Vec::<String>::new()
+    );
+}
+
+const COPIES: &str = "class P {\n  var n: Int\n  func bump() { this.n += 1 }\n  func doubled() -> Int { this.n * 2 }\n}\nclass Box(var p: P)\nvar ps = [P(1)]\nvar box = Box(P(1))\nprint(ps)\nbox = Box(P(2))\nps = []\n";
+
+#[test]
 fn a_ref_parameter_of_a_shared_class_is_a_warning() {
     let src = "shared class P(var n: Int)\nfunc f(ref p: P) { p.n = 2 }";
     assert_eq!(warnings(src), ["ref_param_of_shared_class"]);
