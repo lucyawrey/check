@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::Cursor;
 
 use check_core::ast::Stmt;
@@ -2723,4 +2724,159 @@ fn a_name_called_ref_still_works() {
         output("func f(ref: Int) => ref + 1\nlet ref = 2\nprint(f(ref))"),
         "3"
     );
+}
+
+#[test]
+fn a_write_through_a_call_reaches_only_shared_values() {
+    let src = "ref class Box(var n: Int)\nref class Game {\n  var title: String\n  var box: Box\n  func theBox() -> Box { this.box }\n  func reset() { this.theBox().n = 0 }\n}\nlet g = Game(\"hi\", Box(9))\ng.reset()\nfunc make(b: Box) -> Box { b }\nmake(g.box).n = 7\nprint(\"{g}\")";
+    assert_eq!(output(src), "Game(title = \"hi\", box = Box(n = 7))");
+    let log = "var log = Ref([1])\nfunc theLog() -> Ref<List<Int>> { log }\ntheLog().push(2)\nprint(\"{log}\")";
+    assert_eq!(output(log), "Ref([1, 2])");
+    assert_eq!(
+        first_error("class P(var n: Int)\nfunc make() -> P { P(1) }\nmake().n = 7"),
+        "assign_to_let"
+    );
+    for change in ["xs().pop()", "[1, 2].pop()", "xs().push(3)"] {
+        let src = format!("func xs() -> List<Int> {{ [1, 2] }}\nprint({change})");
+        assert_eq!(first_error(&src), "change_let_collection", "{change}");
+    }
+}
+
+#[test]
+fn paths_run_left_to_right_and_their_base_once() {
+    let src = "var log = Ref([\"\"])\nfunc note(s: String, n: Int) -> Int {\n  log.push(s)\n  n\n}\nvar xs = [0]\nvar grid = [[0]]\nxs[note(\"index\", 0)] = note(\"value\", 1)\nxs[note(\"index\", 0)] += note(\"value\", 1)\ngrid[note(\"index\", 0)].push(note(\"value\", 1))\nref class Box(var n: Int)\nlet b = Box(1)\nfunc make() -> Box {\n  log.push(\"make\")\n  b\n}\nmake().n = 7\nprint(\"{log} {xs} {grid} {b}\")";
+    assert_eq!(
+        output(src),
+        "Ref([\"\", \"index\", \"value\", \"index\", \"value\", \"index\", \"value\", \"make\"]) [2] [[0, 1]] Box(n = 7)"
+    );
+}
+
+#[test]
+fn a_failed_is_binds_nothing() {
+    let src = "let a = 10\nlet t = (5, 2)\nif t is (a, 1) or a == 10 { print(a) }";
+    assert_eq!(output(src), "10");
+}
+
+#[test]
+fn a_default_sees_names_where_its_declared() {
+    let src = "func base() -> Int { 5 }\nfunc f(n: Int = base()) -> Int { n }\nfunc caller() -> Int {\n  let base = func() => 99\n  f()\n}\nprint(caller())";
+    assert_eq!(output(src), "5");
+}
+
+#[test]
+fn deep_programs_reach_the_call_limit_without_overflowing() {
+    let src = |levels: i64| {
+        format!(
+            "func f(n: Int) -> Int {{\n  match n {{\n    0 => 0\n    _ {{\n      var t = 0\n      for i in 0..1 {{ t = [1].map(func(x) => x + f(n - 1))[0] ?? 0 }}\n      t\n    }}\n  }}\n}}\nprint(f({levels}))"
+        )
+    };
+    assert_eq!(output(&src(4_900)), "4900");
+    panics_with(&src(5_100), "stack_overflow");
+    let list = |len: i64, end: &str| {
+        format!(
+            "enum L {{ Nil, Cons(Int, L) }}\nvar l: L = Nil\nvar i = 0\nwhile i < {len} {{\n  l = Cons(i, l)\n  i += 1\n}}\n{end}"
+        )
+    };
+    assert_eq!(output(&list(200_000, "let m = l\nprint(l == m)")), "true");
+    assert_eq!(
+        output(&list(20_000, "let s = \"{l}\"\nprint(\"done\")")),
+        "done"
+    );
+}
+
+#[test]
+fn try_cant_be_used_in_init() {
+    let src = "class P {\n  let name: String\n  var hp: Int = 0\n  init {\n    this.hp = try Int.parse(this.name)\n  }\n}";
+    assert_eq!(first_error(src), "try_outside_failable");
+}
+
+#[test]
+fn functions_cant_be_compared() {
+    assert_eq!(
+        first_error("func one() -> Int { 1 }\nprint(one == one)"),
+        "invalid_operand_types"
+    );
+}
+
+#[test]
+fn a_lambda_cant_change_what_it_captured() {
+    assert_eq!(
+        first_error("var count = 0\nlet inc = func() { count += 1 }"),
+        "assign_to_captured"
+    );
+    assert_eq!(
+        first_error("func f() {\n  var xs = [1]\n  let add = func(n: Int) { xs.push(n) }\n}"),
+        "assign_to_captured"
+    );
+    let own = "let f = func() -> Int {\n  var n = 0\n  n += 1\n  n\n}\nprint(f())";
+    assert_eq!(output(own), "1");
+}
+
+#[test]
+fn a_narrowed_index_that_is_gone_panics() {
+    let src = "var xs = [1, 2, 3]\nfunc clear() { xs = [] }\nfor i in xs.indices() {\n  clear()\n  print(xs[i] * 2)\n}";
+    panics_with(src, "index_out_of_range");
+}
+
+#[test]
+fn powers_of_zero_one_and_minus_one_never_overflow() {
+    let src = "func pw(a: Int, b: Int) -> Int { a ** b }\nprint(\"{pw(0, 9999999999)} {pw(1, 9999999999)} {pw(-1, 5000000001)} {pw(0, 0)}\")";
+    assert_eq!(output(src), "0 1 -1 1");
+}
+
+#[test]
+fn the_smallest_int_can_be_written() {
+    assert_eq!(
+        output("print(-9223372036854775808)"),
+        "-9223372036854775808"
+    );
+    assert_eq!(first_error("print(9223372036854775808)"), "literal_too_big");
+}
+
+/// Loads `item.con` while the schema unit's `stock.conx` holds `stock`, and returns the panic
+/// code: loading builds every data value in the unit.
+fn data_panic(stock: &str) -> String {
+    let files = MemFiles(HashMap::from([
+        (
+            "shop/shop.check".to_string(),
+            "class Item(name: String, price: Int)".to_string(),
+        ),
+        ("shop/stock.conx".to_string(), stock.to_string()),
+    ]));
+    let item = "Item(\"shield\", 3)";
+    match check_core::check_data(&files, "shop/", "item", "item.con", item, "Item") {
+        Err(Report {
+            outcome: Outcome::Panicked(code),
+            ..
+        }) => code.to_string(),
+        Err(r) => panic!(
+            "{:?}",
+            r.diagnostics
+                .iter()
+                .map(|d| d.code.to_string())
+                .collect::<Vec<_>>()
+        ),
+        Ok(_) => panic!("loaded"),
+    }
+}
+
+#[test]
+fn loading_data_stops_on_a_failed_try_or_an_endless_loop() {
+    assert_eq!(
+        data_panic("[Item(\"sword\", try Int.parse(\"x\"))]"),
+        "data_try_failed"
+    );
+    assert_eq!(
+        data_panic("[Item(\"sword\", { loop { } })]"),
+        "out_of_steps"
+    );
+    // Few loop passes, but each `contains` looks at 100,000 items.
+    let busy = "[Item(\"sword\", {\n  var xs: List<Int> = []\n  for i in 0..100000 { xs.push(i) }\n  var n = 0\n  for j in 0..200 { if xs.contains(-1) { n += 1 } }\n  n\n})]";
+    assert_eq!(data_panic(busy), "out_of_steps");
+}
+
+#[test]
+fn nan_matches_no_float_range() {
+    let src = "let x = 0.0 / 0.0\nprint(match x { 0.0..1.0 => \"in\", _ => \"out\" })";
+    assert_eq!(output(src), "out");
 }
