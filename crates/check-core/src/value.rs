@@ -276,37 +276,40 @@ impl Value {
             v.write_code(out);
             Ok::<_, Infallible>(())
         };
-        let done = crate::interp::grow(|| match self {
-            Value::Int(n) => Ok(out.push_str(&n.to_string())),
-            Value::Float(f) => Ok(out.push_str(&float_text(*f))),
-            Value::Bool(b) => Ok(out.push_str(&b.to_string())),
-            Value::Str(s) => Ok(out.push_str(&quote(s))),
-            Value::List(items) => write_items(out, "[", items.iter(), "]", field),
-            Value::Map(entries) => write_map(out, entries.iter(), field),
-            Value::Set(items) => write_items(out, "Set([", items.iter(), "])", field),
-            Value::Some(v) => write_items(out, "Some(", [&**v].into_iter(), ")", field),
-            Value::None => Ok(out.push_str("None")),
+        crate::interp::grow(|| match self {
+            Value::Int(n) => out.push_str(&n.to_string()),
+            Value::Float(f) => out.push_str(&float_text(*f)),
+            Value::Bool(b) => out.push_str(&b.to_string()),
+            Value::Str(s) => out.push_str(&quote(s)),
+            Value::List(items) => done(write_items(out, "[", items.iter(), "]", field)),
+            Value::Map(entries) => done(write_map(out, entries.iter(), field)),
+            Value::Set(items) => done(write_items(out, "Set([", items.iter(), "])", field)),
+            Value::Some(v) => done(write_items(out, "Some(", [&**v].into_iter(), ")", field)),
+            Value::None => out.push_str("None"),
             Value::Range(a, b, inclusive) => {
                 let eq = if *inclusive { "=" } else { "" };
-                Ok(out.push_str(&format!("{a}..{eq}{b}")))
+                out.push_str(&format!("{a}..{eq}{b}"))
             }
             Value::Func(f) => match &**f {
-                Callable::Named(_, sig) | Callable::Lambda { sig, .. } => Ok(out.push_str(sig)),
+                Callable::Named(_, sig) | Callable::Lambda { sig, .. } => out.push_str(sig),
             },
-            Value::Object(r) | Value::Record(r) => r.write_with(true, out, field),
+            Value::Object(r) | Value::Record(r) => done(r.write_with(true, out, field)),
             Value::Shared(r) => match r.try_borrow_mut() {
-                Ok(record) => record.write_with(true, out, field),
-                Err(_) => Ok(out.push_str("...")),
+                Ok(record) => done(record.write_with(true, out, field)),
+                Err(_) => out.push_str("..."),
             },
             Value::Ref(v) => match v.try_borrow_mut() {
-                Ok(v) => write_items(out, "Ref(", [&*v].into_iter(), ")", field),
-                Err(_) => Ok(out.push_str("Ref(...)")),
+                Ok(v) => done(write_items(out, "Ref(", [&*v].into_iter(), ")", field)),
+                Err(_) => out.push_str("Ref(...)"),
             },
-            Value::Variant(r) => r.write_with(false, out, field),
-            Value::Void => Ok(()),
+            Value::Variant(r) => done(r.write_with(false, out, field)),
+            Value::Void => {}
         });
-        let Ok(()) = done;
     }
+}
+
+fn done(written: Result<(), Infallible>) {
+    let Ok(()) = written;
 }
 
 /// Writes `items` between `open` and `close`, separated by commas, with `item` writing each.
