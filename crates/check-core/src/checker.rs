@@ -203,6 +203,8 @@ pub struct Checker<'s> {
     funcs: HashMap<String, FuncEntry>,
     fns: Vec<FnCtx>,
     loops: Vec<LoopCtx>,
+    /// The first scope of the innermost lambda being checked; variables below it are captured.
+    lambda_scope: Option<usize>,
     /// Collection and key names whose index can't miss, and the innermost scope they
     /// may come from, so a shadowing name isn't narrowed.
     narrowed: Vec<(String, String, usize)>,
@@ -258,6 +260,7 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         funcs: HashMap::new(),
         fns: Vec::new(),
         loops: Vec::new(),
+        lambda_scope: None,
         narrowed: Vec::new(),
         top_level_names: HashSet::new(),
         lambda_types: Vec::new(),
@@ -542,6 +545,10 @@ impl Checker<'_> {
         let this = self.own_type(&c.name);
         if let Some(init) = &c.init {
             self.declare_func(init, Some((this.clone(), true)), Some(&c.name));
+            // Building an object can't fail, so `init` returns nothing and `try` can't pass a failure up.
+            if let Some(f) = self.funcs.get_mut(&init.name) {
+                f.sig.ret = Some(Ty::Void);
+            }
         }
         self.declare_members(&c.name, this, &c.members);
         self.add_impls(&c.name, &c.interfaces);
@@ -975,6 +982,7 @@ impl Checker<'_> {
         let saved_type = std::mem::replace(&mut self.current_type, entry.owner.clone());
         let saved_scopes = self.scopes.split_off(1);
         let saved_loops = std::mem::take(&mut self.loops);
+        let saved_lambda = self.lambda_scope.take();
         let saved_narrowed = std::mem::take(&mut self.narrowed);
         let mut scope = HashMap::new();
         for (p, ps) in decl.params.iter().zip(&sig.params) {
@@ -1018,6 +1026,7 @@ impl Checker<'_> {
         self.scopes.truncate(1);
         self.scopes.extend(saved_scopes);
         self.loops = saved_loops;
+        self.lambda_scope = saved_lambda;
         self.narrowed = saved_narrowed;
         let entry = self.funcs.get_mut(name)?;
         entry.sig.ret = Some(ret);
@@ -1210,7 +1219,7 @@ impl Checker<'_> {
             && !self.is_interface(&ty)
             && !self.is_ref_class(&ty)
         {
-            return !self.holds_ref(&ty, &mut HashSet::new());
+            return !self.lacks_eq(&ty, &mut HashSet::new());
         }
         for i in self.interfaces_of(&ty) {
             if let Ty::Named(name, args) = &i
@@ -1701,6 +1710,12 @@ impl Checker<'_> {
                 return (self.const_type(&key), Some(Code::assign_to_let));
             }
         }
+        let captured = self.lambda_scope.is_some_and(|base| {
+            self.scopes
+                .iter()
+                .rposition(|s| s.contains_key(name))
+                .is_none_or(|i| i < base)
+        });
         let Some(var) = self.lookup_mut(name) else {
             let code = if name == "this" {
                 Code::this_outside_method
@@ -1718,6 +1733,9 @@ impl Checker<'_> {
                 Code::assign_to_let
             };
             return (var.ty.clone(), Some(code));
+        }
+        if captured {
+            return (var.ty.clone(), Some(Code::assign_to_captured));
         }
         var.reassigned = true;
         var.list_len = None;
@@ -1908,22 +1926,24 @@ impl Checker<'_> {
     }
 
     /// Whether `==` can't compare `ty`: it holds a `ref class`, interface or `T` that isn't `Eq`.
-    fn holds_ref(&mut self, ty: &Ty, seen: &mut HashSet<String>) -> bool {
+    fn lacks_eq(&mut self, ty: &Ty, seen: &mut HashSet<String>) -> bool {
         let ty = self.subst.shallow(ty);
         match &ty {
-            Ty::List(inner) | Ty::Maybe(inner) => self.holds_ref(inner, seen),
+            Ty::List(inner) | Ty::Maybe(inner) => self.lacks_eq(inner, seen),
             Ty::Param(_) => !self.implements(&ty, &Ty::named(EQ)),
             Ty::Named(..) if self.is_interface(&ty) => !self.implements(&ty, &Ty::named(EQ)),
             Ty::Named(name, args) if name == MAP || name == SET => {
-                args.iter().any(|a| self.holds_ref(a, seen))
+                args.iter().any(|a| self.lacks_eq(a, seen))
             }
             Ty::Named(name, _) if name == REF => true,
+            Ty::Func(..) => true,
+            Ty::Record(_, fields) => fields.iter().any(|f| self.lacks_eq(f, seen)),
             Ty::Named(name, args) if seen.insert(Show(&self.resolve(&ty)).to_string()) => {
                 if self.is_ref_class(&ty) && !self.implements(&ty, &Ty::named(EQ)) {
                     return true;
                 }
                 let fields = self.field_types(name, args);
-                fields.iter().any(|f| self.holds_ref(f, seen))
+                fields.iter().any(|f| self.lacks_eq(f, seen))
             }
             _ => false,
         }
@@ -2769,7 +2789,7 @@ impl Checker<'_> {
                 }
             }
             BinOp::Eq | BinOp::Ne => {
-                if self.holds_ref(&a, &mut HashSet::new()) {
+                if self.lacks_eq(&a, &mut HashSet::new()) {
                     return self.error(Code::invalid_operand_types, span);
                 }
                 if numeric {
@@ -3187,16 +3207,12 @@ impl Checker<'_> {
             }
             return self.unknown_method(args, span);
         }
-        let is_place = matches!(
-            recv.kind,
-            ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::This
-        );
-        let recv_ty = if MUTATING.contains(&name) && is_place {
+        let recv_ty = if MUTATING.contains(&name) {
             let (t, err) = self.place(recv);
             if let Some(code) = err
                 && self.is_collection(&t)
             {
-                let code = if code == Code::readonly_field {
+                let code = if matches!(code, Code::readonly_field | Code::assign_to_captured) {
                     code
                 } else {
                     Code::change_let_collection
@@ -3480,10 +3496,13 @@ impl Checker<'_> {
         }
         let declared = ret.map(|t| self.type_from(t));
         let saved_loops = std::mem::take(&mut self.loops);
+        let saved_lambda = self.lambda_scope.take();
+        self.lambda_scope = Some(self.scopes.len());
         self.scopes.push(scope);
         let ret = self.function_body(body, declared);
         self.finish_scope();
         self.loops = saved_loops;
+        self.lambda_scope = saved_lambda;
         let ty = Ty::Func(param_tys, Box::new(ret));
         self.lambda_types.push((id, ty.clone()));
         ty

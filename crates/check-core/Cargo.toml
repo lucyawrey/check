@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 check-syntax = { path = "../check-syntax" }
+stacker = "0.1.25"

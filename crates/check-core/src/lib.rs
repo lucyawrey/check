@@ -180,7 +180,15 @@ fn panic_text(p: &interp::Panic, sources: &Sources) -> String {
         p.code,
         p.code.message()
     );
-    for call in &p.stack {
+    let shown = 10;
+    for (i, call) in p.stack.iter().enumerate() {
+        if p.stack.len() > shown * 2 && i >= shown && i < p.stack.len() - shown {
+            if i == shown {
+                let left_out = p.stack.len() - shown * 2;
+                text.push_str(&format!("    [{left_out} calls left out]\n"));
+            }
+            continue;
+        }
         let (path, line, col, _) = sources.locate(call.start);
         text.push_str(&format!("    at {path}:{line}:{col}\n"));
     }

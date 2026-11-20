@@ -1502,6 +1502,10 @@ impl Parser<'_> {
             _ => return self.power(),
         };
         let start = self.advance().span;
+        if op == UnOp::Neg && *self.peek() == Tok::Int(i64::MIN) {
+            let end = self.advance().span;
+            return Ok(self.expr_node(start.to(end), ExprKind::Int(i64::MIN)));
+        }
         let operand = self.unary()?;
         Ok(self.expr_node(
             start.to(operand.span),
@@ -1602,6 +1606,11 @@ impl Parser<'_> {
         let token = self.advance();
         let span = token.span;
         let kind = match token.tok {
+            Tok::Int(i64::MIN) => {
+                self.diags
+                    .push(Diagnostic::error(Code::literal_too_big, span));
+                ExprKind::Int(0)
+            }
             Tok::Int(n) => ExprKind::Int(n),
             Tok::Float(f) => ExprKind::Float(f),
             Tok::Kw("true") => ExprKind::Bool(true),
