@@ -1423,9 +1423,7 @@ impl Checker<'_> {
             && n == REF
             && self.subst.unify(&args[0], expected)
         {
-            let mut d = Diagnostic::error(Code::ref_where_value_expected, expr.span);
-            d.detail = Some(format!("{}.value", self.operand_text(expr)));
-            self.diags.push(d);
+            self.ref_value_hint(expr);
             return;
         }
         let code = if matches!(a, Ty::Maybe(_)) {
@@ -1434,6 +1432,12 @@ impl Checker<'_> {
             self.mismatch(&a, expected, Code::type_mismatch)
         };
         self.error(code, expr.span);
+    }
+
+    fn ref_value_hint(&mut self, e: &Expr) {
+        let mut d = Diagnostic::error(Code::ref_where_value_expected, e.span);
+        d.detail = Some(format!("{}.value", self.operand_text(e)));
+        self.diags.push(d);
     }
 
     /// The source of `e` on one line, in parentheses unless a method call on it would bind to all of it.
@@ -2068,6 +2072,9 @@ impl Checker<'_> {
                 let result = self.binary_type(op, target, &ty, value, &rhs, span);
                 if op == BinOp::Div && self.subst.shallow(&ty) == Ty::Int {
                     self.error(Code::slash_for_int, span);
+                    return;
+                }
+                if matches!(self.subst.shallow(&ty), Ty::Named(n, _) if n == REF) {
                     return;
                 }
                 result
@@ -2711,6 +2718,21 @@ impl Checker<'_> {
         }
         if a == Ty::Error || b == Ty::Error {
             return Ty::Error;
+        }
+        let inner = |t: &Ty| match t {
+            Ty::Named(n, args) if n == REF => Some(args[0].clone()),
+            _ => None,
+        };
+        match (inner(&a), inner(&b)) {
+            (Some(t), None) => {
+                self.ref_value_hint(lhs);
+                a = self.subst.shallow(&t);
+            }
+            (None, Some(t)) => {
+                self.ref_value_hint(rhs);
+                b = self.subst.shallow(&t);
+            }
+            _ => {}
         }
         if matches!(a, Ty::Var(_)) {
             return self.error(Code::type_needed, lhs.span);
