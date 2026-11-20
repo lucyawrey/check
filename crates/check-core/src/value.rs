@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::{Expr, FuncDecl, Param};
 use crate::checker::{MAP, MAYBE, SET};
@@ -11,7 +12,7 @@ pub enum Callable {
     Named(Rc<FuncDecl>, String),
     Lambda {
         params: Vec<Param>,
-        body: Rc<Expr>,
+        body: Arc<Expr>,
         captured: HashMap<String, Value>,
         sig: String,
     },

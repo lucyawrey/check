@@ -4299,10 +4299,10 @@ fn find_expr<'a>(e: &'a Expr, hit: &mut dyn FnMut(&Expr, bool) -> bool) -> Optio
         }
         ExprKind::Unary(_, x)
         | ExprKind::Loop(x)
-        | ExprKind::Lambda(_, _, x)
         | ExprKind::Field(x, _)
         | ExprKind::Is(x, _)
         | ExprKind::Spread(x) => kids.push(x),
+        ExprKind::Lambda(_, _, x) => kids.push(x),
         ExprKind::Match(subject, arms) => {
             kids.push(subject);
             for a in arms {

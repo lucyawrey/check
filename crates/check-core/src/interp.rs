@@ -1067,7 +1067,7 @@ impl Interpreter<'_> {
                     .unwrap_or_default();
                 Ok(Value::Func(Rc::new(Callable::Lambda {
                     params: params.clone(),
-                    body: Rc::new((**body).clone()),
+                    body: body.clone(),
                     captured,
                     sig,
                 })))
