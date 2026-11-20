@@ -2635,6 +2635,18 @@ fn ref_must_match_the_parameter() {
 }
 
 #[test]
+fn a_ref_where_its_value_is_expected_suggests_value() {
+    let src = "func count(xs: List<Int>) -> Int { xs.length() }\nlet r = Ref([1])\ncount(r)";
+    assert_eq!(
+        error_and_fix(src),
+        (
+            "ref_where_value_expected".to_string(),
+            Some("r.value".to_string())
+        )
+    );
+}
+
+#[test]
 fn a_function_with_ref_parameters_cant_be_a_value() {
     assert_eq!(
         first_error(&format!("{SET_NINE}let f = setNine")),
