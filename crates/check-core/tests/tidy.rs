@@ -246,3 +246,9 @@ fn the_loaders_style_fixes_wait_too() {
     assert_eq!(after[2], file.1);
     assert!(tidied.style_blocked);
 }
+
+#[test]
+fn never_applies_a_quick_fix_only_fix() {
+    let src = "func setNine(ref a: Int) { a = 9 }\nvar x = 1\nsetNine(x)\nprint(x)";
+    assert_eq!(tidied(src), src);
+}

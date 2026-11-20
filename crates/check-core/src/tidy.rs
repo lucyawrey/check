@@ -88,6 +88,7 @@ pub fn tidy(entry: &str, files: &dyn Files, levels: &[Severity]) -> Tidied {
 /// running (the loader's own style warnings wait too), and not one that would delete a comment.
 fn wanted(d: &Diagnostic, checked: &Checked, levels: &[Severity], style_blocked: bool) -> bool {
     !d.fix.is_empty()
+        && !d.quick_fix_only
         && levels.contains(&d.severity)
         && !(style_blocked && d.severity == Severity::Warning)
         && !d

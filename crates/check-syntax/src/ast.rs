@@ -19,6 +19,7 @@ pub struct Param {
     pub default: Option<Expr>,
     pub is_var: bool,
     pub is_rest: bool,
+    pub is_ref: bool,
     pub is_private: bool,
     pub is_readonly: bool,
 }
@@ -252,6 +253,7 @@ pub enum StrSeg {
 pub struct Arg {
     pub name: Option<String>,
     pub value: Expr,
+    pub is_ref: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -287,7 +289,7 @@ pub enum ExprKind {
     Is(Box<Expr>, Pattern),
     While(Box<Expr>, Box<Expr>),
     Loop(Box<Expr>),
-    For(Pattern, Box<Expr>, Box<Expr>),
+    For(Pattern, Box<Expr>, Box<Expr>, bool),
     Break(Option<Box<Expr>>),
     Continue,
     Return(Option<Box<Expr>>),

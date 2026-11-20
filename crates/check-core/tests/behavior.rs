@@ -361,6 +361,22 @@ fn first_error(src: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The first error's fix, as the texts it inserts.
+fn first_error_fix(src: &str) -> Vec<String> {
+    let report = run_source(
+        "test.check",
+        src,
+        &mut Cursor::new(Vec::new()),
+        &mut Vec::new(),
+    );
+    let d = report
+        .diagnostics
+        .into_iter()
+        .find(|d| d.severity == Severity::Error)
+        .expect("an error");
+    d.fix.into_iter().map(|e| e.text).collect()
+}
+
 #[test]
 fn a_lambda_body_must_match_its_written_return_type() {
     assert_eq!(
@@ -2458,4 +2474,253 @@ match [1, 2, 3] {
     ] {
         assert_eq!(warnings(unchanged), ["unused_var"], "{unchanged}");
     }
+}
+
+const SWAP: &str = "func swap(ref a: Int, ref b: Int) {\n  let t = a\n  a = b\n  b = t\n}\n";
+const SET_NINE: &str = "func setNine(ref a: Int) { a = 9 }\n";
+
+#[test]
+fn holders_of_one_ref_see_each_others_changes() {
+    let src = "class P(var x: Int)\nlet a = Ref([1])\nlet b = a\nb.push(2)\na[0] = 5\nlet p = Ref(P(1))\nlet q = p\nq.x = 3\nprint(\"{a} {p.x}\")";
+    assert_eq!(output(src), "Ref([5, 2]) 3");
+}
+
+#[test]
+fn a_refs_value_is_a_snapshot_and_assigning_it_reaches_every_holder() {
+    let src = "let a = Ref([1])\nlet b = a\nvar copy = a.value\ncopy.push(2)\nprint(\"{a}\")\nb.value = [9]\nprint(\"{a}\")";
+    assert_eq!(output(src), "Ref([1])\nRef([9])");
+}
+
+#[test]
+fn same_tells_one_ref_from_two_equal_ones() {
+    let src = "let a = Ref(1)\nlet b = a\nprint(same(a, b))\nprint(same(a, Ref(1)))";
+    assert_eq!(output(src), "true\nfalse");
+    assert_eq!(
+        first_error("let a = Ref(1)\nprint(a == a)"),
+        "invalid_operand_types"
+    );
+    assert_eq!(
+        first_error("let m: Map<Ref<Int>, Int> = [=]"),
+        "invalid_key_type"
+    );
+}
+
+#[test]
+fn a_ref_prints_inside_a_list() {
+    assert_eq!(output("let xs = [Ref(1)]\nprint(\"{xs}\")"), "[Ref(1)]");
+}
+
+#[test]
+fn a_ref_prints_its_value_through_to_string() {
+    let src = "class Boom: Printable {\n  func toString() -> String { \"boom\" }\n}\nprint(\"{Ref(Boom())}\")";
+    assert_eq!(output(src), "Ref(boom)");
+}
+
+#[test]
+fn a_ref_of_a_ref_class_is_a_warning() {
+    let src = "ref class P(var n: Int)\nlet r = Ref(P(1))";
+    assert_eq!(warnings(src), ["ref_of_ref_class"]);
+}
+
+#[test]
+fn a_ref_parameter_changes_the_callers_variable_or_path() {
+    let src = format!(
+        "{SET_NINE}class Game(var scores: List<Int>)\nvar x = 1\nvar g = Game([1])\nvar l = [[1], [2]]\nsetNine(ref x)\nsetNine(ref g.scores[0])\nsetNine(ref l[1][0])\nprint(\"{{x}} {{g}} {{l}}\")"
+    );
+    assert_eq!(output(&src), "9 Game(scores = [9]) [[1], [9]]");
+}
+
+#[test]
+fn a_ref_parameter_writes_back_through_return_and_further_refs() {
+    let src = "func inner(ref a: Int) { a += 1 }\nfunc outer(ref a: Int) {\n  inner(ref a)\n  if a > 0 { return }\n  a = 0\n}\nvar x = 1\nouter(ref x)\nprint(x)";
+    assert_eq!(output(src), "2");
+}
+
+#[test]
+fn a_ref_path_is_resolved_once_and_can_go_through_a_let_ref() {
+    let src = format!(
+        "{SET_NINE}class P(var x: Int)\nvar n = 0\nfunc next() -> Int {{\n  n += 1\n  0\n}}\nvar xs = [1]\nsetNine(ref xs[next()])\nlet r = Ref(P(1))\nsetNine(ref r.x)\nprint(\"{{xs}} {{n}} {{r.x}}\")"
+    );
+    assert_eq!(output(&src), "[9] 1 9");
+}
+
+#[test]
+fn a_named_ref_argument_puts_ref_after_the_name() {
+    let src = "func f(n: Int, ref a: Int) { a = n }\nvar x = 1\nf(a = ref x, n = 3)\nprint(x)";
+    assert_eq!(output(src), "3");
+}
+
+#[test]
+fn a_ref_argument_must_be_a_var_or_a_path_in_one() {
+    assert_eq!(
+        first_error(&format!("{SET_NINE}let x = 1\nsetNine(ref x)")),
+        "assign_to_let"
+    );
+    assert_eq!(
+        first_error(&format!(
+            "{SET_NINE}class P(x: Int)\nvar p = P(1)\nsetNine(ref p.x)"
+        )),
+        "assign_to_let"
+    );
+    assert_eq!(
+        first_error(&format!("{SET_NINE}var x = 1\nsetNine(ref x + 1)")),
+        "assign_to_let"
+    );
+    assert_eq!(
+        first_error("func f(ref a: Int = 1) { a = 2 }"),
+        "ref_default"
+    );
+    assert_eq!(first_error("func f(ref ...a: Int) {}"), "unexpected_token");
+}
+
+#[test]
+fn overlapping_arguments_are_an_error_but_distinct_fields_are_fine() {
+    assert_eq!(
+        first_error(&format!("{SWAP}var x = 1\nswap(ref x, ref x)")),
+        "overlapping_ref"
+    );
+    assert_eq!(
+        first_error(&format!(
+            "{SWAP}var xs = [0, 0]\nvar i = 0\nswap(ref xs[i], ref i)"
+        )),
+        "overlapping_ref"
+    );
+    assert_eq!(
+        first_error(
+            "func f(ref a: List<Int>, n: Int) { a.push(n) }\nvar xs = [1]\nf(ref xs, xs.length())"
+        ),
+        "overlapping_ref"
+    );
+    assert_eq!(
+        first_error("var xs = [1]\nxs.push(ref xs[0])"),
+        "overlapping_ref"
+    );
+    let src = format!(
+        "{SWAP}class P(var x: Int, var y: Int)\nvar p = P(1, 2)\nswap(ref p.x, ref p.y)\nprint(\"{{p}}\")"
+    );
+    assert_eq!(output(&src), "P(x = 2, y = 1)");
+    let src = "func f(ref a: Int, b: Int) { a = b }\nclass P(var x: Int, var y: Int)\nvar p = P(1, 2)\nvar xs = [5]\nf(ref p.x, p.y)\nf(ref xs[p.x - 2], p.y)\nprint(\"{p} {xs}\")";
+    assert_eq!(output(src), "P(x = 2, y = 2) [2]");
+}
+
+#[test]
+fn a_ref_index_out_of_range_panics_at_the_call() {
+    panics_with(
+        &format!("{SET_NINE}var xs = [1]\nsetNine(ref xs[5])"),
+        "index_out_of_range",
+    );
+}
+
+#[test]
+fn ref_must_match_the_parameter() {
+    assert_eq!(
+        first_error(&format!("{SET_NINE}var x = 1\nsetNine(x)")),
+        "missing_ref"
+    );
+    assert_eq!(
+        first_error_fix(&format!("{SET_NINE}var x = 1\nsetNine(x)")),
+        ["ref "]
+    );
+    assert!(first_error_fix(&format!("{SET_NINE}setNine(5)")).is_empty());
+    for call in [
+        "f(ref x)",
+        "print(ref x)",
+        "Ref(ref x)",
+        "let r = (a = ref x)",
+    ] {
+        let src = format!("func f(a: Int) => print(a)\nvar x = 1\n{call}");
+        assert_eq!(first_error(&src), "ref_not_allowed", "{call}");
+        assert!(first_error_fix(&src).is_empty(), "{call}");
+    }
+}
+
+#[test]
+fn a_ref_where_its_value_is_expected_suggests_value() {
+    let src = "func count(xs: List<Int>) -> Int { xs.length() }\nlet r = Ref([1])\ncount(r)";
+    assert_eq!(
+        error_and_fix(src),
+        (
+            "ref_where_value_expected".to_string(),
+            Some("r.value".to_string())
+        )
+    );
+    for (src, value) in [
+        ("print(r + 1)", "r.value"),
+        ("print(1 < r)", "r.value"),
+        ("var v = r\nv += 1", "v.value"),
+    ] {
+        let src = format!("let r = Ref(1)\n{src}");
+        assert_eq!(
+            diagnostics(&src, Severity::Error),
+            ["ref_where_value_expected"],
+            "{src}"
+        );
+        assert_eq!(error_and_fix(&src).1.as_deref(), Some(value), "{src}");
+    }
+}
+
+#[test]
+fn a_function_with_ref_parameters_cant_be_a_value() {
+    assert_eq!(
+        first_error(&format!("{SET_NINE}let f = setNine")),
+        "ref_func_as_value"
+    );
+}
+
+#[test]
+fn a_ref_parameter_of_a_ref_class_is_a_warning() {
+    let src = "ref class P(var n: Int)\nfunc f(ref p: P) { p.n = 2 }";
+    assert_eq!(warnings(src), ["ref_param_of_ref_class"]);
+}
+
+#[test]
+fn for_ref_writes_each_element_back() {
+    let src = "class T(name: String, var done: Bool)\nvar ts = [T(\"a\", false), T(\"b\", false)]\nfor ref t in ts { t.done = true }\nprint(\"{ts}\")";
+    assert_eq!(
+        output(src),
+        "[T(name = \"a\", done = true), T(name = \"b\", done = true)]"
+    );
+}
+
+#[test]
+fn for_ref_keeps_the_changes_made_before_a_break() {
+    let src = "var xs = [1, 2, 3]\nfor ref x in xs {\n  x *= 10\n  if x == 20 { break }\n}\nprint(\"{xs}\")";
+    assert_eq!(output(src), "[10, 20, 3]");
+}
+
+#[test]
+fn for_ref_cant_change_its_list_or_go_through_a_let() {
+    assert_eq!(
+        first_error("var xs = [1, 2]\nfor ref x in xs { xs.push(x) }"),
+        "changed_in_for_ref"
+    );
+    assert_eq!(
+        first_error("let xs = [1]\nfor ref x in xs { x = 2 }"),
+        "assign_to_let"
+    );
+    assert_eq!(
+        first_error("var xs = [1, 2]\nfor ref x in xs {\n  for ref y in xs { y += 1 }\n}"),
+        "changed_in_for_ref"
+    );
+    assert!(warnings("var xs = [1]\nfor ref x in xs { print(x) }").is_empty());
+}
+
+#[test]
+fn for_ref_goes_through_a_ref() {
+    let src = "class G(var r: Ref<List<Int>>)\nlet r = Ref([1, 2])\nvar g = G(Ref([3]))\nfor ref x in r { x += 1 }\nfor ref x in g.r { x += 1 }\nprint(\"{r} {g}\")";
+    assert_eq!(output(src), "Ref([2, 3]) G(r = Ref([4]))");
+}
+
+#[test]
+fn for_ref_panics_when_its_element_is_gone() {
+    let src = "ref class Box(var items: List<Int>)\nclass Holder(var box: Box)\nfunc empty(b: Box) { b.items = [] }\nvar h = Holder(Box([1, 2]))\nlet b = h.box\nfor ref x in h.box.items { empty(b) }";
+    panics_with(src, "for_ref_element_gone");
+}
+
+#[test]
+fn a_name_called_ref_still_works() {
+    assert_eq!(
+        output("func f(ref: Int) => ref + 1\nlet ref = 2\nprint(f(ref))"),
+        "3"
+    );
 }

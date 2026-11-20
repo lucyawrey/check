@@ -43,6 +43,7 @@ struct ParamSig {
     ty: Ty,
     has_default: bool,
     is_rest: bool,
+    is_ref: bool,
 }
 
 #[derive(Clone)]
@@ -123,7 +124,7 @@ type Binding = (String, Span, Ty, bool);
 type OwnMethod = (String, Vec<(Sig, HashMap<String, Ty>)>);
 
 enum ArgSource<'a> {
-    Expr(&'a Expr),
+    Expr(&'a Expr, bool),
     Spread(Ty, Span),
 }
 
@@ -240,6 +241,7 @@ pub(crate) const BUILT_IN_TYPES: &[&str] = &["String", "Int", "Float", "Bool"];
 pub(crate) const MAYBE: &str = "check.std.Maybe";
 pub(crate) const MAP: &str = "Map";
 pub(crate) const SET: &str = "Set";
+pub(crate) const REF: &str = "Ref";
 /// The bound a map key or set item's type needs; not a real interface.
 const KEY: &str = "check.std.Key";
 pub(crate) const RESULT: &str = "check.std.Result";
@@ -619,6 +621,7 @@ impl Checker<'_> {
                         ty: self.type_from(t),
                         has_default: false,
                         is_rest: false,
+                        is_ref: false,
                     })
                     .collect(),
             })
@@ -748,11 +751,18 @@ impl Checker<'_> {
                 (true, _) => self.error(Code::type_mismatch, p.span),
                 (false, ty) => ty,
             };
+            if p.is_ref && p.default.is_some() {
+                self.error(Code::ref_default, p.span);
+            }
+            if p.is_ref && self.is_ref_class(&ty) {
+                self.warn(Code::ref_param_of_ref_class, p.span);
+            }
             params.push(ParamSig {
                 name: p.name.clone(),
                 ty,
                 has_default: p.default.is_some(),
                 is_rest: p.is_rest,
+                is_ref: p.is_ref,
             });
         }
         params
@@ -915,6 +925,7 @@ impl Checker<'_> {
                         Ty::Named(name.clone(), args)
                     }
                     (MAYBE, [inner]) => Ty::maybe(inner.clone()),
+                    (REF, [_]) => Ty::Named(name.clone(), args),
                     _ if !self.type_names.contains(name) => self.error(Code::unknown_name, *span),
                     _ if self.generics.get(name).map_or(0, Vec::len) != args.len() => {
                         self.error(Code::wrong_type_arguments, *span)
@@ -976,7 +987,7 @@ impl Checker<'_> {
                 p.name.clone(),
                 Var {
                     ty,
-                    mutable: p.is_var,
+                    mutable: p.is_var || p.is_ref,
                     kind: VarKind::Param,
                     span: p.span,
                     reassigned: false,
@@ -1408,12 +1419,40 @@ impl Checker<'_> {
             return;
         }
         let a = self.subst.shallow(actual);
+        if let Ty::Named(n, args) = &a
+            && n == REF
+            && self.subst.unify(&args[0], expected)
+        {
+            self.ref_value_hint(expr);
+            return;
+        }
         let code = if matches!(a, Ty::Maybe(_)) {
             Code::unhandled_maybe
         } else {
             self.mismatch(&a, expected, Code::type_mismatch)
         };
         self.error(code, expr.span);
+    }
+
+    fn ref_value_hint(&mut self, e: &Expr) {
+        let mut d = Diagnostic::error(Code::ref_where_value_expected, e.span);
+        d.detail = Some(format!("{}.value", self.operand_text(e)));
+        self.diags.push(d);
+    }
+
+    /// The source of `e` on one line, in parentheses unless a method call on it would bind to all of it.
+    fn operand_text(&self, e: &Expr) -> String {
+        let text = self.sources.text(e.span);
+        let text = text.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+        match e.kind {
+            ExprKind::Name(_)
+            | ExprKind::This
+            | ExprKind::Call(..)
+            | ExprKind::Method(..)
+            | ExprKind::Field(..)
+            | ExprKind::Index(..) => text,
+            _ => format!("({text})"),
+        }
     }
 
     fn mismatch(&self, actual: &Ty, expected: &Ty, otherwise: Code) -> Code {
@@ -1691,6 +1730,13 @@ impl Checker<'_> {
             ExprKind::This => self.place_name("this", target.span),
             ExprKind::Field(base, name) if self.type_ref(base).is_none() => {
                 let (bt, base_err) = self.place(base);
+                let (bt, base_err) = match self.subst.shallow(&bt) {
+                    Ty::Named(n, mut a) if n == REF && name == "value" => {
+                        return (a.remove(0), None);
+                    }
+                    Ty::Named(n, mut a) if n == REF => (a.remove(0), None),
+                    bt => (bt, base_err),
+                };
                 match self.subst.shallow(&bt) {
                     t if self.is_interface(&t) || matches!(t, Ty::Param(_)) => {
                         match self.required_field(&t, name) {
@@ -1733,6 +1779,10 @@ impl Checker<'_> {
             }
             ExprKind::Index(list, index) => {
                 let (lt, base_err) = self.place(list);
+                let (lt, base_err) = match self.subst.shallow(&lt) {
+                    Ty::Named(n, mut a) if n == REF => (a.remove(0), None),
+                    lt => (lt, base_err),
+                };
                 let (key, value) = match self.subst.shallow(&lt) {
                     Ty::Named(n, mut a) if n == MAP => (a.remove(0), Some(a.remove(0))),
                     _ => (Ty::Int, None),
@@ -1867,6 +1917,7 @@ impl Checker<'_> {
             Ty::Named(name, args) if name == MAP || name == SET => {
                 args.iter().any(|a| self.holds_ref(a, seen))
             }
+            Ty::Named(name, _) if name == REF => true,
             Ty::Named(name, args) if seen.insert(Show(&self.resolve(&ty)).to_string()) => {
                 if self.is_ref_class(&ty) && !self.implements(&ty, &Ty::named(EQ)) {
                     return true;
@@ -1908,7 +1959,7 @@ impl Checker<'_> {
                 None => false,
             },
             Ty::Record(_, fields) => fields.iter().all(|f| self.is_key(f, seen)),
-            Ty::Named(name, _) if name == MAP || name == SET => false,
+            Ty::Named(name, _) if name == MAP || name == SET || name == REF => false,
             Ty::Named(..) if self.is_interface(&ty) || self.is_ref_class(&ty) => false,
             Ty::Named(name, args) => {
                 if !seen.insert(Show(&self.resolve(&ty)).to_string()) {
@@ -1940,6 +1991,13 @@ impl Checker<'_> {
             Ty::List(_) => true,
             Ty::Named(n, _) => n == MAP || n == SET,
             _ => false,
+        }
+    }
+
+    fn unref(&self, ty: &Ty) -> Ty {
+        match self.subst.shallow(ty) {
+            Ty::Named(n, a) if n == REF => self.subst.shallow(&a[0]),
+            t => t,
         }
     }
 
@@ -2014,6 +2072,9 @@ impl Checker<'_> {
                 let result = self.binary_type(op, target, &ty, value, &rhs, span);
                 if op == BinOp::Div && self.subst.shallow(&ty) == Ty::Int {
                     self.error(Code::slash_for_int, span);
+                    return;
+                }
+                if matches!(self.subst.shallow(&ty), Ty::Named(n, _) if n == REF) {
                     return;
                 }
                 result
@@ -2154,8 +2215,14 @@ impl Checker<'_> {
             }
             ExprKind::Unary(op, operand) => self.unary(*op, operand, expr.span),
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expr.span),
-            ExprKind::Call(callee, args) => self.call(expr.id, callee, args, expr.span, expected),
-            ExprKind::Method(recv, name, args) => self.method(expr.id, recv, name, args, expr.span),
+            ExprKind::Call(callee, args) => {
+                self.check_overlap(None, args);
+                self.call(expr.id, callee, args, expr.span, expected)
+            }
+            ExprKind::Method(recv, name, args) => {
+                self.check_overlap(Some(recv), args);
+                self.method(expr.id, recv, name, args, expr.span)
+            }
             ExprKind::Index(list, index) => self.index(expr.id, list, index, expr.span),
             ExprKind::Lambda(params, ret, body) => {
                 self.lambda(expr.id, params, ret.as_ref(), body, expected)
@@ -2172,7 +2239,10 @@ impl Checker<'_> {
                 self.finish_scope();
                 ty
             }
-            ExprKind::For(pattern, iter, body) => self.for_loop(expr.id, pattern, iter, body),
+            ExprKind::For(pattern, iter, body, false) => {
+                self.for_loop(expr.id, pattern, iter, body)
+            }
+            ExprKind::For(pattern, iter, body, true) => self.for_ref(expr.id, pattern, iter, body),
             ExprKind::Loop(body) => {
                 self.loops.push(LoopCtx {
                     kind: LoopKind::Loop,
@@ -2304,6 +2374,7 @@ impl Checker<'_> {
 
     fn record_literal(&mut self, expr: &Expr, args: &[Arg], expected: Option<&Ty>) -> Ty {
         if let Some(ExprKind::Spread(inner)) = args.first().map(|a| &a.value.kind) {
+            self.no_ref_args(&args[1..]);
             return self.record_copy(inner, &args[1..]);
         }
         let expected = expected.map(|e| match self.subst.shallow(e) {
@@ -2315,6 +2386,7 @@ impl Checker<'_> {
         {
             return self.construct(expr.id, class, args, expr.span);
         }
+        self.no_ref_args(args);
         if args.is_empty() {
             return self.error(Code::type_needed, expr.span);
         }
@@ -2427,6 +2499,11 @@ impl Checker<'_> {
             return self.error(Code::unknown_field, span);
         }
         let bt = self.expr(base, None);
+        let bt = match self.subst.shallow(&bt) {
+            Ty::Named(n, mut a) if n == REF && name == "value" => return a.remove(0),
+            Ty::Named(n, mut a) if n == REF => a.remove(0),
+            bt => bt,
+        };
         match self.subst.shallow(&bt) {
             t if self.is_interface(&t) || matches!(t, Ty::Param(_)) => {
                 match self.required_field(&t, name) {
@@ -2456,6 +2533,9 @@ impl Checker<'_> {
             let Some(sig) = self.ensure_checked(name, span) else {
                 return Ty::Error;
             };
+            if sig.params.iter().any(|p| p.is_ref) {
+                return self.error(Code::ref_func_as_value, span);
+            }
             let map = self.instantiate(name, span);
             let params = sig.params.iter().map(|p| p.ty.substitute(&map)).collect();
             let ret = sig.ret.unwrap_or(Ty::Void).substitute(&map);
@@ -2554,19 +2634,8 @@ impl Checker<'_> {
             (Fails::Result(_), Some(Fails::Maybe)) => (Code::try_result_in_maybe, "ok()"),
             (Fails::Maybe, Some(Fails::Result(_))) => (Code::try_maybe_in_result, "orErr(...)"),
         };
-        let text = self.sources.text(operand.span);
-        let text = text.lines().map(str::trim).collect::<Vec<_>>().join(" ");
-        let text = match operand.kind {
-            ExprKind::Name(_)
-            | ExprKind::This
-            | ExprKind::Call(..)
-            | ExprKind::Method(..)
-            | ExprKind::Field(..)
-            | ExprKind::Index(..) => text,
-            _ => format!("({text})"),
-        };
         let mut d = Diagnostic::error(code, span);
-        d.detail = Some(format!("try {text}.{fix}"));
+        d.detail = Some(format!("try {}.{fix}", self.operand_text(operand)));
         self.diags.push(d);
         false
     }
@@ -2650,6 +2719,21 @@ impl Checker<'_> {
         if a == Ty::Error || b == Ty::Error {
             return Ty::Error;
         }
+        let inner = |t: &Ty| match t {
+            Ty::Named(n, args) if n == REF => Some(args[0].clone()),
+            _ => None,
+        };
+        match (inner(&a), inner(&b)) {
+            (Some(t), None) => {
+                self.ref_value_hint(lhs);
+                a = self.subst.shallow(&t);
+            }
+            (None, Some(t)) => {
+                self.ref_value_hint(rhs);
+                b = self.subst.shallow(&t);
+            }
+            _ => {}
+        }
         if matches!(a, Ty::Var(_)) {
             return self.error(Code::type_needed, lhs.span);
         }
@@ -2722,7 +2806,7 @@ impl Checker<'_> {
         let mut known = true;
         for (i, arg) in args.iter().enumerate() {
             let ExprKind::Spread(inner) = &arg.value.kind else {
-                out.push((arg.name.clone(), ArgSource::Expr(&arg.value)));
+                out.push((arg.name.clone(), ArgSource::Expr(&arg.value, arg.is_ref)));
                 continue;
             };
             let t = self.expr(inner, None);
@@ -2746,7 +2830,7 @@ impl Checker<'_> {
         }
         if !known {
             for (_, source) in out {
-                if let ArgSource::Expr(e) = source {
+                if let ArgSource::Expr(e, _) = source {
                     self.expr(e, None);
                 }
             }
@@ -2755,9 +2839,36 @@ impl Checker<'_> {
         Some(out)
     }
 
-    fn check_arg(&mut self, source: &ArgSource, param: &Ty) {
+    fn check_arg(&mut self, source: &ArgSource, param: &Ty, ref_param: bool) {
         match source {
-            ArgSource::Expr(e) => {
+            ArgSource::Expr(e, true) if ref_param => {
+                let (t, err) = self.place(e);
+                if let Some(code) = err {
+                    self.error(code, e.span);
+                } else if !self.subst.unify(&t, param) {
+                    let code = self.mismatch(&t, param, Code::type_mismatch);
+                    self.error(code, e.span);
+                }
+            }
+            ArgSource::Expr(e, is_ref) => {
+                if ref_param {
+                    let mut d = Diagnostic::error(Code::missing_ref, e.span);
+                    if ref_path(e).is_some() {
+                        d = d.with_quick_fix(vec![Edit {
+                            span: Span::new(e.span.start, e.span.start),
+                            text: "ref ".to_string(),
+                        }]);
+                    }
+                    self.diags.push(d);
+                    if let Some((root, _)) = ref_path(e)
+                        && let Some(var) =
+                            self.scopes.iter_mut().rev().find_map(|s| s.get_mut(root))
+                    {
+                        var.reassigned = true;
+                    }
+                } else if *is_ref {
+                    self.error(Code::ref_not_allowed, e.span);
+                }
                 let t = self.expr(e, Some(param));
                 self.expect(e, &t, param);
             }
@@ -2771,8 +2882,14 @@ impl Checker<'_> {
     }
 
     fn skip_arg(&mut self, source: &ArgSource) {
-        if let ArgSource::Expr(e) = source {
+        if let ArgSource::Expr(e, _) = source {
             self.expr(e, None);
+        }
+    }
+
+    fn no_ref_args(&mut self, args: &[Arg]) {
+        for a in args.iter().filter(|a| a.is_ref) {
+            self.error(Code::ref_not_allowed, a.value.span);
         }
     }
 
@@ -2788,7 +2905,7 @@ impl Checker<'_> {
             return false;
         }
         for ((_, source), param) in sources.iter().zip(params) {
-            self.check_arg(source, param);
+            self.check_arg(source, param, false);
         }
         true
     }
@@ -2806,6 +2923,9 @@ impl Checker<'_> {
         {
             if self.funcs.contains_key(name) {
                 return self.call_named(name, args, span);
+            }
+            if matches!(name.as_str(), "print" | "Some" | REF | "same") {
+                self.no_ref_args(args);
             }
             match name.as_str() {
                 "print" => {
@@ -2838,13 +2958,30 @@ impl Checker<'_> {
                     self.args_of(args, span, &[Ty::list(item.clone())]);
                     return Ty::Named(SET.to_string(), vec![item]);
                 }
+                REF => {
+                    if args.len() != 1 {
+                        return self.error(Code::wrong_arguments, span);
+                    }
+                    let inner = match expected.map(|e| self.subst.shallow(e)) {
+                        Some(Ty::Named(n, mut a)) if n == REF => a.remove(0),
+                        _ => self.subst.fresh(),
+                    };
+                    let t = self.expr(&args[0].value, Some(&inner));
+                    self.expect(&args[0].value, &t, &inner);
+                    if self.is_ref_class(&inner) {
+                        self.warn(Code::ref_of_ref_class, span);
+                    }
+                    return Ty::Named(REF.to_string(), vec![inner]);
+                }
                 "same" => {
                     if args.len() != 2 {
                         return self.error(Code::wrong_arguments, span);
                     }
                     let a = self.expr(&args[0].value, None);
                     let b = self.expr(&args[1].value, None);
-                    if !self.is_ref_class(&a) || !self.subst.unify(&a, &b) {
+                    let shared = self.is_ref_class(&a)
+                        || matches!(self.subst.shallow(&a), Ty::Named(n, _) if n == REF);
+                    if !shared || !self.subst.unify(&a, &b) {
                         self.error(Code::type_mismatch, span);
                     }
                     return Ty::Bool;
@@ -3000,10 +3137,10 @@ impl Checker<'_> {
         for (k, source) in positional.into_iter().enumerate() {
             if let Some(&i) = fixed.get(k) {
                 filled[i] = true;
-                self.check_arg(source, &params[i].ty);
+                self.check_arg(source, &params[i].ty, params[i].is_ref);
             } else if let Some(r) = rest {
                 filled[r] = true;
-                self.check_arg(source, &params[r].ty);
+                self.check_arg(source, &params[r].ty, false);
             } else {
                 self.skip_arg(source);
                 ok = false;
@@ -3019,7 +3156,7 @@ impl Checker<'_> {
             {
                 Some(i) if !filled[i] => {
                     filled[i] = true;
-                    self.check_arg(source, &params[i].ty);
+                    self.check_arg(source, &params[i].ty, params[i].is_ref);
                 }
                 _ => {
                     self.skip_arg(source);
@@ -3070,7 +3207,7 @@ impl Checker<'_> {
         } else {
             self.expr(recv, None)
         };
-        let recv_ty = self.subst.shallow(&recv_ty);
+        let recv_ty = self.unref(&recv_ty);
         if self.is_interface(&recv_ty) || matches!(recv_ty, Ty::Param(_)) {
             let Some(sig) = self.interface_method(&recv_ty, name) else {
                 return self.unknown_method(args, span);
@@ -3268,7 +3405,7 @@ impl Checker<'_> {
 
     fn index(&mut self, id: NodeId, list: &Expr, index: &Expr, span: Span) -> Ty {
         let lt = self.expr(list, None);
-        let lt = self.subst.shallow(&lt);
+        let lt = self.unref(&lt);
         let key = match &lt {
             Ty::Named(n, a) if n == MAP => a[0].clone(),
             _ => Ty::Int,
@@ -3333,7 +3470,7 @@ impl Checker<'_> {
                 p.name.clone(),
                 Var {
                     ty,
-                    mutable: p.is_var,
+                    mutable: p.is_var || p.is_ref,
                     kind: VarKind::Param,
                     span: p.span,
                     reassigned: false,
@@ -3961,6 +4098,68 @@ impl Checker<'_> {
         }
     }
 
+    fn check_overlap(&mut self, recv: Option<&Expr>, args: &[Arg]) {
+        let refs: Vec<(&Expr, RefPath)> = args
+            .iter()
+            .filter(|a| a.is_ref)
+            .filter_map(|a| Some((&a.value, ref_path(&a.value)?)))
+            .collect();
+        for (i, (e, path)) in refs.iter().enumerate() {
+            let mut readers: Vec<&Expr> = recv.into_iter().collect();
+            readers.extend(args.iter().filter(|a| !a.is_ref).map(|a| &a.value));
+            for (j, (other, _)) in refs.iter().enumerate() {
+                if j != i {
+                    index_exprs(other, &mut readers);
+                }
+            }
+            let reads = readers.iter().any(|r| {
+                let mut bases = Vec::new();
+                find_expr(r, &mut |x, _| {
+                    if bases.contains(&(x as *const Expr)) {
+                        return false;
+                    }
+                    let Some(p) = ref_path(x) else {
+                        return false;
+                    };
+                    path_bases(x, &mut bases);
+                    overlaps(&p, path)
+                })
+                .is_some()
+            });
+            if reads || refs[..i].iter().any(|(_, p)| overlaps(p, path)) {
+                self.error(Code::overlapping_ref, e.span);
+            }
+        }
+    }
+
+    fn for_ref(&mut self, id: NodeId, pattern: &Pattern, iter: &Expr, body: &Expr) -> Ty {
+        let (t, err) = self.place(iter);
+        let shared = matches!(self.subst.shallow(&t), Ty::Named(n, _) if n == REF);
+        if let Some(code) = err.filter(|_| !shared) {
+            self.error(code, iter.span);
+        }
+        let elem = match self.unref(&t) {
+            Ty::List(e) => *e,
+            Ty::Error => Ty::Error,
+            _ => self.error(Code::not_iterable, iter.span),
+        };
+        let PatternKind::Name(name) = &pattern.kind else {
+            return self.error(Code::unexpected_token, pattern.span);
+        };
+        if let Some(path) = ref_path(iter)
+            && let Some(hit) = changes(body, &|e| ref_path(e).is_some_and(|p| overlaps(&p, &path)))
+        {
+            self.error(Code::changed_in_for_ref, hit.span);
+        }
+        self.push_bindings(vec![(name.clone(), pattern.span, elem, true)]);
+        if let Some(var) = self.scopes.last_mut().and_then(|s| s.get_mut(name)) {
+            var.reassigned = true;
+        }
+        let ty = self.valued_loop(id, body);
+        self.finish_scope();
+        ty
+    }
+
     fn for_loop(&mut self, id: NodeId, pattern: &Pattern, iter: &Expr, body: &Expr) -> Ty {
         let it = self.expr(iter, None);
         let elem = match self.subst.shallow(&it) {
@@ -4023,55 +4222,133 @@ fn narrowing_list(iter: &Expr) -> Option<String> {
 }
 
 fn mutates(expr: &Expr, list: &str) -> bool {
-    let is_list = |e: &Expr| matches!(&e.kind, ExprKind::Name(n) if n == list);
-    match &expr.kind {
-        ExprKind::Method(recv, m, args) => {
-            (is_list(recv) && MUTATING.contains(&m.as_str()))
-                || mutates(recv, list)
-                || args.iter().any(|a| mutates(&a.value, list))
+    changes(expr, &|e| matches!(&e.kind, ExprKind::Name(n) if n == list)).is_some()
+}
+
+fn changes<'a>(expr: &'a Expr, is_target: &dyn Fn(&Expr) -> bool) -> Option<&'a Expr> {
+    find_expr(expr, &mut |e, assigned| {
+        (assigned && is_target(e))
+            || match &e.kind {
+                ExprKind::Method(recv, m, args) => {
+                    (is_target(recv) && MUTATING.contains(&m.as_str()))
+                        || args.iter().any(|a| a.is_ref && is_target(&a.value))
+                }
+                ExprKind::Call(_, args) => args.iter().any(|a| a.is_ref && is_target(&a.value)),
+                ExprKind::For(_, iter, _, true) => is_target(iter),
+                _ => false,
+            }
+    })
+}
+
+fn find_expr<'a>(e: &'a Expr, hit: &mut dyn FnMut(&Expr, bool) -> bool) -> Option<&'a Expr> {
+    if hit(e, false) {
+        return Some(e);
+    }
+    let mut kids: Vec<&Expr> = Vec::new();
+    match &e.kind {
+        ExprKind::Method(recv, _, args) | ExprKind::Call(recv, args) => {
+            kids.push(recv);
+            kids.extend(args.iter().map(|a| &a.value));
         }
-        ExprKind::Block(stmts) => stmts.iter().any(|s| match s {
-            Stmt::Assign { target, value, .. } => is_list(target) || mutates(value, list),
-            Stmt::Let { value, .. } => mutates(value, list),
-            Stmt::Expr(e) => mutates(e, list),
-            Stmt::LetPattern { value, .. } => mutates(value, list),
-            Stmt::Func(_)
-            | Stmt::Class(_)
-            | Stmt::Enum(_)
-            | Stmt::Implement(_)
-            | Stmt::Interface(_)
-            | Stmt::Data(_) => false,
-        }),
-        ExprKind::Str(segs) => segs
-            .iter()
-            .any(|s| matches!(s, StrSeg::Expr(e) if mutates(e, list))),
-        ExprKind::List(items) => items.iter().any(|e| mutates(e, list)),
-        ExprKind::Map(entries) => entries
-            .iter()
-            .any(|(k, v)| mutates(k, list) || mutates(v, list)),
-        ExprKind::Record(args) => args.iter().any(|a| mutates(&a.value, list)),
-        ExprKind::Unary(_, e)
-        | ExprKind::Loop(e)
-        | ExprKind::Lambda(_, _, e)
-        | ExprKind::Field(e, _)
-        | ExprKind::Is(e, _)
-        | ExprKind::Spread(e) => mutates(e, list),
-        ExprKind::Match(s, arms) => {
-            mutates(s, list)
-                || arms.iter().any(|a| {
-                    mutates(&a.body, list) || a.guard.as_ref().is_some_and(|g| mutates(g, list))
-                })
+        ExprKind::Record(args) => kids.extend(args.iter().map(|a| &a.value)),
+        ExprKind::Block(stmts) => {
+            for s in stmts {
+                match s {
+                    Stmt::Assign { target, value, .. } => {
+                        if hit(target, true) {
+                            return Some(target);
+                        }
+                        kids.push(target);
+                        kids.push(value);
+                    }
+                    Stmt::Let { value, .. } | Stmt::LetPattern { value, .. } => kids.push(value),
+                    Stmt::Expr(x) => kids.push(x),
+                    _ => {}
+                }
+            }
+        }
+        ExprKind::Str(segs) => kids.extend(segs.iter().filter_map(|s| match s {
+            StrSeg::Expr(x) => Some(x),
+            _ => None,
+        })),
+        ExprKind::List(items) => kids.extend(items),
+        ExprKind::Map(entries) => {
+            for (k, v) in entries {
+                kids.push(k);
+                kids.push(v);
+            }
+        }
+        ExprKind::Unary(_, x)
+        | ExprKind::Loop(x)
+        | ExprKind::Lambda(_, _, x)
+        | ExprKind::Field(x, _)
+        | ExprKind::Is(x, _)
+        | ExprKind::Spread(x) => kids.push(x),
+        ExprKind::Match(subject, arms) => {
+            kids.push(subject);
+            for a in arms {
+                kids.push(&a.body);
+                kids.extend(&a.guard);
+            }
         }
         ExprKind::Binary(_, a, b)
         | ExprKind::Index(a, b)
         | ExprKind::While(a, b)
-        | ExprKind::For(_, a, b) => mutates(a, list) || mutates(b, list),
-        ExprKind::Call(f, args) => mutates(f, list) || args.iter().any(|a| mutates(&a.value, list)),
-        ExprKind::If(c, t, o) => {
-            mutates(c, list) || mutates(t, list) || o.as_ref().is_some_and(|o| mutates(o, list))
+        | ExprKind::For(_, a, b, _) => {
+            kids.push(a);
+            kids.push(b);
         }
-        ExprKind::Break(v) | ExprKind::Return(v) => v.as_ref().is_some_and(|v| mutates(v, list)),
-        _ => false,
+        ExprKind::If(c, t, o) => {
+            kids.push(c);
+            kids.push(t);
+            kids.extend(o.as_deref());
+        }
+        ExprKind::Break(v) | ExprKind::Return(v) => kids.extend(v.as_deref()),
+        _ => {}
+    }
+    kids.into_iter().find_map(|k| find_expr(k, hit))
+}
+
+type RefPath<'a> = (&'a str, Vec<&'a str>);
+
+fn ref_path(e: &Expr) -> Option<RefPath<'_>> {
+    match &e.kind {
+        ExprKind::Name(n) => Some((n, Vec::new())),
+        ExprKind::This => Some(("this", Vec::new())),
+        ExprKind::Field(base, name) => {
+            let (root, mut steps) = ref_path(base)?;
+            steps.push(name);
+            Some((root, steps))
+        }
+        ExprKind::Index(base, _) => {
+            let (root, mut steps) = ref_path(base)?;
+            steps.push("[]");
+            Some((root, steps))
+        }
+        _ => None,
+    }
+}
+
+fn overlaps(a: &RefPath, b: &RefPath) -> bool {
+    a.0 == b.0 && a.1.iter().zip(&b.1).all(|(x, y)| x == y)
+}
+
+/// The shorter paths inside a path, which a read of the whole path doesn't read on its own.
+fn path_bases(e: &Expr, out: &mut Vec<*const Expr>) {
+    if let ExprKind::Field(base, _) | ExprKind::Index(base, _) = &e.kind {
+        out.push(&**base);
+        path_bases(base, out);
+    }
+}
+
+fn index_exprs<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match &e.kind {
+        ExprKind::Field(base, _) => index_exprs(base, out),
+        ExprKind::Index(base, index) => {
+            out.push(index);
+            index_exprs(base, out);
+        }
+        _ => {}
     }
 }
 

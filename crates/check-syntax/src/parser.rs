@@ -109,6 +109,14 @@ impl Parser<'_> {
         matches!(self.peek(), Tok::Ident(w) if w == word)
     }
 
+    fn soft_before_name(&mut self, word: &str) -> bool {
+        let before = self.is_soft(word) && matches!(self.peek_at(1), Tok::Ident(_));
+        if before {
+            self.advance();
+        }
+        before
+    }
+
     fn is_type_decl(&self) -> bool {
         self.is_kw("class")
             || self.is_kw("enum")
@@ -230,6 +238,7 @@ impl Parser<'_> {
             args.push(Arg {
                 name: Some(name),
                 value: self.expr()?,
+                is_ref: false,
             });
             self.end_statement(false);
             self.skip_newlines();
@@ -648,7 +657,7 @@ impl Parser<'_> {
         let mut members = Members::default();
         let interfaces;
         if self.is_sym("(") {
-            fields = self.params(true)?;
+            fields = self.params(true, false)?;
             interfaces = self.interface_list()?;
         } else {
             interfaces = self.interface_list()?;
@@ -715,6 +724,7 @@ impl Parser<'_> {
             default,
             is_var,
             is_rest: false,
+            is_ref: false,
             is_private,
             is_readonly,
         })
@@ -965,7 +975,7 @@ impl Parser<'_> {
         let start = self.advance().span;
         let (name, _) = self.ident()?;
         let type_params = self.type_params()?;
-        let params = self.params(false)?;
+        let params = self.params(false, true)?;
         let ret = if self.eat_sym("->") {
             Some(self.type_expr()?)
         } else {
@@ -1125,7 +1135,7 @@ impl Parser<'_> {
     }
 
     /// `fields` allows `private` and `readonly`, as in a class header.
-    fn params(&mut self, fields: bool) -> PResult<Vec<Param>> {
+    fn params(&mut self, fields: bool, allow_ref: bool) -> PResult<Vec<Param>> {
         self.expect_sym("(")?;
         let mut params = Vec::new();
         self.list_items(")", |p| {
@@ -1137,6 +1147,7 @@ impl Parser<'_> {
             if fields && !is_private && !is_readonly && p.is_kw("let") {
                 p.remove_token(Code::let_in_class_header);
             }
+            let is_ref = allow_ref && p.soft_before_name("ref");
             let is_var = p.eat_kw("var");
             let is_rest = p.eat_sym("...");
             let (name, span) = p.ident()?;
@@ -1157,6 +1168,7 @@ impl Parser<'_> {
                 default,
                 is_var,
                 is_rest,
+                is_ref,
                 is_private,
                 is_readonly,
             });
@@ -1517,14 +1529,19 @@ impl Parser<'_> {
                 }
                 _ => None,
             };
+            let is_ref = p.soft_before_name("ref");
             let start = p.span();
-            let value = if name.is_none() && p.eat_sym("...") {
+            let value = if name.is_none() && !is_ref && p.eat_sym("...") {
                 let inner = p.expr()?;
                 p.expr_node(start.to(inner.span), ExprKind::Spread(Box::new(inner)))
             } else {
                 p.expr()?
             };
-            args.push(Arg { name, value });
+            args.push(Arg {
+                name,
+                value,
+                is_ref,
+            });
             Ok(())
         })?;
         Ok(args)
@@ -1595,7 +1612,11 @@ impl Parser<'_> {
             Tok::Sym("(") => {
                 let mut args = self.args()?;
                 let span = span.to(self.prev_span());
-                if let [Arg { name: None, value }] = args.as_slice()
+                if let [
+                    Arg {
+                        name: None, value, ..
+                    },
+                ] = args.as_slice()
                     && !matches!(value.kind, ExprKind::Spread(_))
                 {
                     return Ok(args.remove(0).value);
@@ -1635,7 +1656,7 @@ impl Parser<'_> {
             Tok::Kw("func") => {
                 self.pos -= 1;
                 self.advance();
-                let params = self.params(false)?;
+                let params = self.params(false, false)?;
                 let ret = if self.eat_sym("->") {
                     Some(self.type_expr()?)
                 } else {
@@ -1662,6 +1683,7 @@ impl Parser<'_> {
                 return Ok(self.expr_node(span.to(body.span), ExprKind::Loop(Box::new(body))));
             }
             Tok::Kw("for") => {
+                let is_ref = self.soft_before_name("ref");
                 let pattern = self.pattern(true)?;
                 if !self.eat_kw("in") {
                     return self.error(Code::unexpected_token, self.span());
@@ -1670,7 +1692,7 @@ impl Parser<'_> {
                 let body = self.block()?;
                 return Ok(self.expr_node(
                     span.to(body.span),
-                    ExprKind::For(pattern, Box::new(iter), Box::new(body)),
+                    ExprKind::For(pattern, Box::new(iter), Box::new(body), is_ref),
                 ));
             }
             Tok::Kw("break" | "continue" | "return") => {

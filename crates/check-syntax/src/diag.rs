@@ -88,6 +88,13 @@ codes! {
     try_maybe_in_result => "[try on a Maybe in a function returning a Result]",
     try_error_mismatch => "[try on a Result whose error type differs from the function's]",
     assign_to_let => "[assigning to a let]",
+    missing_ref => "[an argument for a ref parameter without ref]",
+    ref_not_allowed => "[ref on an argument whose parameter isn't ref]",
+    overlapping_ref => "[a ref argument that overlaps another argument of the same call]",
+    ref_default => "[a ref parameter with a default]",
+    ref_func_as_value => "[a function with ref parameters used as a value]",
+    ref_where_value_expected => "[a Ref where its value is expected]",
+    changed_in_for_ref => "[changing the list a for ref loop goes through]",
     assign_to_parameter => "[assigning to a parameter not written var]",
     change_let_collection => "[changing a let list, map or set]",
     break_outside_loop => "[break or continue outside a loop]",
@@ -153,7 +160,10 @@ codes! {
     stack_overflow => "[more than 10,000 nested calls]",
     missing_key => "[a compound assignment to a map key that isn't there]",
     index_out_of_range => "[writing to a list index that doesn't exist]",
+    for_ref_element_gone => "[a for ref element whose index is gone when it's written back]",
     unused_var => "[a var that's never reassigned]",
+    ref_of_ref_class => "[Ref of a ref class, which is already shared]",
+    ref_param_of_ref_class => "[a ref parameter of a ref class, which is already shared]",
     shadowed_name => "[a local that shadows a function or type]",
     interpolated_maybe => "[interpolating a T?]",
     nested_maybe => "[an if or loop value that is a T??]",
@@ -183,6 +193,7 @@ pub struct Diagnostic {
     pub detail: Option<String>,
     /// The tidy fix, applied all together; empty when there's no one obvious fix.
     pub fix: Vec<Edit>,
+    pub quick_fix_only: bool,
 }
 
 impl Diagnostic {
@@ -193,6 +204,7 @@ impl Diagnostic {
             severity: Severity::Error,
             detail: None,
             fix: Vec::new(),
+            quick_fix_only: false,
         }
     }
 
@@ -203,11 +215,18 @@ impl Diagnostic {
             severity: Severity::Warning,
             detail: None,
             fix: Vec::new(),
+            quick_fix_only: false,
         }
     }
 
     pub fn with_fix(mut self, fix: Vec<Edit>) -> Self {
         self.fix = fix;
+        self
+    }
+
+    pub fn with_quick_fix(mut self, fix: Vec<Edit>) -> Self {
+        self.fix = fix;
+        self.quick_fix_only = true;
         self
     }
 
