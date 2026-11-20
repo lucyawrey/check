@@ -251,3 +251,20 @@ fn saving_a_new_file_rechecks_the_files_that_use_it() {
     let saved = lsp.notify("textDocument/didSave", json!({ "textDocument": doc }));
     assert!(codes_for(&saved, &main).is_empty());
 }
+
+#[test]
+fn hints_each_method_that_changes_this() {
+    let dir = folder("inlay hints", &[("main.check", "")]);
+    let main = dir.join("main.check");
+    let mut lsp = Lsp::start();
+    lsp.open(
+        &main,
+        "class C {\n  var n: Int = 0\n  func bump() { this.n += 1 }\n  func get() -> Int { this.n }\n}",
+    );
+    let range =
+        json!({ "start": { "line": 0, "character": 0 }, "end": { "line": 9, "character": 0 } });
+    let params = json!({ "textDocument": { "uri": uri(&main) }, "range": range });
+    let hints = lsp.request("textDocument/inlayHint", params).0;
+    assert_eq!(hints.as_array().unwrap().len(), 1, "{hints}");
+    assert_eq!(hints[0]["position"], json!({ "line": 2, "character": 14 }));
+}

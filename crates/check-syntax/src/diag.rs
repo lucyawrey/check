@@ -98,6 +98,8 @@ codes! {
     changed_in_for_ref => "[changing the list a for ref loop goes through]",
     assign_to_parameter => "[assigning to a parameter not written var]",
     change_let_collection => "[changing a let list, map or set]",
+    changes_let => "[calling a method that changes its value on a let]",
+    interface_changes_this => "[an interface method whose implementation changes this]",
     break_outside_loop => "[break or continue outside a loop]",
     return_outside_function => "[return outside a function]",
     loop_value_without_break => "[a loop used as a value with no break value]",

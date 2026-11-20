@@ -37,6 +37,8 @@ pub struct Info {
     pub aliases: HashMap<String, String>,
     /// Each type's interfaces, their parents included.
     pub implements: HashMap<String, HashSet<String>>,
+    /// Methods whose body changes `this`, so calls write it back, with where the body starts.
+    pub changes_this: HashMap<String, Span>,
 }
 
 #[derive(Clone)]
@@ -66,6 +68,7 @@ struct FuncEntry {
     sig: Sig,
     state: FuncState,
     this: Option<(Ty, bool)>,
+    changes_this: bool,
     owner: Option<String>,
     library: bool,
     /// The type parameters it's generic over, its owner's included, and their bounds.
@@ -238,6 +241,13 @@ pub struct Checker<'s> {
     impl_spans: HashMap<String, Span>,
     /// Parameter names an `implement` uses for its type's own (`U` for `T`).
     renamed: HashMap<String, String>,
+    current_method: Option<String>,
+    /// Calls on `this` to a method still being checked, as (caller, callee), settled at the end.
+    pending_changes: Vec<(String, String)>,
+    /// Set while checking a write path: whether it went into a `Shared` or `shared class`.
+    through_shared: bool,
+    /// Set while checking a write path: its variable, when that is a `var`.
+    place_root: Option<String>,
 }
 
 pub(crate) const RESERVED_NAMES: &[&str] = &["Maybe", "Some", "None", "Result", "Ok", "Err"];
@@ -283,6 +293,10 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         pending_bounds: Vec::new(),
         impl_spans: HashMap::new(),
         renamed: HashMap::new(),
+        current_method: None,
+        pending_changes: Vec::new(),
+        through_shared: false,
+        place_root: None,
     };
     checker.program(program, library);
     (checker.info, checker.diags)
@@ -367,7 +381,7 @@ impl Checker<'_> {
             self.subsume(default.id, &actual, &ty);
         }
         self.current_type = None;
-        self.check_signatures(own_methods);
+        let interface_methods = self.check_signatures(own_methods);
         for stmt in program {
             self.stmt(stmt);
         }
@@ -376,6 +390,7 @@ impl Checker<'_> {
         for name in names {
             self.ensure_checked(&name, Span::default());
         }
+        self.settle_changes(interface_methods);
         let consts: Vec<String> = self.consts.keys().cloned().collect();
         for key in consts {
             self.const_type(&key);
@@ -729,6 +744,7 @@ impl Checker<'_> {
             sig: Sig { params, ret },
             state: FuncState::Unchecked,
             this,
+            changes_this: false,
             owner: owner.map(str::to_string),
             library: self.in_library,
             bounds,
@@ -983,6 +999,10 @@ impl Checker<'_> {
         let saved_bounds = std::mem::replace(&mut self.bounds, entry.bounds.clone());
         let saved_renamed = std::mem::replace(&mut self.renamed, entry.renamed.clone());
         let saved_type = std::mem::replace(&mut self.current_type, entry.owner.clone());
+        let saved_method = std::mem::replace(
+            &mut self.current_method,
+            this.is_some().then(|| name.to_string()),
+        );
         let saved_scopes = self.scopes.split_off(1);
         let saved_loops = std::mem::take(&mut self.loops);
         let saved_lambdas = std::mem::take(&mut self.lambdas);
@@ -1026,6 +1046,7 @@ impl Checker<'_> {
         let bounds = std::mem::replace(&mut self.bounds, saved_bounds);
         self.renamed = saved_renamed;
         self.current_type = saved_type;
+        self.current_method = saved_method;
         self.scopes.truncate(1);
         self.scopes.extend(saved_scopes);
         self.loops = saved_loops;
@@ -1371,9 +1392,39 @@ impl Checker<'_> {
         own_methods
     }
 
+    /// Methods that change `this` through a call to one still being checked, and the rule that
+    /// interface methods never change it (generic calls on a `let` rely on it).
+    fn settle_changes(&mut self, interface_methods: Vec<String>) {
+        let edges = std::mem::take(&mut self.pending_changes);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (caller, callee) in &edges {
+                if self.funcs[callee].changes_this && !self.funcs[caller].changes_this {
+                    self.funcs.get_mut(caller).expect("caller").changes_this = true;
+                    changed = true;
+                }
+            }
+        }
+        for key in interface_methods {
+            if self.funcs[&key].changes_this {
+                self.error(Code::interface_changes_this, self.funcs[&key].decl.span);
+            }
+        }
+        self.info.changes_this = (self.funcs.iter())
+            .filter(|(_, f)| f.changes_this)
+            .map(|(k, f)| {
+                let at = f.decl.body.as_ref().map_or(f.decl.span, |b| b.span).start;
+                (k.clone(), Span::new(at, at))
+            })
+            .collect();
+    }
+
     /// Checks a type's own methods against the signatures its interfaces declare.
-    fn check_signatures(&mut self, own_methods: Vec<OwnMethod>) {
+    fn check_signatures(&mut self, own_methods: Vec<OwnMethod>) -> Vec<String> {
+        let mut keys = Vec::new();
         for (key, wants) in own_methods {
+            keys.push(key.clone());
             let span = self.funcs[&key].decl.span;
             let Some(sig) = self.ensure_checked(&key, span) else {
                 continue;
@@ -1394,6 +1445,7 @@ impl Checker<'_> {
                 }
             }
         }
+        keys
     }
 
     fn add_coercion(&mut self, id: NodeId, to_float: bool, wraps: usize) {
@@ -1744,32 +1796,92 @@ impl Checker<'_> {
             return (self.error(code, span), None);
         };
         if !var.mutable {
-            let code = if var.kind == VarKind::Param && name != "this" {
+            let (ty, kind) = (var.ty.clone(), var.kind);
+            // `changes_let` here only marks a write rooted at a value's `this`: `place` takes it.
+            let code = if name != "this" && kind == VarKind::Param {
                 Code::assign_to_parameter
-            } else {
+            } else if name != "this" || self.is_shared_class(&ty) {
                 Code::assign_to_let
+            } else if captured {
+                Code::assign_to_captured
+            } else {
+                Code::changes_let
             };
-            return (var.ty.clone(), Some(code));
+            return (ty, Some(code));
         }
-        var.reassigned = true;
-        if captured {
-            return (var.ty.clone(), Some(Code::assign_to_captured));
+        let ty = var.ty.clone();
+        if !captured {
+            var.list_len = None;
         }
-        var.list_len = None;
-        (var.ty.clone(), None)
+        self.place_root = Some(name.to_string());
+        (ty, captured.then_some(Code::assign_to_captured))
     }
 
     fn place(&mut self, target: &Expr) -> (Ty, Option<Code>) {
+        let saved = (
+            std::mem::take(&mut self.through_shared),
+            self.place_root.take(),
+        );
+        let (ty, mut err) = self.place_path(target);
+        let through = std::mem::replace(&mut self.through_shared, saved.0);
+        let root = std::mem::replace(&mut self.place_root, saved.1);
+        if err == Some(Code::changes_let) {
+            err = None;
+            if let Some(f) = self
+                .current_method
+                .as_ref()
+                .and_then(|k| self.funcs.get_mut(k))
+            {
+                f.changes_this = true;
+            }
+        }
+        // A change through a `Shared` or `shared class` leaves the variable itself as it was.
+        if !through && let Some(var) = root.and_then(|n| self.lookup_mut(&n)) {
+            var.reassigned = true;
+        }
+        (ty, err)
+    }
+
+    fn changing_method(&mut self, ty: &Ty, name: &str) -> bool {
+        let ty = self.subst.shallow(ty);
+        let Some(tag) = self.tag(&ty) else {
+            return false;
+        };
+        let key = self.method_key(&tag, name, &ty);
+        self.funcs.get(&key).is_some_and(|f| f.this.is_some())
+            && self.ensure_checked(&key, Span::default()).is_some()
+            && self.funcs[&key].changes_this
+    }
+
+    /// A receiver its call changes, already checked as an expression, must be a place.
+    fn changed_receiver(&mut self, recv: &Expr, code: Code) {
+        let before = self.diags.len();
+        let (_, err) = self.place(recv);
+        self.diags.truncate(before);
+        if let Some(err) = err {
+            let code = match err {
+                Code::readonly_field | Code::assign_to_captured => err,
+                _ => code,
+            };
+            self.error(code, recv.span);
+        }
+    }
+
+    fn place_path(&mut self, target: &Expr) -> (Ty, Option<Code>) {
         match &target.kind {
             ExprKind::Name(name) => self.place_name(name, target.span),
             ExprKind::This => self.place_name("this", target.span),
             ExprKind::Field(base, name) if self.type_ref(base).is_none() => {
-                let (bt, base_err) = self.place(base);
+                let (bt, base_err) = self.place_path(base);
                 let (bt, base_err) = match self.subst.shallow(&bt) {
                     Ty::Named(n, mut a) if n == SHARED && name == "value" => {
+                        self.through_shared = true;
                         return (a.remove(0), None);
                     }
-                    Ty::Named(n, mut a) if n == SHARED => (a.remove(0), None),
+                    Ty::Named(n, mut a) if n == SHARED => {
+                        self.through_shared = true;
+                        (a.remove(0), None)
+                    }
                     bt => (bt, base_err),
                 };
                 match self.subst.shallow(&bt) {
@@ -1794,6 +1906,7 @@ impl Checker<'_> {
                                 } else if f.readonly && !self.inside(&class) {
                                     Some(Code::readonly_field)
                                 } else if is_shared {
+                                    self.through_shared = true;
                                     None
                                 } else {
                                     base_err
@@ -1813,9 +1926,12 @@ impl Checker<'_> {
                 }
             }
             ExprKind::Index(list, index) => {
-                let (lt, base_err) = self.place(list);
+                let (lt, base_err) = self.place_path(list);
                 let (lt, base_err) = match self.subst.shallow(&lt) {
-                    Ty::Named(n, mut a) if n == SHARED => (a.remove(0), None),
+                    Ty::Named(n, mut a) if n == SHARED => {
+                        self.through_shared = true;
+                        (a.remove(0), None)
+                    }
                     lt => (lt, base_err),
                 };
                 let (key, value) = match self.subst.shallow(&lt) {
@@ -3231,22 +3347,25 @@ impl Checker<'_> {
             return self.unknown_method(args, span);
         }
         let recv_ty = if MUTATING.contains(&name) {
-            let (t, err) = self.place(recv);
-            if let Some(code) = err
-                && self.is_collection(&t)
-            {
-                let code = if matches!(code, Code::readonly_field | Code::assign_to_captured) {
-                    code
-                } else {
-                    Code::change_let_collection
-                };
-                self.error(code, recv.span);
+            // Typed as a write path (`grid[i]` is a list, not a maybe), but only a collection's
+            // method changes it.
+            let (t, _) = self.place_path(recv);
+            (self.through_shared, self.place_root) = (false, None);
+            if self.is_collection(&t) {
+                self.changed_receiver(recv, Code::change_let_collection);
             }
             t
         } else {
             self.expr(recv, None)
         };
-        let recv_ty = self.unref(&recv_ty);
+        let boxed = matches!(self.subst.shallow(&recv_ty), Ty::Named(n, _) if n == SHARED);
+        let mut recv_ty = self.unref(&recv_ty);
+        // A method that changes an element is a write through the index, as `xs[i].n = 1` is.
+        if let (ExprKind::Index(..), Ty::Maybe(inner)) = (&recv.kind, self.subst.shallow(&recv_ty))
+            && self.changing_method(&inner, name)
+        {
+            recv_ty = self.subst.shallow(&inner);
+        }
         if self.is_interface(&recv_ty) || matches!(recv_ty, Ty::Param(_)) {
             let Some(sig) = self.interface_method(&recv_ty, name) else {
                 return self.unknown_method(args, span);
@@ -3262,7 +3381,19 @@ impl Checker<'_> {
             if self.funcs.get(&key).is_some_and(|f| f.this.is_some()) {
                 self.check_private_method(&key, &tag, span);
                 self.info.resolved.insert(id, Resolved::Method(key.clone()));
-                return self.call_entry(&key, Some(&recv_ty), args, span);
+                let ret = self.call_entry(&key, Some(&recv_ty), args, span);
+                let f = &self.funcs[&key];
+                if f.changes_this {
+                    if !boxed {
+                        self.changed_receiver(recv, Code::changes_let);
+                    }
+                } else if f.state == FuncState::InProgress
+                    && let Some(caller) = &self.current_method
+                    && ref_path(recv).is_some_and(|(root, _)| root == "this")
+                {
+                    self.pending_changes.push((caller.clone(), key));
+                }
+                return ret;
             }
         }
         match recv_ty {

@@ -577,8 +577,7 @@ fn a_variant_without_its_enum_needs_a_known_type() {
 
 #[test]
 fn printing_a_shared_class_that_reaches_itself_stops() {
-    let src =
-        "shared class Node {\n  var next: Node? = None\n}\nlet a = Node()\na.next = Some(a)\nprint(a)";
+    let src = "shared class Node {\n  var next: Node? = None\n}\nlet a = Node()\na.next = Some(a)\nprint(a)";
     assert_eq!(output(src), "Node(next = Some(...))");
 }
 
@@ -1980,7 +1979,9 @@ print(same(\"a\", \"b\"))";
         "invalid_operand_types"
     );
     assert_eq!(
-        first_error("shared class P { let x: Int }\nfunc f<T: Eq>(a: T) -> Bool { a == a }\nf(P(1))"),
+        first_error(
+            "shared class P { let x: Int }\nfunc f<T: Eq>(a: T) -> Bool { a == a }\nf(P(1))"
+        ),
         "unmet_constraint"
     );
 }
@@ -2514,7 +2515,10 @@ fn same_tells_one_ref_from_two_equal_ones() {
 
 #[test]
 fn a_ref_prints_inside_a_list() {
-    assert_eq!(output("let xs = [Shared(1)]\nprint(\"{xs}\")"), "[Shared(1)]");
+    assert_eq!(
+        output("let xs = [Shared(1)]\nprint(\"{xs}\")"),
+        "[Shared(1)]"
+    );
 }
 
 #[test]
@@ -2671,6 +2675,124 @@ fn a_function_with_ref_parameters_cant_be_a_value() {
     assert_eq!(
         first_error(&format!("{SET_NINE}let f = setNine")),
         "ref_func_as_value"
+    );
+}
+
+const COUNTER_VALUE: &str = "class Counter {
+  var n: Int = 0
+  func bump() { this.n += 1 }
+  func twice() { this.bump(); this.bump() }
+  func doubled() -> Int { this.n * 2 }
+}
+";
+
+#[test]
+fn a_method_that_changes_this_writes_back_to_its_receiver() {
+    let src = format!(
+        "{COUNTER_VALUE}class Game(var counters: Counter[])\nvar c = Counter()\nc.twice()\n\
+        var g = Game([Counter(), Counter()])\ng.counters[1].bump()\n\
+        for ref each in g.counters {{ each.bump() }}\n\
+        let box = Shared(Counter())\nbox.bump()\nbox.value.bump()\n\
+        print(\"{{c.n}} {{g.counters}} {{box.n}}\")"
+    );
+    assert_eq!(output(&src), "2 [Counter(n = 1), Counter(n = 2)] 2");
+}
+
+#[test]
+fn a_method_that_changes_this_needs_a_place() {
+    for call in [
+        "let k = Counter()\nk.bump()",
+        "Counter().bump()",
+        "func f(k: Counter) { k.twice() }",
+    ] {
+        assert_eq!(
+            first_error(&format!("{COUNTER_VALUE}{call}")),
+            "changes_let",
+            "{call}"
+        );
+    }
+    assert_eq!(
+        output(&format!(
+            "{COUNTER_VALUE}let k = Counter()\nprint(k.doubled())"
+        )),
+        "0"
+    );
+}
+
+#[test]
+fn methods_are_inferred_to_change_this_through_calls_and_recursion() {
+    let src = "class Walk {
+  var steps: Int[] = []
+  func step(n: Int) -> Void { if n > 0 { this.steps.push(n); this.next(n - 1) } }
+  func next(n: Int) -> Void { this.step(n) }
+  func start() { this.next(2) }
+}
+var w = Walk()
+w.start()
+print(w.steps)
+let k = Walk()
+";
+    assert_eq!(output(src), "[2, 1]");
+    for call in ["k.start()", "k.next(1)", "k.step(1)"] {
+        assert_eq!(
+            first_error(&format!("{src}{call}")),
+            "changes_let",
+            "{call}"
+        );
+    }
+}
+
+#[test]
+fn a_change_to_this_survives_an_early_return() {
+    let src = "class C {\n  var n: Int = 0\n  func bump() {\n    this.n = 5\n    if this.n > 0 { return }\n    this.n = 9\n  }\n}\nvar c = C()\nc.bump()\nprint(c.n)";
+    assert_eq!(output(src), "5");
+}
+
+#[test]
+fn writes_through_a_shared_dont_change_this() {
+    let src = "shared class Owner(var hits: Int)\nclass Tool {
+  let owner: Owner
+  func apply() { this.box.value += 1; this.owner.hits += 1 }
+  let box: Shared<Int>
+}
+let t = Tool(Owner(0), Shared(0))
+t.apply()
+print(\"{t.box} {t.owner.hits}\")";
+    assert_eq!(output(src), "Shared(1) 1");
+}
+
+#[test]
+fn a_receiver_overlapping_a_ref_argument_is_an_error() {
+    let src = "class C {\n  var n: Int = 0\n  func add(ref x: Int) { this.n += x }\n}\nvar c = C()\nc.add(ref c.n)";
+    assert_eq!(first_error(src), "overlapping_ref");
+}
+
+#[test]
+fn interface_methods_never_change_this() {
+    let src = "interface Ticks { func tick() }\nclass V: Ticks {\n  var n: Int = 0\n  func tick() { this.n += 1 }\n}";
+    assert_eq!(first_error(src), "interface_changes_this");
+    let shared = "interface Ticks { func tick() }\nshared class S: Ticks {\n  var n: Int = 0\n  func tick() { this.n += 1 }\n}\nlet s = S()\ns.tick()\nprint(s.n)";
+    assert_eq!(output(shared), "1");
+}
+
+#[test]
+fn a_lambda_in_a_method_cant_change_this() {
+    let src = "class C {\n  var n: Int = 0\n  func later() -> func() { func() { this.n += 1 } }\n}";
+    assert_eq!(first_error(src), "assign_to_captured");
+}
+
+#[test]
+fn a_change_through_a_shared_isnt_a_reassignment() {
+    for src in [
+        "var b = Shared(2)\nb.value += 1",
+        "var c = Shared([1])\nc.push(2)",
+        "shared class P(var n: Int)\nvar p = P(1)\np.n += 1",
+    ] {
+        assert_eq!(warnings(src), ["unused_var"], "{src}");
+    }
+    assert_eq!(
+        warnings("var d = Shared(2)\nd = Shared(3)"),
+        Vec::<String>::new()
     );
 }
 

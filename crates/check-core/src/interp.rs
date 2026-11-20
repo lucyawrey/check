@@ -1389,6 +1389,33 @@ impl Interpreter<'_> {
         let (values, places) = self.bind_args(&decl.params, args)?;
         let names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
         let (result, kept) = self.run_decl(decl, values, this, span, &names)?;
+        self.write_back(places, kept)?;
+        Ok(result)
+    }
+
+    /// Calls a method that changes `this`, writing it back to the receiver like a `ref` argument.
+    fn call_changing(
+        &mut self,
+        decl: &Rc<FuncDecl>,
+        args: &[Arg],
+        span: Span,
+        this: Value,
+        (mut root, steps): Place,
+    ) -> Eval {
+        let (values, places) = self.bind_args(&decl.params, args)?;
+        let mut names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+        names.push("this".to_string());
+        let (result, mut kept) = self.run_decl(decl, values, Some(this), span, &names)?;
+        let this = kept.pop().expect("this is kept last");
+        self.write_back(places, kept)?;
+        self.write_steps(&mut root, &steps, &mut |slot| {
+            through_ref(slot, |slot| *slot = this.clone());
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    fn write_back(&mut self, places: Vec<Option<Place>>, kept: Vec<Value>) -> Result<(), Flow> {
         for (place, value) in places.into_iter().zip(kept) {
             if let Some((mut root, steps)) = place {
                 self.write_steps(&mut root, &steps, &mut |slot| {
@@ -1397,7 +1424,7 @@ impl Interpreter<'_> {
                 })?;
             }
         }
-        Ok(result)
+        Ok(())
     }
 
     fn run_decl(
@@ -1543,9 +1570,15 @@ impl Interpreter<'_> {
         let info = self.info;
         match info.resolved.get(&id) {
             Some(Resolved::Method(key)) => {
-                let this = deref(self.expr(recv)?);
                 let decl = self.funcs[key].clone();
-                return self.call_named(&decl, args, span, Some(this));
+                if !info.changes_this.contains_key(key) {
+                    let this = deref(self.expr(recv)?);
+                    return self.call_named(&decl, args, span, Some(this));
+                }
+                let mut steps = Vec::new();
+                let mut root = self.path(recv, &mut steps)?;
+                let this = deref(self.read_steps(&mut root, &steps)?);
+                return self.call_changing(&decl, args, span, this, (root, steps));
             }
             Some(Resolved::Dynamic(name)) => {
                 let this = deref(self.expr(recv)?);

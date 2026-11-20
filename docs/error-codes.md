@@ -60,6 +60,7 @@
 - `changed_in_for_ref` changing the list a `for ref` loop goes through, inside the loop
 - `assign_to_parameter` assigning to a parameter not written `var`
 - `change_let_collection` changing a `let` list, map or set (`push`, `pop`, `removeAt`, `add`, `remove`)
+- `changes_let` calling a method that changes its value on a `let`, a parameter or a temporary (`k.bump()`)
 - `invalid_key_type` a map key or set item whose type has no exact equality (`Float`, a function, a collection, a `shared class` or anything holding one)
 - `break_outside_loop` `break` or `continue` outside a loop
 - `return_outside_function` `return` outside a function
@@ -95,6 +96,7 @@
 - `unmet_constraint` a type argument that doesn't implement the interfaces its parameter needs (`<T: Shape>`)
 - `missing_implementation` a type missing a method or field an interface it implements requires
 - `wrong_implementation` a method whose parameter or return types don't match its interface's
+- `interface_changes_this` a value type's implementation of an interface method that changes `this` (use a `shared class`)
 - `conflicting_defaults` two interfaces with defaults for the same method, which the type doesn't override
 - `field_requirement_needs_class` an interface that requires fields, implemented by an enum or built-in type
 - `implement_for_specific_arguments` an interface implemented for some of a generic type's arguments (`implement Shape for Box<Int>`), since they're erased at run time
