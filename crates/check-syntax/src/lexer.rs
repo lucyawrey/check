@@ -333,6 +333,8 @@ impl Lexer<'_> {
         } else {
             match text.parse() {
                 Ok(n) => Tok::Int(n),
+                // `Int.MIN`'s digits only fit after a minus, so the parser takes `i64::MIN` to mean them.
+                Err(_) if text == "9223372036854775808" => Tok::Int(i64::MIN),
                 Err(_) => {
                     self.error(Code::literal_too_big, start);
                     Tok::Int(0)

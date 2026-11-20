@@ -28,13 +28,55 @@ pub struct Record {
     pub fields: Vec<Value>,
 }
 
+impl Drop for Record {
+    /// Drops nested values with a loop, since dropping a long chain (a list built from enum
+    /// variants) one level per call would overflow the stack.
+    fn drop(&mut self) {
+        let mut pending = std::mem::take(&mut self.fields);
+        while let Some(v) = pending.pop() {
+            match v {
+                Value::Object(r) | Value::Variant(r) | Value::Record(r) => {
+                    if let Ok(mut r) = Rc::try_unwrap(r) {
+                        pending.append(&mut r.fields);
+                    }
+                }
+                Value::Shared(r) => {
+                    if let Ok(r) = Rc::try_unwrap(r) {
+                        pending.append(&mut r.into_inner().fields);
+                    }
+                }
+                Value::List(items) | Value::Set(items) => {
+                    if let Ok(items) = Rc::try_unwrap(items) {
+                        pending.extend(items);
+                    }
+                }
+                Value::Map(entries) => {
+                    if let Ok(entries) = Rc::try_unwrap(entries) {
+                        pending.extend(entries.into_iter().flat_map(|(k, v)| [k, v]));
+                    }
+                }
+                Value::Some(inner) => {
+                    if let Ok(inner) = Rc::try_unwrap(inner) {
+                        pending.push(inner);
+                    }
+                }
+                Value::Ref(inner) => {
+                    if let Ok(inner) = Rc::try_unwrap(inner) {
+                        pending.push(inner.into_inner());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 impl Record {
-    pub fn index(&self, field: &str) -> usize {
+    pub fn index(&self, field: &str) -> Option<usize> {
         match &self.field_names {
             Some(names) => names.iter().position(|n| &**n == field),
             None => field.parse().ok(),
         }
-        .unwrap_or(0)
     }
 
     fn code(&self, always_parens: bool) -> String {
@@ -105,6 +147,12 @@ pub enum Value {
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
+        crate::interp::grow(|| self.eq_inner(other))
+    }
+}
+
+impl Value {
+    fn eq_inner(&self, other: &Self) -> bool {
         match (self, other) {
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
@@ -188,6 +236,10 @@ impl Value {
     }
 
     pub fn code(&self) -> String {
+        crate::interp::grow(|| self.code_inner())
+    }
+
+    fn code_inner(&self) -> String {
         match self {
             Value::Int(n) => n.to_string(),
             Value::Float(f) => float_text(*f),

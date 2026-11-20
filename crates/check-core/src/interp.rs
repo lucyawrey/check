@@ -30,7 +30,7 @@ type Eval = Result<Value, Flow>;
 
 type ArgValue = (Option<Rc<str>>, Value, Option<Place>);
 
-type Place = (String, Vec<Step>);
+type Place = (Root, Vec<Step>);
 
 type Bound = (Vec<Value>, Vec<Option<Place>>);
 
@@ -41,6 +41,13 @@ type Descent<'s> = Result<Option<(Holder, &'s [Step])>, Flow>;
 enum Holder {
     Record(Rc<RefCell<Record>>),
     Value(Rc<RefCell<Value>>),
+}
+
+/// Where a write path starts: a variable, or a value computed once, such as a call's result,
+/// which a write can only change through something shared in it.
+enum Root {
+    Var(String),
+    Value(Value),
 }
 
 enum Step {
@@ -66,11 +73,16 @@ pub struct Interpreter<'a> {
     depth: usize,
     /// The `ref class` objects being printed, by address, to stop at a cycle.
     printing: Vec<usize>,
+    /// Steps left before evaluation stops with `out_of_steps`; `None` is no limit.
+    budget: Option<u64>,
     input: &'a mut dyn BufRead,
     output: &'a mut dyn Write,
 }
 
 const MAX_DEPTH: usize = 10_000;
+
+/// The step budget for consts and data values, so loading data can't hang a host.
+const DATA_BUDGET: u64 = 10_000_000;
 
 pub fn run(
     program: &[Stmt],
@@ -79,7 +91,13 @@ pub fn run(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
 ) -> Result<Option<(Span, Option<String>)>, Panic> {
-    let mut interp = start(program, library, info, input, output)?;
+    let mut interp = match start(program, library, info, input, output) {
+        Ok(interp) => interp,
+        Err(Flow::Stop(span, err)) => return Ok(Some((span, err))),
+        Err(Flow::Panic(p)) => return Err(p),
+        Err(_) => unreachable!("start returns only stops and panics"),
+    };
+    interp.budget = None;
     for stmt in program {
         match interp.stmt(stmt) {
             Ok(_) => {}
@@ -99,7 +117,19 @@ pub fn eval_data(
     id: NodeId,
 ) -> Result<Value, Panic> {
     let (mut input, mut output) = (std::io::empty(), std::io::sink());
-    let mut interp = start(program, library, info, &mut input, &mut output)?;
+    let mut interp = match start(program, library, info, &mut input, &mut output) {
+        Ok(interp) => interp,
+        Err(Flow::Stop(span, reason)) => {
+            return Err(Panic {
+                code: Code::data_try_failed,
+                span,
+                reason,
+                stack: Vec::new(),
+            });
+        }
+        Err(Flow::Panic(p)) => return Err(p),
+        Err(_) => unreachable!("start returns only stops and panics"),
+    };
     let name = program.iter().find_map(|s| match s {
         Stmt::Data(d) if d.value.id == id => Some(&d.name),
         _ => None,
@@ -114,7 +144,7 @@ fn start<'a>(
     info: &'a Info,
     input: &'a mut dyn BufRead,
     output: &'a mut dyn Write,
-) -> Result<Interpreter<'a>, Panic> {
+) -> Result<Interpreter<'a>, Flow> {
     let mut interp = Interpreter {
         info,
         funcs: HashMap::new(),
@@ -127,6 +157,7 @@ fn start<'a>(
         frames: vec![Frame { scopes: Vec::new() }],
         depth: 0,
         printing: Vec::new(),
+        budget: Some(DATA_BUDGET),
         input,
         output,
     };
@@ -170,11 +201,23 @@ fn start<'a>(
     consts.retain(|k| !data.contains(k));
     consts.sort();
     for key in consts.into_iter().chain(data) {
-        if let Err(Flow::Panic(p)) = interp.resolved(&Resolved::Const(key), &[], Span::default()) {
-            return Err(p);
+        if let Err(e @ (Flow::Panic(_) | Flow::Stop(..))) =
+            interp.resolved(&Resolved::Const(key), &[], Span::default())
+        {
+            return Err(e);
         }
     }
     Ok(interp)
+}
+
+/// A case the checker should have ruled out, returned as an error rather than a wrong value.
+pub(crate) fn internal<T>(what: &str, span: Span) -> Result<T, Flow> {
+    Err(Flow::Panic(Panic {
+        code: Code::internal_error,
+        span,
+        reason: Some(what.to_string()),
+        stack: Vec::new(),
+    }))
 }
 
 pub(crate) fn panic<T>(code: Code, span: Span) -> Result<T, Flow> {
@@ -270,6 +313,12 @@ fn loop_end(result: Eval, wraps: bool) -> Result<Option<Value>, Flow> {
     }
 }
 
+/// Runs `f` with room on the stack, growing it if needed, so deep programs and values reach the
+/// call limit instead of overflowing the host thread's stack.
+pub(crate) fn grow<R>(f: impl FnOnce() -> R) -> R {
+    stacker::maybe_grow(256 * 1024, 4 * 1024 * 1024, f)
+}
+
 fn through_ref<R>(slot: &mut Value, f: impl FnOnce(&mut Value) -> R) -> R {
     match slot {
         Value::Ref(v) => f(&mut v.borrow_mut()),
@@ -284,11 +333,28 @@ fn deref(v: Value) -> Value {
     }
 }
 
+fn field(v: &Value, name: &str, span: Span) -> Eval {
+    let found = match v {
+        Value::Object(r) | Value::Record(r) => r.index(name).map(|i| r.fields[i].clone()),
+        Value::Shared(r) => {
+            let r = r.borrow();
+            r.index(name).map(|i| r.fields[i].clone())
+        }
+        _ => None,
+    };
+    match found {
+        Some(v) => Ok(v),
+        None => internal(&format!("no field `{name}`"), span),
+    }
+}
+
 fn descend_record<'s>(r: &mut Record, steps: &'s [Step], f: Writer) -> Descent<'s> {
     let Some((Step::Field(name), rest)) = steps.split_first() else {
         return Ok(None);
     };
-    let i = r.index(name);
+    let Some(i) = r.index(name) else {
+        return internal(&format!("no field `{name}` to write"), Span::default());
+    };
     descend(&mut r.fields[i], rest, f)
 }
 
@@ -313,7 +379,7 @@ impl Interpreter<'_> {
         result
     }
 
-    fn path(&mut self, e: &Expr, steps: &mut Vec<Step>) -> Result<String, Flow> {
+    fn path(&mut self, e: &Expr, steps: &mut Vec<Step>) -> Result<Root, Flow> {
         match &e.kind {
             ExprKind::Field(base, name) => {
                 let root = self.path(base, steps)?;
@@ -326,20 +392,21 @@ impl Interpreter<'_> {
                 steps.push(Step::Index(key, e.span));
                 Ok(root)
             }
-            ExprKind::Name(name) => Ok(name.clone()),
-            _ => Ok("this".to_string()),
+            ExprKind::Name(name) => Ok(Root::Var(name.clone())),
+            ExprKind::This => Ok(Root::Var("this".to_string())),
+            _ => Ok(Root::Value(self.expr(e)?)),
         }
     }
 
-    fn write_path(&mut self, target: &Expr, f: Writer) -> Result<(), Flow> {
-        let mut steps = Vec::new();
-        let root = self.path(target, &mut steps)?;
-        self.write_steps(&root, &steps, f)
-    }
-
-    fn write_steps(&mut self, root: &str, steps: &[Step], f: Writer) -> Result<(), Flow> {
-        let Some(slot) = self.slot(root) else {
-            return Ok(());
+    fn write_steps(&mut self, root: &mut Root, steps: &[Step], f: Writer) -> Result<(), Flow> {
+        let slot = match root {
+            Root::Var(name) => match self.slot(name) {
+                Some(slot) => slot,
+                None => {
+                    return internal(&format!("no variable `{name}` to write"), Span::default());
+                }
+            },
+            Root::Value(v) => v,
         };
         let mut next = descend(slot, steps, f)?;
         while let Some((holder, rest)) = next {
@@ -351,7 +418,7 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    fn read_steps(&mut self, root: &str, steps: &[Step]) -> Eval {
+    fn read_steps(&mut self, root: &mut Root, steps: &[Step]) -> Eval {
         let mut out = Value::Void;
         self.write_steps(root, steps, &mut |v| {
             out = v.clone();
@@ -371,8 +438,9 @@ impl Interpreter<'_> {
                     return panic(Code::const_cycle, span);
                 }
                 let value = self.consts[key].value.clone();
-                let v = self.expr(&value)?;
+                let v = self.expr(&value);
                 self.building.remove(key);
+                let v = v?;
                 self.const_values.insert(key.clone(), v.clone());
                 Ok(v)
             }
@@ -438,6 +506,10 @@ impl Interpreter<'_> {
 
     /// How `print` and interpolation show a value, through `toString()` where it's `Printable`.
     fn text(&mut self, v: &Value, quoted: bool, span: Span) -> Result<String, Flow> {
+        grow(|| self.text_inner(v, quoted, span))
+    }
+
+    fn text_inner(&mut self, v: &Value, quoted: bool, span: Span) -> Result<String, Flow> {
         if self.implements(&v.tag(), PRINTABLE) {
             let decl = self.find_method(v, "toString");
             return Ok(self
@@ -518,7 +590,13 @@ impl Interpreter<'_> {
         };
         for change in changes {
             let value = self.expr(&change.value)?;
-            let i = record.index(change.name.as_deref().unwrap_or_default());
+            let name = change.name.as_deref().unwrap_or_default();
+            let Some(i) = record.index(name) else {
+                return internal(
+                    &format!("no field `{name}` to copy with"),
+                    change.value.span,
+                );
+            };
             record.fields[i] = value;
         }
         let class = self.classes.get(&*record.name).cloned();
@@ -671,6 +749,16 @@ impl Interpreter<'_> {
         Ok(true)
     }
 
+    fn spend(&mut self, steps: u64, span: Span) -> Result<(), Flow> {
+        if let Some(left) = &mut self.budget {
+            if *left < steps {
+                return panic(Code::out_of_steps, span);
+            }
+            *left -= steps;
+        }
+        Ok(())
+    }
+
     fn frame(&mut self) -> &mut Frame {
         self.frames.last_mut().expect("frame")
     }
@@ -730,15 +818,15 @@ impl Interpreter<'_> {
                 value,
                 span,
             } => {
-                let rhs = self.scoped(|i| i.expr(value))?;
                 let info = self.info;
                 let mut steps = Vec::new();
-                let root = self.path(target, &mut steps)?;
+                let mut root = self.path(target, &mut steps)?;
+                let rhs = self.scoped(|i| i.expr(value))?;
                 // `m[k] = v` can add a key, so it writes to the map rather than the entry.
                 if op.is_none()
                     && let Some((last @ Step::Index(key, _), init)) = steps.split_last()
                 {
-                    self.write_steps(&root, init, &mut |slot| {
+                    self.write_steps(&mut root, init, &mut |slot| {
                         through_ref(slot, |slot| match slot {
                             Value::Map(entries) => {
                                 map_insert(Rc::make_mut(entries), key.clone(), rhs.clone());
@@ -753,7 +841,7 @@ impl Interpreter<'_> {
                     })?;
                     return Ok(Value::Void);
                 }
-                self.write_steps(&root, &steps, &mut |slot| {
+                self.write_steps(&mut root, &steps, &mut |slot| {
                     *slot = match op {
                         None => rhs.clone(),
                         Some(op) => {
@@ -811,7 +899,7 @@ impl Interpreter<'_> {
     }
 
     fn expr(&mut self, expr: &Expr) -> Eval {
-        let value = self.raw(expr)?;
+        let value = grow(|| self.raw(expr))?;
         Ok(self.coerce(expr.id, value))
     }
 
@@ -843,31 +931,27 @@ impl Interpreter<'_> {
                 }
                 Ok(Value::Str(out.into()))
             }
-            ExprKind::Name(name) => Ok(self.lookup(name).unwrap_or(Value::Void)),
-            ExprKind::This => Ok(self.lookup("this").unwrap_or(Value::Void)),
-            ExprKind::Field(base, name) => Ok(match self.expr(base)? {
-                Value::Ref(v) if name == "value" => v.borrow().clone(),
-                Value::Ref(v) => match &*v.borrow() {
-                    Value::Object(r) | Value::Record(r) => r.fields[r.index(name)].clone(),
-                    Value::Shared(r) => {
-                        let r = r.borrow();
-                        r.fields[r.index(name)].clone()
-                    }
-                    _ => Value::Void,
-                },
-                Value::Object(r) | Value::Record(r) => r.fields[r.index(name)].clone(),
-                Value::Shared(r) => {
-                    let r = r.borrow();
-                    r.fields[r.index(name)].clone()
-                }
-                _ => Value::Void,
-            }),
+            ExprKind::Name(name) => match self.lookup(name) {
+                Some(v) => Ok(v),
+                None => internal(&format!("no variable `{name}`"), expr.span),
+            },
+            ExprKind::This => match self.lookup("this") {
+                Some(v) => Ok(v),
+                None => internal("no `this`", expr.span),
+            },
+            ExprKind::Field(base, name) => match self.expr(base)? {
+                Value::Ref(v) if name == "value" => Ok(v.borrow().clone()),
+                Value::Ref(v) => field(&v.borrow(), name, expr.span),
+                v => field(&v, name, expr.span),
+            },
             ExprKind::Is(lhs, pattern) => {
                 let v = self.expr(lhs)?;
                 let mut binds = Vec::new();
                 let matched = self.matches(pattern, &v, &mut binds)?;
-                for (name, v) in binds {
-                    self.define(&name, v);
+                if matched {
+                    for (name, v) in binds {
+                        self.define(&name, v);
+                    }
                 }
                 Ok(Value::Bool(matched))
             }
@@ -952,6 +1036,7 @@ impl Interpreter<'_> {
             ExprKind::Index(list, index) => {
                 let l = deref(self.expr(list)?);
                 let i = self.expr(index)?;
+                let is_map = matches!(l, Value::Map(_));
                 let found = match (l, i) {
                     (Value::List(items), Value::Int(i)) => {
                         usize::try_from(i).ok().and_then(|i| items.get(i).cloned())
@@ -959,11 +1044,15 @@ impl Interpreter<'_> {
                     (Value::Map(entries), key) => map_get(&entries, &key).cloned(),
                     _ => None,
                 };
-                Ok(match found {
-                    Some(v) if self.info.unwrapped_index.contains(&expr.id) => v,
-                    Some(v) => Value::Some(Rc::new(v)),
-                    None => Value::None,
-                })
+                let unwrapped = self.info.unwrapped_index.contains(&expr.id);
+                match found {
+                    Some(v) if unwrapped => Ok(v),
+                    Some(v) => Ok(Value::Some(Rc::new(v))),
+                    // Narrowing can miss a function that changes the collection.
+                    None if unwrapped && is_map => panic(Code::missing_key, expr.span),
+                    None if unwrapped => panic(Code::index_out_of_range, expr.span),
+                    None => Ok(Value::None),
+                }
             }
             ExprKind::Lambda(params, _, body) => {
                 let mut captured = self.globals.clone();
@@ -1013,6 +1102,7 @@ impl Interpreter<'_> {
             ExprKind::While(cond, body) => {
                 let wraps = self.info.wrapping.contains(&expr.id);
                 loop {
+                    self.spend(1, expr.span)?;
                     self.frame().scopes.push(HashMap::new());
                     let step = match self.expr(cond) {
                         Ok(c) if c.truthy() => Some(self.expr(body)),
@@ -1038,6 +1128,7 @@ impl Interpreter<'_> {
                 Ok(if wraps { Value::None } else { Value::Void })
             }
             ExprKind::Loop(body) => loop {
+                self.spend(1, expr.span)?;
                 match self.expr(body) {
                     Ok(_) | Err(Flow::Continue) => {}
                     Err(Flow::Break(v)) => return Ok(v),
@@ -1050,10 +1141,11 @@ impl Interpreter<'_> {
                     return Ok(Value::Void);
                 };
                 let mut steps = Vec::new();
-                let root = self.path(iter, &mut steps)?;
+                let mut root = self.path(iter, &mut steps)?;
                 let mut i = 0;
                 loop {
-                    let item = match deref(self.read_steps(&root, &steps)?) {
+                    self.spend(1, expr.span)?;
+                    let item = match deref(self.read_steps(&mut root, &steps)?) {
                         Value::List(items) => items.get(i).cloned(),
                         _ => None,
                     };
@@ -1070,7 +1162,7 @@ impl Interpreter<'_> {
                     }
                     let item = scope.remove(name).unwrap_or(Value::Void);
                     let mut gone = true;
-                    self.write_steps(&root, &steps, &mut |list| {
+                    self.write_steps(&mut root, &steps, &mut |list| {
                         through_ref(list, |list| {
                             if let Value::List(items) = list
                                 && let Some(slot) = Rc::make_mut(items).get_mut(i)
@@ -1104,6 +1196,7 @@ impl Interpreter<'_> {
                     _ => Box::new(std::iter::empty()),
                 };
                 for item in items {
+                    self.spend(1, expr.span)?;
                     let mut binds = Vec::new();
                     self.matches(pattern, &item, &mut binds)?;
                     self.frame().scopes.push(binds.into_iter().collect());
@@ -1176,8 +1269,8 @@ impl Interpreter<'_> {
             let name = arg.name.as_deref().map(Rc::from);
             if arg.is_ref {
                 let mut steps = Vec::new();
-                let root = self.path(&arg.value, &mut steps)?;
-                let value = self.read_steps(&root, &steps)?;
+                let mut root = self.path(&arg.value, &mut steps)?;
+                let value = self.read_steps(&mut root, &steps)?;
                 out.push((name, value, Some((root, steps))));
                 continue;
             }
@@ -1261,8 +1354,8 @@ impl Interpreter<'_> {
         let names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
         let (result, kept) = self.run_decl(decl, values, this, span, &names)?;
         for (place, value) in places.into_iter().zip(kept) {
-            if let Some((root, steps)) = place {
-                self.write_steps(&root, &steps, &mut |slot| {
+            if let Some((mut root, steps)) = place {
+                self.write_steps(&mut root, &steps, &mut |slot| {
                     *slot = value.clone();
                     Ok(())
                 })?;
@@ -1338,7 +1431,13 @@ impl Interpreter<'_> {
                 match slots[i].take() {
                     Some(v) => v,
                     None => match &p.default {
-                        Some(d) => self.expr(d)?,
+                        Some(d) => {
+                            // A default sees the names where it's declared, not the caller's locals.
+                            self.frames.push(Frame { scopes: Vec::new() });
+                            let v = self.expr(d);
+                            self.frames.pop();
+                            v?
+                        }
                         None => Value::Void,
                     },
                 }
@@ -1350,7 +1449,7 @@ impl Interpreter<'_> {
 
     fn call_value(&mut self, f: &Value, values: Vec<Value>, span: Span) -> Eval {
         let Value::Func(callable) = f else {
-            return Ok(Value::Void);
+            return internal("calling a value that isn't a function", span);
         };
         match &**callable {
             Callable::Named(decl, _) => Ok(self.run_decl(decl, values, None, span, &[])?.0),
@@ -1381,6 +1480,7 @@ impl Interpreter<'_> {
         if self.depth >= MAX_DEPTH {
             return panic(Code::stack_overflow, span);
         }
+        self.spend(1, span)?;
         self.depth += 1;
         self.frames.push(Frame { scopes });
         let result = self.expr(body);
@@ -1416,14 +1516,12 @@ impl Interpreter<'_> {
             Some(r) => return self.resolved(r, args, span),
             None => {}
         }
-        let is_place = matches!(
-            recv.kind,
-            ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::This
-        );
-        if is_place && matches!(name, "push" | "pop" | "removeAt" | "add" | "remove") {
+        if matches!(name, "push" | "pop" | "removeAt" | "add" | "remove") {
+            let mut steps = Vec::new();
+            let mut root = self.path(recv, &mut steps)?;
             let mut arg = self.args(args)?.into_iter().next();
             let mut out = Value::Void;
-            self.write_path(recv, &mut |slot| {
+            self.write_steps(&mut root, &steps, &mut |slot| {
                 through_ref(slot, |slot| {
                     let items = match (slot, arg.take()) {
                         (Value::List(list), a) => {
@@ -1454,7 +1552,12 @@ impl Interpreter<'_> {
                             };
                             return Ok(());
                         }
-                        _ => return Ok(()),
+                        _ => {
+                            return internal(
+                                &format!("`{name}` on a value that isn't a collection"),
+                                span,
+                            );
+                        }
                     };
                     out = match (name, arg.take()) {
                         ("push", Some(v)) => {
@@ -1466,7 +1569,7 @@ impl Interpreter<'_> {
                             Ok(i) if i < items.len() => Value::Some(Rc::new(items.remove(i))),
                             _ => Value::None,
                         },
-                        _ => Value::Void,
+                        _ => return internal(&format!("`{name}` with the wrong argument"), span),
                     };
                     Ok(())
                 })
@@ -1479,6 +1582,13 @@ impl Interpreter<'_> {
     }
 
     fn builtin_method(&mut self, recv: Value, name: &str, args: Vec<Value>, span: Span) -> Eval {
+        let scanned = match &recv {
+            _ if !matches!(name, "contains" | "join" | "enumerate" | "keys" | "values") => 1,
+            Value::List(items) | Value::Set(items) => items.len(),
+            Value::Map(entries) => entries.len(),
+            _ => 1,
+        };
+        self.spend(scanned as u64, span)?;
         let arg_str = |i: usize| args.get(i).map(Value::display).unwrap_or_default();
         Ok(match (recv, name) {
             (Value::List(items), "length") => Value::Int(items.len() as i64),
@@ -1583,7 +1693,9 @@ impl Interpreter<'_> {
                 }
                 v
             }
-            _ => Value::Void,
+            (recv, name) => {
+                return internal(&format!("no method `{name}` on {}", recv.code()), span);
+            }
         })
     }
 }
@@ -1618,7 +1730,7 @@ fn arith(op: BinOp, l: Value, r: Value, span: Span) -> Eval {
     };
     let (l, r) = match (l, r) {
         (I(a), F(b)) => (F(a as f64), F(b)),
-        (F(a), I(b)) if op != BinOp::Pow => (F(a), F(b as f64)),
+        (F(a), I(b)) => (F(a), F(b as f64)),
         pair => pair,
     };
     Ok(match (op, l, r) {
@@ -1645,10 +1757,12 @@ fn arith(op: BinOp, l: Value, r: Value, span: Span) -> Eval {
             if b < 0 {
                 return panic(Code::negative_exponent, span);
             }
-            let exp = u32::try_from(b).ok();
-            return overflow(exp.and_then(|e| a.checked_pow(e)));
+            return match a {
+                0 | 1 => Ok(I(if b == 0 { 1 } else { a })),
+                -1 => Ok(I(if b % 2 == 0 { 1 } else { -1 })),
+                _ => overflow(u32::try_from(b).ok().and_then(|e| a.checked_pow(e))),
+            };
         }
-        (BinOp::Pow, F(a), I(b)) => F(a.powi(b as i32)),
         (BinOp::Add, F(a), F(b)) => F(a + b),
         (BinOp::Sub, F(a), F(b)) => F(a - b),
         (BinOp::Mul, F(a), F(b)) => F(a * b),
@@ -1671,6 +1785,8 @@ fn arith(op: BinOp, l: Value, r: Value, span: Span) -> Eval {
         (BinOp::Gt, a, b) => Value::Bool(a.compare(&b).is_some_and(Ordering::is_gt)),
         (BinOp::Le, a, b) => Value::Bool(a.compare(&b).is_some_and(Ordering::is_le)),
         (BinOp::Ge, a, b) => Value::Bool(a.compare(&b).is_some_and(Ordering::is_ge)),
-        _ => Value::Void,
+        (op, l, r) => {
+            return internal(&format!("{op:?} on {} and {}", l.code(), r.code()), span);
+        }
     })
 }
