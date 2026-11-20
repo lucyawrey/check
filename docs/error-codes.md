@@ -53,7 +53,8 @@
 - `missing_ref` an argument for a `ref` parameter written without `ref` (quick fix: add it)
 - `ref_not_allowed` `ref` on an argument whose parameter isn't `ref`
 - `overlapping_ref` a `ref` argument that overlaps another argument of the same call (`swap(ref a, ref a)`)
-- `ref_rest_or_default` a `ref` parameter that is a rest parameter or has a default
+- `ref_default` a `ref` parameter with a default (a `ref` rest parameter doesn't parse)
+- `ref_func_as_value` a function with `ref` parameters used as a value, which would drop the write-back
 - `changed_in_for_ref` changing the list a `for ref` loop goes through, inside the loop
 - `assign_to_parameter` assigning to a parameter not written `var`
 - `change_let_collection` changing a `let` list, map or set (`push`, `pop`, `removeAt`, `add`, `remove`)
