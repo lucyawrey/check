@@ -751,8 +751,8 @@ impl Checker<'_> {
                 (true, _) => self.error(Code::type_mismatch, p.span),
                 (false, ty) => ty,
             };
-            if p.is_ref && (p.is_rest || p.default.is_some()) {
-                self.error(Code::ref_rest_or_default, p.span);
+            if p.is_ref && p.default.is_some() {
+                self.error(Code::ref_default, p.span);
             }
             if p.is_ref && self.is_ref_class(&ty) {
                 self.warn(Code::ref_param_of_ref_class, p.span);
@@ -2343,6 +2343,7 @@ impl Checker<'_> {
 
     fn record_literal(&mut self, expr: &Expr, args: &[Arg], expected: Option<&Ty>) -> Ty {
         if let Some(ExprKind::Spread(inner)) = args.first().map(|a| &a.value.kind) {
+            self.no_ref_args(&args[1..]);
             return self.record_copy(inner, &args[1..]);
         }
         let expected = expected.map(|e| match self.subst.shallow(e) {
@@ -2354,6 +2355,7 @@ impl Checker<'_> {
         {
             return self.construct(expr.id, class, args, expr.span);
         }
+        self.no_ref_args(args);
         if args.is_empty() {
             return self.error(Code::type_needed, expr.span);
         }
@@ -2500,6 +2502,9 @@ impl Checker<'_> {
             let Some(sig) = self.ensure_checked(name, span) else {
                 return Ty::Error;
             };
+            if sig.params.iter().any(|p| p.is_ref) {
+                return self.error(Code::ref_func_as_value, span);
+            }
             let map = self.instantiate(name, span);
             let params = sig.params.iter().map(|p| p.ty.substitute(&map)).collect();
             let ret = sig.ret.unwrap_or(Ty::Void).substitute(&map);
@@ -2812,11 +2817,13 @@ impl Checker<'_> {
             }
             ArgSource::Expr(e, is_ref) => {
                 if ref_param {
-                    let fix = vec![Edit {
-                        span: Span::new(e.span.start, e.span.start),
-                        text: "ref ".to_string(),
-                    }];
-                    let d = Diagnostic::error(Code::missing_ref, e.span).with_quick_fix(fix);
+                    let mut d = Diagnostic::error(Code::missing_ref, e.span);
+                    if ref_path(e).is_some() {
+                        d = d.with_quick_fix(vec![Edit {
+                            span: Span::new(e.span.start, e.span.start),
+                            text: "ref ".to_string(),
+                        }]);
+                    }
                     self.diags.push(d);
                     if let Some((root, _)) = ref_path(e)
                         && let Some(var) =
@@ -2842,6 +2849,12 @@ impl Checker<'_> {
     fn skip_arg(&mut self, source: &ArgSource) {
         if let ArgSource::Expr(e, _) = source {
             self.expr(e, None);
+        }
+    }
+
+    fn no_ref_args(&mut self, args: &[Arg]) {
+        for a in args.iter().filter(|a| a.is_ref) {
+            self.error(Code::ref_not_allowed, a.value.span);
         }
     }
 
@@ -2875,6 +2888,9 @@ impl Checker<'_> {
         {
             if self.funcs.contains_key(name) {
                 return self.call_named(name, args, span);
+            }
+            if matches!(name.as_str(), "print" | "Some" | REF | "same") {
+                self.no_ref_args(args);
             }
             match name.as_str() {
                 "print" => {
@@ -4062,8 +4078,16 @@ impl Checker<'_> {
                 }
             }
             let reads = readers.iter().any(|r| {
+                let mut bases = Vec::new();
                 find_expr(r, &mut |x, _| {
-                    ref_path(x).is_some_and(|p| overlaps(&p, path))
+                    if bases.contains(&(x as *const Expr)) {
+                        return false;
+                    }
+                    let Some(p) = ref_path(x) else {
+                        return false;
+                    };
+                    path_bases(x, &mut bases);
+                    overlaps(&p, path)
                 })
                 .is_some()
             });
@@ -4175,6 +4199,7 @@ fn changes<'a>(expr: &'a Expr, is_target: &dyn Fn(&Expr) -> bool) -> Option<&'a 
                         || args.iter().any(|a| a.is_ref && is_target(&a.value))
                 }
                 ExprKind::Call(_, args) => args.iter().any(|a| a.is_ref && is_target(&a.value)),
+                ExprKind::For(_, iter, _, true) => is_target(iter),
                 _ => false,
             }
     })
@@ -4271,6 +4296,14 @@ fn ref_path(e: &Expr) -> Option<RefPath<'_>> {
 
 fn overlaps(a: &RefPath, b: &RefPath) -> bool {
     a.0 == b.0 && a.1.iter().zip(&b.1).all(|(x, y)| x == y)
+}
+
+/// The shorter paths inside a path, which a read of the whole path doesn't read on its own.
+fn path_bases(e: &Expr, out: &mut Vec<*const Expr>) {
+    if let ExprKind::Field(base, _) | ExprKind::Index(base, _) = &e.kind {
+        out.push(&**base);
+        path_bases(base, out);
+    }
 }
 
 fn index_exprs<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {

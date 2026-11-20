@@ -473,6 +473,10 @@ impl Interpreter<'_> {
                 self.printing.pop();
                 text?
             }
+            Value::Ref(r) => {
+                let inner = r.borrow().clone();
+                format!("Ref({})", self.text(&inner, true, span)?)
+            }
             Value::Str(_) if !quoted => v.display(),
             _ => v.code(),
         })
@@ -1049,7 +1053,7 @@ impl Interpreter<'_> {
                 let root = self.path(iter, &mut steps)?;
                 let mut i = 0;
                 loop {
-                    let item = match self.read_steps(&root, &steps)? {
+                    let item = match deref(self.read_steps(&root, &steps)?) {
                         Value::List(items) => items.get(i).cloned(),
                         _ => None,
                     };
@@ -1067,12 +1071,14 @@ impl Interpreter<'_> {
                     let item = scope.remove(name).unwrap_or(Value::Void);
                     let mut gone = true;
                     self.write_steps(&root, &steps, &mut |list| {
-                        if let Value::List(items) = list
-                            && let Some(slot) = Rc::make_mut(items).get_mut(i)
-                        {
-                            *slot = item.clone();
-                            gone = false;
-                        }
+                        through_ref(list, |list| {
+                            if let Value::List(items) = list
+                                && let Some(slot) = Rc::make_mut(items).get_mut(i)
+                            {
+                                *slot = item.clone();
+                                gone = false;
+                            }
+                        });
                         Ok(())
                     })?;
                     if gone {
