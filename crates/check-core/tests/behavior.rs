@@ -2906,3 +2906,11 @@ fn a_lambda_keeps_what_it_captured_when_it_was_made() {
     let src = "var g = 1\nlet f = func() -> Int { g }\ng = 2\nvar fs: List<func() -> Int> = []\nfor i in 0..3 { fs.push(func() => i * 10) }\nfunc outer() -> func() -> func() -> Int {\n  let x = 5\n  func() => func() => x + 1\n}\nprint(\"{f()} {fs.map(func(h) => h())} {outer()()()}\")";
     assert_eq!(output(src), "1 [0, 10, 20] 6");
 }
+
+#[test]
+fn a_lambda_changes_shared_values_it_captured_and_calls_its_own_captures() {
+    let src = "ref class Box(var x: Int)\nfunc g() -> Int { 1 }\nfunc main() {\n  let r = Ref([1])\n  let b = Box(1)\n  let g = func() => 2\n  let f = func() {\n    r.push(2)\n    b.x = 7\n  }\n  f()\n  let h = func() => g()\n  print(\"{r} {b} {h()}\")\n}\nmain()";
+    assert_eq!(output(src), "Ref([1, 2]) Box(x = 7) 2");
+    let callback = "ref class Player {\n  var score: Int = 0\n  func bump() -> func() { func() { this.score += 1 } }\n}\nlet p = Player()\np.bump()()\nprint(p.score)";
+    assert_eq!(output(callback), "1");
+}

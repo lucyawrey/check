@@ -387,9 +387,20 @@ impl Interpreter<'_> {
                 steps.push(Step::Index(key, e.span));
                 Ok(root)
             }
-            ExprKind::Name(name) => Ok(Root::Var(name.clone())),
-            ExprKind::This => Ok(Root::Var("this".to_string())),
+            ExprKind::Name(name) => Ok(self.root(name)),
+            ExprKind::This => Ok(self.root("this")),
             _ => Ok(Root::Value(self.expr(e)?)),
+        }
+    }
+
+    /// A write path's variable. A lambda's captured variable is a copy that writes can only reach
+    /// through (the checker allows only paths into a `Ref` or `ref class`), so it starts there.
+    fn root(&self, name: &str) -> Root {
+        let frame = self.frames.last().expect("frame");
+        let own = frame.scopes.iter().any(|s| s.contains_key(name));
+        match frame.captured.as_ref().and_then(|c| c.get(name)) {
+            Some(v) if !own => Root::Value(v.clone()),
+            _ => Root::Var(name.to_string()),
         }
     }
 
@@ -793,16 +804,20 @@ impl Interpreter<'_> {
         self.globals.get_mut(name)
     }
 
-    fn lookup(&mut self, name: &str) -> Option<Value> {
+    /// A variable's value: the frame's own scopes, then a lambda's captures, then globals.
+    fn variable(&self, name: &str) -> Option<&Value> {
         let frame = self.frames.last().expect("frame");
-        let found = frame
+        frame
             .scopes
             .iter()
             .rev()
             .find_map(|s| s.get(name))
             .or_else(|| frame.captured.as_ref().and_then(|c| c.get(name)))
-            .or_else(|| self.globals.get(name));
-        if let Some(v) = found {
+            .or_else(|| self.globals.get(name))
+    }
+
+    fn lookup(&mut self, name: &str) -> Option<Value> {
+        if let Some(v) = self.variable(name) {
             return Some(v.clone());
         }
         if let Some(decl) = self.funcs.get(name) {
@@ -1317,7 +1332,7 @@ impl Interpreter<'_> {
 
     fn call(&mut self, callee: &Expr, args: &[Arg], span: Span) -> Eval {
         if let ExprKind::Name(name) = &callee.kind
-            && self.slot(name).is_none()
+            && self.variable(name).is_none()
         {
             if let Some(decl) = self.funcs.get(name).cloned() {
                 return self.call_named(&decl, args, span, None);

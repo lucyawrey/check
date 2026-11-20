@@ -1731,6 +1731,8 @@ impl Checker<'_> {
                 .rposition(|s| s.contains_key(name))
                 .is_none_or(|i| i < base)
         });
+        // A write into a `Ref` or `ref class` it captured goes through the captured copy.
+        self.capture(name);
         let Some(var) = self.lookup_mut(name) else {
             let code = if name == "this" {
                 Code::this_outside_method
