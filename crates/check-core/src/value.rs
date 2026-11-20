@@ -1,7 +1,10 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+
+use indexmap::{IndexMap, IndexSet};
 use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -47,7 +50,12 @@ impl Drop for Record {
                         pending.append(&mut r.into_inner().fields);
                     }
                 }
-                Value::List(items) | Value::Set(items) => {
+                Value::List(items) => {
+                    if let Ok(items) = Rc::try_unwrap(items) {
+                        pending.extend(items);
+                    }
+                }
+                Value::Set(items) => {
                     if let Ok(items) = Rc::try_unwrap(items) {
                         pending.extend(items);
                     }
@@ -132,9 +140,9 @@ pub enum Value {
     Str(Rc<str>),
     List(Rc<Vec<Value>>),
     /// Entries in insertion order.
-    Map(Rc<Vec<(Value, Value)>>),
+    Map(Rc<IndexMap<Value, Value>>),
     /// Items in insertion order.
-    Set(Rc<Vec<Value>>),
+    Set(Rc<IndexSet<Value>>),
     Some(Rc<Value>),
     None,
     Range(i64, i64, bool),
@@ -145,6 +153,27 @@ pub enum Value {
     Variant(Rc<Record>),
     Record(Rc<Record>),
     Void,
+}
+
+// `==` is exact for the types a map key or set item can have (`invalid_key_type` rules out
+// `Float` and everything else whose `==` is looser), so it's an equivalence for those.
+impl Eq for Value {}
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Value::Int(n) => n.hash(state),
+            Value::Bool(b) => b.hash(state),
+            Value::Str(s) => s.hash(state),
+            Value::Some(v) => v.hash(state),
+            Value::Object(r) | Value::Variant(r) | Value::Record(r) => {
+                r.name.hash(state);
+                r.fields.hash(state);
+            }
+            // Never a key, so one hash for all is correct, if slow.
+            _ => {}
+        }
+    }
 }
 
 impl PartialEq for Value {
@@ -164,10 +193,8 @@ impl Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
-            (Value::Map(a), Value::Map(b)) => {
-                a.len() == b.len() && a.iter().all(|(k, v)| map_get(b, k) == Some(v))
-            }
-            (Value::Set(a), Value::Set(b)) => a.len() == b.len() && a.iter().all(|x| b.contains(x)),
+            (Value::Map(a), Value::Map(b)) => a == b,
+            (Value::Set(a), Value::Set(b)) => a == b,
             (Value::Some(a), Value::Some(b)) => a == b,
             (Value::None, Value::None) | (Value::Void, Value::Void) => true,
             (Value::Range(a, b, x), Value::Range(c, d, y)) => a == c && b == d && x == y,
@@ -281,10 +308,6 @@ impl Value {
             Value::Void => String::new(),
         }
     }
-}
-
-pub fn map_get<'m>(entries: &'m [(Value, Value)], key: &Value) -> Option<&'m Value> {
-    entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
 pub fn map_code(entries: impl Iterator<Item = (String, String)>) -> String {

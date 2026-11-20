@@ -8,7 +8,9 @@ use crate::ast::*;
 use crate::checker::{EQ, Info, PRINTABLE, RESULT, Resolved, SET};
 use crate::diag::{Code, Span};
 use crate::host::{self, Io};
-use crate::value::{Callable, Record, Value, map_code, map_get};
+use indexmap::{IndexMap, IndexSet};
+
+use crate::value::{Callable, Record, Value, map_code};
 
 pub struct Panic {
     pub code: Code,
@@ -286,21 +288,11 @@ fn descend<'s>(v: &mut Value, steps: &'s [Step], f: Writer) -> Descent<'s> {
                 None => panic(Code::index_out_of_range, *span),
             }
         }
-        (Value::Map(entries), Step::Index(key, span)) => {
-            match Rc::make_mut(entries).iter_mut().find(|(k, _)| k == key) {
-                Some((_, v)) => descend(v, rest, f),
-                None => panic(Code::missing_key, *span),
-            }
-        }
+        (Value::Map(entries), Step::Index(key, span)) => match Rc::make_mut(entries).get_mut(key) {
+            Some(v) => descend(v, rest, f),
+            None => panic(Code::missing_key, *span),
+        },
         _ => Ok(None),
-    }
-}
-
-/// Sets `key` to `value`, keeping its place if it's there and adding it at the end if not.
-fn map_insert(entries: &mut Vec<(Value, Value)>, key: Value, value: Value) {
-    match entries.iter_mut().find(|(k, _)| *k == key) {
-        Some((_, v)) => *v = value,
-        None => entries.push((key, value)),
     }
 }
 
@@ -522,7 +514,10 @@ impl Interpreter<'_> {
         }
         Ok(match v {
             Value::List(items) => format!("[{}]", self.texts(items, span)?),
-            Value::Set(items) => format!("Set([{}])", self.texts(items, span)?),
+            Value::Set(items) => {
+                let items: Vec<Value> = items.iter().cloned().collect();
+                format!("Set([{}])", self.texts(&items, span)?)
+            }
             Value::Map(entries) => {
                 let mut parts = Vec::with_capacity(entries.len());
                 for (k, v) in entries.iter() {
@@ -841,7 +836,7 @@ impl Interpreter<'_> {
                     self.write_steps(&mut root, init, &mut |slot| {
                         through_ref(slot, |slot| match slot {
                             Value::Map(entries) => {
-                                map_insert(Rc::make_mut(entries), key.clone(), rhs.clone());
+                                Rc::make_mut(entries).insert(key.clone(), rhs.clone());
                                 Ok(())
                             }
                             _ => descend(slot, std::slice::from_ref(last), &mut |v| {
@@ -1012,11 +1007,11 @@ impl Interpreter<'_> {
                 Ok(Value::List(Rc::new(values)))
             }
             ExprKind::Map(items) => {
-                let mut entries = Vec::with_capacity(items.len());
+                let mut entries = IndexMap::with_capacity(items.len());
                 for (k, v) in items {
                     let k = self.expr(k)?;
                     let v = self.expr(v)?;
-                    map_insert(&mut entries, k, v);
+                    entries.insert(k, v);
                 }
                 Ok(Value::Map(Rc::new(entries)))
             }
@@ -1053,7 +1048,7 @@ impl Interpreter<'_> {
                     (Value::List(items), Value::Int(i)) => {
                         usize::try_from(i).ok().and_then(|i| items.get(i).cloned())
                     }
-                    (Value::Map(entries), key) => map_get(&entries, &key).cloned(),
+                    (Value::Map(entries), key) => entries.get(&key).cloned(),
                     _ => None,
                 };
                 let unwrapped = self.info.unwrapped_index.contains(&expr.id);
@@ -1201,16 +1196,18 @@ impl Interpreter<'_> {
             }
             ExprKind::For(pattern, iter, body, false) => {
                 let wraps = self.info.wrapping.contains(&expr.id);
+                // Each holds its collection's `Rc`, so the loop walks the collection as it was
+                // when the loop started, without copying it.
                 let items: Box<dyn Iterator<Item = Value>> = match self.expr(iter)? {
                     Value::Range(lo, hi, false) => Box::new((lo..hi).map(Value::Int)),
                     Value::Range(lo, hi, true) => Box::new((lo..=hi).map(Value::Int)),
-                    Value::List(items) | Value::Set(items) => {
-                        Box::new((*items).clone().into_iter())
-                    }
-                    Value::Map(entries) => {
-                        Box::new((*entries).clone().into_iter().map(|(k, v)| pair(k, v)))
-                    }
-                    _ => Box::new(std::iter::empty()),
+                    Value::List(items) => Box::new((0..items.len()).map(move |i| items[i].clone())),
+                    Value::Set(items) => Box::new((0..items.len()).map(move |i| items[i].clone())),
+                    Value::Map(entries) => Box::new((0..entries.len()).map(move |i| {
+                        let (k, v) = entries.get_index(i).expect("in range");
+                        pair(k.clone(), v.clone())
+                    })),
+                    v => return internal(&format!("`for` over {}", v.code()), iter.span),
                 };
                 for item in items {
                     self.spend(1, expr.span)?;
@@ -1328,12 +1325,7 @@ impl Interpreter<'_> {
                     let Value::List(items) = self.expr(&args[0].value)? else {
                         return Ok(Value::Void);
                     };
-                    let mut set = Vec::new();
-                    for item in items.iter() {
-                        if !set.contains(item) {
-                            set.push(item.clone());
-                        }
-                    }
+                    let set: IndexSet<Value> = items.iter().cloned().collect();
                     return Ok(Value::Set(Rc::new(set)));
                 }
                 "Ref" => {
@@ -1549,26 +1541,19 @@ impl Interpreter<'_> {
                             Rc::make_mut(list)
                         }
                         (Value::Map(entries), Some(key)) => {
-                            let entries = Rc::make_mut(entries);
-                            let i = entries.iter().position(|(k, _)| *k == key);
-                            out = i
-                                .map_or(Value::None, |i| Value::Some(Rc::new(entries.remove(i).1)));
+                            out = match Rc::make_mut(entries).shift_remove(&key) {
+                                Some(v) => Value::Some(Rc::new(v)),
+                                None => Value::None,
+                            };
                             return Ok(());
                         }
                         (Value::Set(set), Some(item)) => {
                             let set = Rc::make_mut(set);
-                            let i = set.iter().position(|x| *x == item);
-                            out = match (name, i) {
-                                ("add", None) => {
-                                    set.push(item);
-                                    Value::Void
-                                }
-                                ("add", Some(_)) => Value::Void,
-                                (_, Some(i)) => {
-                                    set.remove(i);
-                                    Value::Bool(true)
-                                }
-                                (_, None) => Value::Bool(false),
+                            out = if name == "add" {
+                                set.insert(item);
+                                Value::Void
+                            } else {
+                                Value::Bool(set.shift_remove(&item))
                             };
                             return Ok(());
                         }
@@ -1603,9 +1588,8 @@ impl Interpreter<'_> {
 
     fn builtin_method(&mut self, recv: Value, name: &str, args: Vec<Value>, span: Span) -> Eval {
         let scanned = match &recv {
-            _ if !matches!(name, "contains" | "join" | "enumerate" | "keys" | "values") => 1,
-            Value::List(items) | Value::Set(items) => items.len(),
-            Value::Map(entries) => entries.len(),
+            Value::List(items) if matches!(name, "contains" | "join" | "enumerate") => items.len(),
+            Value::Map(entries) if matches!(name, "keys" | "values") => entries.len(),
             _ => 1,
         };
         self.spend(scanned as u64, span)?;
@@ -1633,7 +1617,7 @@ impl Interpreter<'_> {
             (Value::Map(entries), "length") => Value::Int(entries.len() as i64),
             (Value::Map(entries), "isEmpty") => Value::Bool(entries.is_empty()),
             (Value::Map(entries), "contains") => {
-                Value::Bool(args.first().is_some_and(|k| map_get(&entries, k).is_some()))
+                Value::Bool(args.first().is_some_and(|k| entries.contains_key(k)))
             }
             (Value::Map(entries), "keys") => {
                 Value::List(Rc::new(entries.iter().map(|(k, _)| k.clone()).collect()))
