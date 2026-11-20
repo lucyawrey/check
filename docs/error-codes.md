@@ -50,6 +50,7 @@
 - `try_maybe_in_result` `try` on a `Maybe` in a function returning a `Result` (suggests `try x.orErr(...)`)
 - `try_error_mismatch` `try` on a `Result` whose error type differs from the function's
 - `assign_to_let` assigning to a `let`
+- `assign_to_captured` assigning to or changing a variable from outside a lambda inside it, top-level `var`s included, since a lambda keeps a copy of what it captures
 - `missing_ref` an argument for a `ref` parameter written without `ref` (quick fix: add it)
 - `ref_not_allowed` `ref` on an argument whose parameter isn't `ref`
 - `overlapping_ref` a `ref` argument that overlaps another argument of the same call (`swap(ref a, ref a)`)
@@ -125,9 +126,12 @@
 - `shift_out_of_range` a shift amount below 0 or of 64 and above
 - `round_out_of_range` rounding `NaN`, `Infinity` or a `Float` too big for an `Int`
 - `stack_overflow` more than 10,000 nested calls
-- `index_out_of_range` writing to a list index that doesn't exist (`list[9] = x`)
+- `index_out_of_range` writing to a list index that doesn't exist (`list[9] = x`), or a narrowed read whose index is gone
 - `for_ref_element_gone` a `for ref` element whose index is gone when it's written back
-- `missing_key` a compound assignment or nested write to a map key that isn't there (`m[k] += 1`)
+- `missing_key` a map key that isn't there, on a write path (`m[k] += 1`, `m[k].push(x)`, `ref m[k]`) or in a narrowed read
+- `internal_error` a case the checker should have ruled out reached the interpreter (a bug in Check, not the program); the reason names the case
+- `out_of_steps` a const or `.conx` value that ran past the step budget (10 million loop passes, calls and built-in steps) while being built
+- `data_try_failed` a `try` that failed in a `.conx` value while a host loads it (`check run` stops with the error instead, as for a top-level `try`)
 - `const_cycle` a `.conx` value that reaches itself through a function call while it's being built
 
 ## Warnings
