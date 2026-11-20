@@ -13,7 +13,8 @@ pub enum Callable {
     Lambda {
         params: Vec<Param>,
         body: Arc<Expr>,
-        captured: HashMap<String, Value>,
+        /// What the lambda read from outside, as it was when the lambda was made.
+        captured: Rc<HashMap<String, Value>>,
         sig: String,
     },
 }

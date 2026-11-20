@@ -56,8 +56,11 @@ enum Step {
     Index(Value, Span),
 }
 
+#[derive(Default)]
 struct Frame {
     scopes: Vec<HashMap<String, Value>>,
+    /// A lambda call's captured variables, read after the frame's own scopes and never written.
+    captured: Option<Rc<HashMap<String, Value>>>,
 }
 
 pub struct Interpreter<'a> {
@@ -154,7 +157,7 @@ fn start<'a>(
         const_values: HashMap::new(),
         building: HashSet::new(),
         globals: HashMap::new(),
-        frames: vec![Frame { scopes: Vec::new() }],
+        frames: vec![Frame::default()],
         depth: 0,
         printing: Vec::new(),
         budget: Some(DATA_BUDGET),
@@ -615,6 +618,7 @@ impl Interpreter<'_> {
         let scope = HashMap::from([("this".to_string(), this)]);
         self.frames.push(Frame {
             scopes: vec![scope],
+            captured: None,
         });
         let result = self.expr(init.body.as_ref().expect("init has a body"));
         let mut frame = self.frames.pop().expect("frame");
@@ -783,7 +787,15 @@ impl Interpreter<'_> {
     }
 
     fn lookup(&mut self, name: &str) -> Option<Value> {
-        if let Some(v) = self.slot(name) {
+        let frame = self.frames.last().expect("frame");
+        let found = frame
+            .scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.get(name))
+            .or_else(|| frame.captured.as_ref().and_then(|c| c.get(name)))
+            .or_else(|| self.globals.get(name));
+        if let Some(v) = found {
             return Some(v.clone());
         }
         if let Some(decl) = self.funcs.get(name) {
@@ -1055,10 +1067,15 @@ impl Interpreter<'_> {
                 }
             }
             ExprKind::Lambda(params, _, body) => {
-                let mut captured = self.globals.clone();
-                for scope in &self.frames.last().expect("frame").scopes {
-                    captured.extend(scope.iter().map(|(k, v)| (k.clone(), v.clone())));
-                }
+                let captured = info
+                    .captures
+                    .get(&expr.id)
+                    .map_or_else(HashMap::new, |names| {
+                        names
+                            .iter()
+                            .filter_map(|n| Some((n.clone(), self.lookup(n)?)))
+                            .collect()
+                    });
                 let sig = self
                     .info
                     .signatures
@@ -1068,7 +1085,7 @@ impl Interpreter<'_> {
                 Ok(Value::Func(Rc::new(Callable::Lambda {
                     params: params.clone(),
                     body: body.clone(),
-                    captured,
+                    captured: Rc::new(captured),
                     sig,
                 })))
             }
@@ -1393,7 +1410,11 @@ impl Interpreter<'_> {
         if let Some(this) = this {
             scope.insert("this".to_string(), this);
         }
-        self.enter_keeping(vec![scope], body, span, keep)
+        let frame = Frame {
+            scopes: vec![scope],
+            captured: None,
+        };
+        self.enter_keeping(frame, body, span, keep)
     }
 
     fn bind_args(&mut self, params: &[Param], args: &[Arg]) -> Result<Bound, Flow> {
@@ -1433,7 +1454,7 @@ impl Interpreter<'_> {
                     None => match &p.default {
                         Some(d) => {
                             // A default sees the names where it's declared, not the caller's locals.
-                            self.frames.push(Frame { scopes: Vec::new() });
+                            self.frames.push(Frame::default());
                             let v = self.expr(d);
                             self.frames.pop();
                             v?
@@ -1459,20 +1480,19 @@ impl Interpreter<'_> {
                 captured,
                 ..
             } => {
-                let scope = params.iter().map(|p| p.name.clone()).zip(values).collect();
+                let frame = Frame {
+                    scopes: vec![params.iter().map(|p| p.name.clone()).zip(values).collect()],
+                    captured: Some(captured.clone()),
+                };
                 let body = body.clone();
-                self.enter(vec![captured.clone(), scope], &body, span)
+                Ok(self.enter_keeping(frame, &body, span, &[])?.0)
             }
         }
     }
 
-    fn enter(&mut self, scopes: Vec<HashMap<String, Value>>, body: &Expr, span: Span) -> Eval {
-        Ok(self.enter_keeping(scopes, body, span, &[])?.0)
-    }
-
     fn enter_keeping(
         &mut self,
-        scopes: Vec<HashMap<String, Value>>,
+        frame: Frame,
         body: &Expr,
         span: Span,
         keep: &[String],
@@ -1482,7 +1502,7 @@ impl Interpreter<'_> {
         }
         self.spend(1, span)?;
         self.depth += 1;
-        self.frames.push(Frame { scopes });
+        self.frames.push(frame);
         let result = self.expr(body);
         let mut frame = self.frames.pop().expect("frame");
         let kept = keep

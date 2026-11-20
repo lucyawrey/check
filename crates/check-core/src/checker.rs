@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ast::*;
 use crate::diag::{Code, Diagnostic, Edit, Sources, Span};
@@ -28,6 +28,8 @@ pub struct Info {
     pub coercions: HashMap<NodeId, Coercion>,
     pub wrapping: HashSet<NodeId>,
     pub signatures: HashMap<NodeId, String>,
+    /// Each lambda's captured variables: what its body, or a lambda inside it, reads from outside.
+    pub captures: HashMap<NodeId, Vec<String>>,
     pub unwrapped_index: HashSet<NodeId>,
     pub resolved: HashMap<NodeId, Resolved>,
     pub variant_patterns: HashSet<NodeId>,
@@ -203,8 +205,9 @@ pub struct Checker<'s> {
     funcs: HashMap<String, FuncEntry>,
     fns: Vec<FnCtx>,
     loops: Vec<LoopCtx>,
-    /// The first scope of the innermost lambda being checked; variables below it are captured.
-    lambda_scope: Option<usize>,
+    /// The lambdas being checked, innermost last: each one's first scope (variables below it are
+    /// captured) and what it has captured so far.
+    lambdas: Vec<(usize, BTreeSet<String>)>,
     /// Collection and key names whose index can't miss, and the innermost scope they
     /// may come from, so a shadowing name isn't narrowed.
     narrowed: Vec<(String, String, usize)>,
@@ -260,7 +263,7 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         funcs: HashMap::new(),
         fns: Vec::new(),
         loops: Vec::new(),
-        lambda_scope: None,
+        lambdas: Vec::new(),
         narrowed: Vec::new(),
         top_level_names: HashSet::new(),
         lambda_types: Vec::new(),
@@ -982,7 +985,7 @@ impl Checker<'_> {
         let saved_type = std::mem::replace(&mut self.current_type, entry.owner.clone());
         let saved_scopes = self.scopes.split_off(1);
         let saved_loops = std::mem::take(&mut self.loops);
-        let saved_lambda = self.lambda_scope.take();
+        let saved_lambdas = std::mem::take(&mut self.lambdas);
         let saved_narrowed = std::mem::take(&mut self.narrowed);
         let mut scope = HashMap::new();
         for (p, ps) in decl.params.iter().zip(&sig.params) {
@@ -1026,7 +1029,7 @@ impl Checker<'_> {
         self.scopes.truncate(1);
         self.scopes.extend(saved_scopes);
         self.loops = saved_loops;
-        self.lambda_scope = saved_lambda;
+        self.lambdas = saved_lambdas;
         self.narrowed = saved_narrowed;
         let entry = self.funcs.get_mut(name)?;
         entry.sig.ret = Some(ret);
@@ -1521,6 +1524,18 @@ impl Checker<'_> {
         self.scopes.iter().rev().find_map(|s| s.get(name))
     }
 
+    /// Records a read of `name` in every lambda it comes from outside of.
+    fn capture(&mut self, name: &str) {
+        let Some(i) = self.scope_of(name) else {
+            return;
+        };
+        for (base, captures) in &mut self.lambdas {
+            if i < *base {
+                captures.insert(name.to_string());
+            }
+        }
+    }
+
     fn scope_of(&self, name: &str) -> Option<usize> {
         self.scopes.iter().rposition(|s| s.contains_key(name))
     }
@@ -1710,7 +1725,7 @@ impl Checker<'_> {
                 return (self.const_type(&key), Some(Code::assign_to_let));
             }
         }
-        let captured = self.lambda_scope.is_some_and(|base| {
+        let captured = self.lambdas.last().is_some_and(|&(base, _)| {
             self.scopes
                 .iter()
                 .rposition(|s| s.contains_key(name))
@@ -2169,7 +2184,11 @@ impl Checker<'_> {
             }
             ExprKind::Name(name) => self.name(expr.id, name, expr.span, expected),
             ExprKind::This => match self.lookup("this") {
-                Some(var) => var.ty.clone(),
+                Some(var) => {
+                    let ty = var.ty.clone();
+                    self.capture("this");
+                    ty
+                }
                 None => self.error(Code::this_outside_method, expr.span),
             },
             ExprKind::Field(base, name) => self.field_expr(expr.id, base, name, expr.span),
@@ -2547,7 +2566,9 @@ impl Checker<'_> {
 
     fn name(&mut self, id: NodeId, name: &str, span: Span, expected: Option<&Ty>) -> Ty {
         if let Some(var) = self.lookup(name) {
-            return var.ty.clone();
+            let ty = var.ty.clone();
+            self.capture(name);
+            return ty;
         }
         if self.funcs.contains_key(name) {
             let Some(sig) = self.ensure_checked(name, span) else {
@@ -3496,13 +3517,15 @@ impl Checker<'_> {
         }
         let declared = ret.map(|t| self.type_from(t));
         let saved_loops = std::mem::take(&mut self.loops);
-        let saved_lambda = self.lambda_scope.take();
-        self.lambda_scope = Some(self.scopes.len());
+        self.lambdas.push((self.scopes.len(), BTreeSet::new()));
         self.scopes.push(scope);
         let ret = self.function_body(body, declared);
         self.finish_scope();
         self.loops = saved_loops;
-        self.lambda_scope = saved_lambda;
+        let (_, captures) = self.lambdas.pop().expect("lambda");
+        self.info
+            .captures
+            .insert(id, captures.into_iter().collect());
         let ty = Ty::Func(param_tys, Box::new(ret));
         self.lambda_types.push((id, ty.clone()));
         ty
