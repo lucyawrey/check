@@ -66,7 +66,7 @@ pub struct Members {
 pub struct ClassDecl {
     pub name: String,
     pub span: Span,
-    pub is_ref: bool,
+    pub is_shared: bool,
     pub is_private: bool,
     pub type_params: Vec<TypeParam>,
     pub interfaces: Vec<TypeExpr>,

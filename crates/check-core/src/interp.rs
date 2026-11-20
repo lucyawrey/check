@@ -76,7 +76,7 @@ pub struct Interpreter<'a> {
     globals: HashMap<String, Value>,
     frames: Vec<Frame>,
     depth: usize,
-    /// The `ref class` objects being printed, by address, to stop at a cycle.
+    /// The `shared class` objects being printed, by address, to stop at a cycle.
     printing: Vec<usize>,
     /// Steps left before evaluation stops with `out_of_steps`; `None` is no limit.
     budget: Option<u64>,
@@ -272,10 +272,10 @@ fn descend<'s>(v: &mut Value, steps: &'s [Step], f: Writer) -> Descent<'s> {
     };
     match (v, step) {
         (Value::Shared(rc), _) => Ok(Some((Holder::Record(rc.clone()), steps))),
-        (Value::Ref(rc), Step::Field(name)) if name == "value" => {
+        (Value::SharedBox(rc), Step::Field(name)) if name == "value" => {
             Ok(Some((Holder::Value(rc.clone()), rest)))
         }
-        (Value::Ref(rc), _) => Ok(Some((Holder::Value(rc.clone()), steps))),
+        (Value::SharedBox(rc), _) => Ok(Some((Holder::Value(rc.clone()), steps))),
         (Value::Object(rc), _) => descend_record(Rc::make_mut(rc), steps, f),
         (Value::List(items), Step::Index(i, span)) => {
             let items = Rc::make_mut(items);
@@ -316,14 +316,14 @@ pub(crate) fn grow<R>(f: impl FnOnce() -> R) -> R {
 
 fn through_ref<R>(slot: &mut Value, f: impl FnOnce(&mut Value) -> R) -> R {
     match slot {
-        Value::Ref(v) => f(&mut v.borrow_mut()),
+        Value::SharedBox(v) => f(&mut v.borrow_mut()),
         slot => f(slot),
     }
 }
 
 fn deref(v: Value) -> Value {
     match v {
-        Value::Ref(v) => v.borrow().clone(),
+        Value::SharedBox(v) => v.borrow().clone(),
         v => v,
     }
 }
@@ -394,7 +394,7 @@ impl Interpreter<'_> {
     }
 
     /// A write path's variable. A lambda's captured variable is a copy that writes can only reach
-    /// through (the checker allows only paths into a `Ref` or `ref class`), so it starts there.
+    /// through (the checker allows only paths into a `Shared` or `shared class`), so it starts there.
     fn root(&self, name: &str) -> Root {
         let frame = self.frames.last().expect("frame");
         let own = frame.scopes.iter().any(|s| s.contains_key(name));
@@ -559,10 +559,10 @@ impl Interpreter<'_> {
                 self.printing.pop();
                 done
             }
-            Value::Ref(r) => {
+            Value::SharedBox(r) => {
                 // A copy, as for `Shared`: printing can run code that changes it.
                 let inner = r.borrow().clone();
-                write_items(out, "Ref(", [&inner].into_iter(), ")", field)
+                write_items(out, "Shared(", [&inner].into_iter(), ")", field)
             }
             Value::Str(_) if !quoted => {
                 out.push_str(&v.display());
@@ -591,7 +591,7 @@ impl Interpreter<'_> {
             ),
             fields,
         };
-        let value = if class.is_ref {
+        let value = if class.is_shared {
             Value::Shared(Rc::new(RefCell::new(record)))
         } else {
             Value::Object(Rc::new(record))
@@ -974,8 +974,8 @@ impl Interpreter<'_> {
                 None => internal("no `this`", expr.span),
             },
             ExprKind::Field(base, name) => match self.expr(base)? {
-                Value::Ref(v) if name == "value" => Ok(v.borrow().clone()),
-                Value::Ref(v) => field(&v.borrow(), name, expr.span),
+                Value::SharedBox(v) if name == "value" => Ok(v.borrow().clone()),
+                Value::SharedBox(v) => field(&v.borrow(), name, expr.span),
                 v => field(&v, name, expr.span),
             },
             ExprKind::Is(lhs, pattern) => {
@@ -1355,9 +1355,9 @@ impl Interpreter<'_> {
                     let set: IndexSet<Value> = items.iter().cloned().collect();
                     return Ok(Value::Set(Rc::new(set)));
                 }
-                "Ref" => {
+                "Shared" => {
                     let value = self.args(args)?.remove(0);
-                    return Ok(Value::Ref(Rc::new(RefCell::new(value))));
+                    return Ok(Value::SharedBox(Rc::new(RefCell::new(value))));
                 }
                 "same" => {
                     let values = self.args(args)?;
@@ -1367,7 +1367,7 @@ impl Interpreter<'_> {
                             (Value::Shared(a), Value::Shared(b)) if Rc::ptr_eq(a, b)
                         ) || matches!(
                             (&values[0], &values[1]),
-                            (Value::Ref(a), Value::Ref(b)) if Rc::ptr_eq(a, b)
+                            (Value::SharedBox(a), Value::SharedBox(b)) if Rc::ptr_eq(a, b)
                         ),
                     ));
                 }

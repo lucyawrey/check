@@ -27,7 +27,7 @@ pub struct Record {
     pub name: Rc<str>,
     /// The key of the record's class or enum, empty for a plain record.
     pub ty: Rc<str>,
-    /// A `ref class` that implements `Eq`, so `==` compares its fields.
+    /// A `shared class` that implements `Eq`, so `==` compares its fields.
     pub by_fields: bool,
     pub field_names: Option<Rc<[Rc<str>]>>,
     pub fields: Vec<Value>,
@@ -70,7 +70,7 @@ impl Drop for Record {
                         pending.push(inner);
                     }
                 }
-                Value::Ref(inner) => {
+                Value::SharedBox(inner) => {
                     if let Ok(inner) = Rc::try_unwrap(inner) {
                         pending.push(inner.into_inner());
                     }
@@ -127,7 +127,7 @@ impl Record {
 }
 
 thread_local! {
-    /// The `ref class` objects `==` is comparing, by address.
+    /// The `shared class` objects `==` is comparing, by address.
     static COMPARING: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -148,7 +148,7 @@ pub enum Value {
     Func(Rc<Callable>),
     Object(Rc<Record>),
     Shared(Rc<RefCell<Record>>),
-    Ref(Rc<RefCell<Value>>),
+    SharedBox(Rc<RefCell<Value>>),
     Variant(Rc<Record>),
     Record(Rc<Record>),
     Void,
@@ -198,7 +198,7 @@ impl Value {
             (Value::None, Value::None) | (Value::Void, Value::Void) => true,
             (Value::Range(a, b, x), Value::Range(c, d, y)) => a == c && b == d && x == y,
             (Value::Func(a), Value::Func(b)) => Rc::ptr_eq(a, b),
-            (Value::Ref(a), Value::Ref(b)) => Rc::ptr_eq(a, b),
+            (Value::SharedBox(a), Value::SharedBox(b)) => Rc::ptr_eq(a, b),
             (Value::Object(a), Value::Object(b))
             | (Value::Variant(a), Value::Variant(b))
             | (Value::Record(a), Value::Record(b)) => a == b,
@@ -250,7 +250,7 @@ impl Value {
             Value::Set(_) => SET.into(),
             Value::Some(_) | Value::None => MAYBE.into(),
             Value::Shared(r) => r.borrow().ty.clone(),
-            Value::Ref(_) => "Ref".into(),
+            Value::SharedBox(_) => "Shared".into(),
             Value::Object(r) | Value::Variant(r) | Value::Record(r) => r.ty.clone(),
             Value::Range(..) | Value::Func(_) | Value::Void => "".into(),
         }
@@ -298,9 +298,9 @@ impl Value {
                 Ok(record) => done(record.write_with(true, out, field)),
                 Err(_) => out.push_str("..."),
             },
-            Value::Ref(v) => match v.try_borrow_mut() {
-                Ok(v) => done(write_items(out, "Ref(", [&*v].into_iter(), ")", field)),
-                Err(_) => out.push_str("Ref(...)"),
+            Value::SharedBox(v) => match v.try_borrow_mut() {
+                Ok(v) => done(write_items(out, "Shared(", [&*v].into_iter(), ")", field)),
+                Err(_) => out.push_str("Shared(...)"),
             },
             Value::Variant(r) => done(r.write_with(false, out, field)),
             Value::Void => {}

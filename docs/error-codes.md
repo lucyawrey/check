@@ -56,11 +56,11 @@
 - `overlapping_ref` a `ref` argument that overlaps another argument of the same call (`swap(ref a, ref a)`)
 - `ref_default` a `ref` parameter with a default (a `ref` rest parameter doesn't parse)
 - `ref_func_as_value` a function with `ref` parameters used as a value, which would drop the write-back
-- `ref_where_value_expected` a `Ref<T>` where a `T` is expected (suggests `r.value`)
+- `shared_where_value_expected` a `Shared<T>` where a `T` is expected (suggests `r.value`)
 - `changed_in_for_ref` changing the list a `for ref` loop goes through, inside the loop
 - `assign_to_parameter` assigning to a parameter not written `var`
 - `change_let_collection` changing a `let` list, map or set (`push`, `pop`, `removeAt`, `add`, `remove`)
-- `invalid_key_type` a map key or set item whose type has no exact equality (`Float`, a function, a collection, a `ref class` or anything holding one)
+- `invalid_key_type` a map key or set item whose type has no exact equality (`Float`, a function, a collection, a `shared class` or anything holding one)
 - `break_outside_loop` `break` or `continue` outside a loop
 - `return_outside_function` `return` outside a function
 - `loop_value_without_break` a `for`, `while` or `loop` used as a value with no `break` value
@@ -136,8 +136,8 @@
 
 ## Warnings
 - `unused_var` a `var` that's never reassigned
-- `ref_of_ref_class` `Ref` of a `ref class`, which is already shared
-- `ref_param_of_ref_class` a `ref` parameter of a `ref class` type, which is already shared
+- `shared_wraps_shared_class` `Shared` of a `shared class`, which is already shared
+- `ref_param_of_shared_class` a `ref` parameter of a `shared class` type, which is already shared
 - `shadowed_name` a local that shadows a function or type
 - `repeated_namespace` a `namespace` line that only repeats its package's, which the manifest already sets
 - `interpolated_maybe` interpolating a `T?`

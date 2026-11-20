@@ -83,7 +83,7 @@ struct InterfaceDef {
 }
 
 struct ClassDef {
-    is_ref: bool,
+    is_shared: bool,
     fields: Vec<ParamSig>,
     mutable: Vec<bool>,
     private: Vec<bool>,
@@ -93,7 +93,7 @@ struct ClassDef {
 struct FieldInfo {
     ty: Ty,
     mutable: bool,
-    is_ref: bool,
+    is_shared: bool,
     private: bool,
     readonly: bool,
 }
@@ -246,7 +246,7 @@ pub(crate) const BUILT_IN_TYPES: &[&str] = &["String", "Int", "Float", "Bool"];
 pub(crate) const MAYBE: &str = "check.std.Maybe";
 pub(crate) const MAP: &str = "Map";
 pub(crate) const SET: &str = "Set";
-pub(crate) const REF: &str = "Ref";
+pub(crate) const SHARED: &str = "Shared";
 /// The bound a map key or set item's type needs; not a real interface.
 const KEY: &str = "check.std.Key";
 pub(crate) const RESULT: &str = "check.std.Result";
@@ -538,7 +538,7 @@ impl Checker<'_> {
         self.types.insert(
             c.name.clone(),
             TypeDef::Class(ClassDef {
-                is_ref: c.is_ref,
+                is_shared: c.is_shared,
                 fields,
                 mutable,
                 private: c.fields.iter().map(|f| f.is_private).collect(),
@@ -764,8 +764,8 @@ impl Checker<'_> {
             if p.is_ref && p.default.is_some() {
                 self.error(Code::ref_default, p.span);
             }
-            if p.is_ref && self.is_ref_class(&ty) {
-                self.warn(Code::ref_param_of_ref_class, p.span);
+            if p.is_ref && self.is_shared_class(&ty) {
+                self.warn(Code::ref_param_of_shared_class, p.span);
             }
             params.push(ParamSig {
                 name: p.name.clone(),
@@ -935,7 +935,7 @@ impl Checker<'_> {
                         Ty::Named(name.clone(), args)
                     }
                     (MAYBE, [inner]) => Ty::maybe(inner.clone()),
-                    (REF, [_]) => Ty::Named(name.clone(), args),
+                    (SHARED, [_]) => Ty::Named(name.clone(), args),
                     _ if !self.type_names.contains(name) => self.error(Code::unknown_name, *span),
                     _ if self.generics.get(name).map_or(0, Vec::len) != args.len() => {
                         self.error(Code::wrong_type_arguments, *span)
@@ -1216,11 +1216,11 @@ impl Checker<'_> {
         if want == KEY {
             return self.is_key(&ty, &mut HashSet::new());
         }
-        // Every type `==` works on is `Eq`; a `ref class` has to say so.
+        // Every type `==` works on is `Eq`; a `shared class` has to say so.
         if want == EQ
             && !matches!(ty, Ty::Param(_))
             && !self.is_interface(&ty)
-            && !self.is_ref_class(&ty)
+            && !self.is_shared_class(&ty)
         {
             return !self.lacks_eq(&ty, &mut HashSet::new());
         }
@@ -1432,7 +1432,7 @@ impl Checker<'_> {
         }
         let a = self.subst.shallow(actual);
         if let Ty::Named(n, args) = &a
-            && n == REF
+            && n == SHARED
             && self.subst.unify(&args[0], expected)
         {
             self.ref_value_hint(expr);
@@ -1447,7 +1447,7 @@ impl Checker<'_> {
     }
 
     fn ref_value_hint(&mut self, e: &Expr) {
-        let mut d = Diagnostic::error(Code::ref_where_value_expected, e.span);
+        let mut d = Diagnostic::error(Code::shared_where_value_expected, e.span);
         d.detail = Some(format!("{}.value", self.operand_text(e)));
         self.diags.push(d);
     }
@@ -1731,7 +1731,7 @@ impl Checker<'_> {
                 .rposition(|s| s.contains_key(name))
                 .is_none_or(|i| i < base)
         });
-        // A write into a `Ref` or `ref class` it captured goes through the captured copy.
+        // A write into a `Shared` or `shared class` it captured goes through the captured copy.
         self.capture(name);
         let Some(var) = self.lookup_mut(name) else {
             let code = if name == "this" {
@@ -1766,10 +1766,10 @@ impl Checker<'_> {
             ExprKind::Field(base, name) if self.type_ref(base).is_none() => {
                 let (bt, base_err) = self.place(base);
                 let (bt, base_err) = match self.subst.shallow(&bt) {
-                    Ty::Named(n, mut a) if n == REF && name == "value" => {
+                    Ty::Named(n, mut a) if n == SHARED && name == "value" => {
                         return (a.remove(0), None);
                     }
-                    Ty::Named(n, mut a) if n == REF => (a.remove(0), None),
+                    Ty::Named(n, mut a) if n == SHARED => (a.remove(0), None),
                     bt => (bt, base_err),
                 };
                 match self.subst.shallow(&bt) {
@@ -1786,14 +1786,14 @@ impl Checker<'_> {
                                 let FieldInfo {
                                     ty,
                                     mutable,
-                                    is_ref,
+                                    is_shared,
                                     ..
                                 } = f;
                                 let err = if !mutable {
                                     Some(Code::assign_to_let)
                                 } else if f.readonly && !self.inside(&class) {
                                     Some(Code::readonly_field)
-                                } else if is_ref {
+                                } else if is_shared {
                                     None
                                 } else {
                                     base_err
@@ -1815,7 +1815,7 @@ impl Checker<'_> {
             ExprKind::Index(list, index) => {
                 let (lt, base_err) = self.place(list);
                 let (lt, base_err) = match self.subst.shallow(&lt) {
-                    Ty::Named(n, mut a) if n == REF => (a.remove(0), None),
+                    Ty::Named(n, mut a) if n == SHARED => (a.remove(0), None),
                     lt => (lt, base_err),
                 };
                 let (key, value) = match self.subst.shallow(&lt) {
@@ -1856,7 +1856,7 @@ impl Checker<'_> {
         Some(FieldInfo {
             ty,
             mutable: c.mutable[i],
-            is_ref: c.is_ref,
+            is_shared: c.is_shared,
             private: c.private[i],
             readonly: c.readonly[i],
         })
@@ -1942,7 +1942,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Whether `==` can't compare `ty`: it holds a `ref class`, interface or `T` that isn't `Eq`.
+    /// Whether `==` can't compare `ty`: it holds a `shared class`, interface or `T` that isn't `Eq`.
     fn lacks_eq(&mut self, ty: &Ty, seen: &mut HashSet<String>) -> bool {
         let ty = self.subst.shallow(ty);
         match &ty {
@@ -1952,11 +1952,11 @@ impl Checker<'_> {
             Ty::Named(name, args) if name == MAP || name == SET => {
                 args.iter().any(|a| self.lacks_eq(a, seen))
             }
-            Ty::Named(name, _) if name == REF => true,
+            Ty::Named(name, _) if name == SHARED => true,
             Ty::Func(..) => true,
             Ty::Record(_, fields) => fields.iter().any(|f| self.lacks_eq(f, seen)),
             Ty::Named(name, args) if seen.insert(Show(&self.resolve(&ty)).to_string()) => {
-                if self.is_ref_class(&ty) && !self.implements(&ty, &Ty::named(EQ)) {
+                if self.is_shared_class(&ty) && !self.implements(&ty, &Ty::named(EQ)) {
                     return true;
                 }
                 let fields = self.field_types(name, args);
@@ -1996,8 +1996,8 @@ impl Checker<'_> {
                 None => false,
             },
             Ty::Record(_, fields) => fields.iter().all(|f| self.is_key(f, seen)),
-            Ty::Named(name, _) if name == MAP || name == SET || name == REF => false,
-            Ty::Named(..) if self.is_interface(&ty) || self.is_ref_class(&ty) => false,
+            Ty::Named(name, _) if name == MAP || name == SET || name == SHARED => false,
+            Ty::Named(..) if self.is_interface(&ty) || self.is_shared_class(&ty) => false,
             Ty::Named(name, args) => {
                 if !seen.insert(Show(&self.resolve(&ty)).to_string()) {
                     return true;
@@ -2033,14 +2033,14 @@ impl Checker<'_> {
 
     fn unref(&self, ty: &Ty) -> Ty {
         match self.subst.shallow(ty) {
-            Ty::Named(n, a) if n == REF => self.subst.shallow(&a[0]),
+            Ty::Named(n, a) if n == SHARED => self.subst.shallow(&a[0]),
             t => t,
         }
     }
 
-    fn is_ref_class(&self, ty: &Ty) -> bool {
+    fn is_shared_class(&self, ty: &Ty) -> bool {
         matches!(self.subst.shallow(ty), Ty::Named(n, _)
-            if matches!(self.types.get(&n), Some(TypeDef::Class(c)) if c.is_ref))
+            if matches!(self.types.get(&n), Some(TypeDef::Class(c)) if c.is_shared))
     }
 
     fn bare_variant(&self, e: &Expr) -> bool {
@@ -2111,7 +2111,7 @@ impl Checker<'_> {
                     self.error(Code::slash_for_int, span);
                     return;
                 }
-                if matches!(self.subst.shallow(&ty), Ty::Named(n, _) if n == REF) {
+                if matches!(self.subst.shallow(&ty), Ty::Named(n, _) if n == SHARED) {
                     return;
                 }
                 result
@@ -2541,8 +2541,8 @@ impl Checker<'_> {
         }
         let bt = self.expr(base, None);
         let bt = match self.subst.shallow(&bt) {
-            Ty::Named(n, mut a) if n == REF && name == "value" => return a.remove(0),
-            Ty::Named(n, mut a) if n == REF => a.remove(0),
+            Ty::Named(n, mut a) if n == SHARED && name == "value" => return a.remove(0),
+            Ty::Named(n, mut a) if n == SHARED => a.remove(0),
             bt => bt,
         };
         match self.subst.shallow(&bt) {
@@ -2763,7 +2763,7 @@ impl Checker<'_> {
             return Ty::Error;
         }
         let inner = |t: &Ty| match t {
-            Ty::Named(n, args) if n == REF => Some(args[0].clone()),
+            Ty::Named(n, args) if n == SHARED => Some(args[0].clone()),
             _ => None,
         };
         match (inner(&a), inner(&b)) {
@@ -2967,7 +2967,7 @@ impl Checker<'_> {
             if self.funcs.contains_key(name) {
                 return self.call_named(name, args, span);
             }
-            if matches!(name.as_str(), "print" | "Some" | REF | "same") {
+            if matches!(name.as_str(), "print" | "Some" | SHARED | "same") {
                 self.no_ref_args(args);
             }
             match name.as_str() {
@@ -3001,20 +3001,20 @@ impl Checker<'_> {
                     self.args_of(args, span, &[Ty::list(item.clone())]);
                     return Ty::Named(SET.to_string(), vec![item]);
                 }
-                REF => {
+                SHARED => {
                     if args.len() != 1 {
                         return self.error(Code::wrong_arguments, span);
                     }
                     let inner = match expected.map(|e| self.subst.shallow(e)) {
-                        Some(Ty::Named(n, mut a)) if n == REF => a.remove(0),
+                        Some(Ty::Named(n, mut a)) if n == SHARED => a.remove(0),
                         _ => self.subst.fresh(),
                     };
                     let t = self.expr(&args[0].value, Some(&inner));
                     self.expect(&args[0].value, &t, &inner);
-                    if self.is_ref_class(&inner) {
-                        self.warn(Code::ref_of_ref_class, span);
+                    if self.is_shared_class(&inner) {
+                        self.warn(Code::shared_wraps_shared_class, span);
                     }
-                    return Ty::Named(REF.to_string(), vec![inner]);
+                    return Ty::Named(SHARED.to_string(), vec![inner]);
                 }
                 "same" => {
                     if args.len() != 2 {
@@ -3022,8 +3022,8 @@ impl Checker<'_> {
                     }
                     let a = self.expr(&args[0].value, None);
                     let b = self.expr(&args[1].value, None);
-                    let shared = self.is_ref_class(&a)
-                        || matches!(self.subst.shallow(&a), Ty::Named(n, _) if n == REF);
+                    let shared = self.is_shared_class(&a)
+                        || matches!(self.subst.shallow(&a), Ty::Named(n, _) if n == SHARED);
                     if !shared || !self.subst.unify(&a, &b) {
                         self.error(Code::type_mismatch, span);
                     }
@@ -4178,7 +4178,7 @@ impl Checker<'_> {
 
     fn for_ref(&mut self, id: NodeId, pattern: &Pattern, iter: &Expr, body: &Expr) -> Ty {
         let (t, err) = self.place(iter);
-        let shared = matches!(self.subst.shallow(&t), Ty::Named(n, _) if n == REF);
+        let shared = matches!(self.subst.shallow(&t), Ty::Named(n, _) if n == SHARED);
         if let Some(code) = err.filter(|_| !shared) {
             self.error(code, iter.span);
         }

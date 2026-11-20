@@ -123,7 +123,7 @@ impl Parser<'_> {
         self.is_kw("class")
             || self.is_kw("enum")
             || self.is_kw("implement")
-            || (self.is_soft("ref") && matches!(self.peek_at(1), Tok::Kw("class")))
+            || (self.is_soft("shared") && matches!(self.peek_at(1), Tok::Kw("class")))
     }
 
     fn field_name(&mut self) -> PResult<(String, Span)> {
@@ -286,7 +286,7 @@ impl Parser<'_> {
     fn private(&mut self) -> bool {
         let before_decl = match self.peek_at(1) {
             Tok::Kw("func" | "class" | "enum" | "interface" | "let" | "var" | "const") => true,
-            Tok::Ident(w) => matches!(w.as_str(), "ref" | "static" | "external"),
+            Tok::Ident(w) => matches!(w.as_str(), "shared" | "static" | "external"),
             _ => false,
         };
         let is_private = self.is_soft("private") && before_decl;
@@ -647,8 +647,8 @@ impl Parser<'_> {
 
     fn class_decl(&mut self) -> PResult<ClassDecl> {
         let start = self.span();
-        let is_ref = self.is_soft("ref");
-        if is_ref {
+        let is_shared = self.is_soft("shared");
+        if is_shared {
             self.advance();
         }
         self.advance();
@@ -691,7 +691,7 @@ impl Parser<'_> {
             is_private: false,
             name,
             span: start.to(self.prev_span()),
-            is_ref,
+            is_shared,
             type_params,
             interfaces,
             fields,

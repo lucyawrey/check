@@ -24,6 +24,6 @@ enum StoryLine {
   Input(key: String)
 }
 
-ref class Story(script: StoryLine[], var position = 0)
+shared class Story(script: StoryLine[], var position = 0)
 
 try main()
