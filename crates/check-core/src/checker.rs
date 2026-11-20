@@ -1419,12 +1419,36 @@ impl Checker<'_> {
             return;
         }
         let a = self.subst.shallow(actual);
+        if let Ty::Named(n, args) = &a
+            && n == REF
+            && self.subst.unify(&args[0], expected)
+        {
+            let mut d = Diagnostic::error(Code::ref_where_value_expected, expr.span);
+            d.detail = Some(format!("{}.value", self.operand_text(expr)));
+            self.diags.push(d);
+            return;
+        }
         let code = if matches!(a, Ty::Maybe(_)) {
             Code::unhandled_maybe
         } else {
             self.mismatch(&a, expected, Code::type_mismatch)
         };
         self.error(code, expr.span);
+    }
+
+    /// The source of `e` on one line, in parentheses unless a method call on it would bind to all of it.
+    fn operand_text(&self, e: &Expr) -> String {
+        let text = self.sources.text(e.span);
+        let text = text.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+        match e.kind {
+            ExprKind::Name(_)
+            | ExprKind::This
+            | ExprKind::Call(..)
+            | ExprKind::Method(..)
+            | ExprKind::Field(..)
+            | ExprKind::Index(..) => text,
+            _ => format!("({text})"),
+        }
     }
 
     fn mismatch(&self, actual: &Ty, expected: &Ty, otherwise: Code) -> Code {
@@ -2603,19 +2627,8 @@ impl Checker<'_> {
             (Fails::Result(_), Some(Fails::Maybe)) => (Code::try_result_in_maybe, "ok()"),
             (Fails::Maybe, Some(Fails::Result(_))) => (Code::try_maybe_in_result, "orErr(...)"),
         };
-        let text = self.sources.text(operand.span);
-        let text = text.lines().map(str::trim).collect::<Vec<_>>().join(" ");
-        let text = match operand.kind {
-            ExprKind::Name(_)
-            | ExprKind::This
-            | ExprKind::Call(..)
-            | ExprKind::Method(..)
-            | ExprKind::Field(..)
-            | ExprKind::Index(..) => text,
-            _ => format!("({text})"),
-        };
         let mut d = Diagnostic::error(code, span);
-        d.detail = Some(format!("try {text}.{fix}"));
+        d.detail = Some(format!("try {}.{fix}", self.operand_text(operand)));
         self.diags.push(d);
         false
     }
