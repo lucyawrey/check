@@ -1,0 +1,7 @@
+[package]
+name = "check-wasm-proto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wasm-encoder = "0.263.0"
