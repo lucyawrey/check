@@ -89,31 +89,30 @@ impl Record {
         }
     }
 
-    fn code(&self, always_parens: bool) -> String {
-        match self.code_with(always_parens, |v| Ok::<_, Infallible>(v.code())) {
-            Ok(text) => text,
-            Err(never) => match never {},
-        }
-    }
-
-    /// The record as code, with `field` giving each field's text.
-    pub fn code_with<E>(
+    /// Writes the record as code, with `field` writing each field's text.
+    pub fn write_with<E>(
         &self,
         always_parens: bool,
-        mut field: impl FnMut(&Value) -> Result<String, E>,
-    ) -> Result<String, E> {
+        out: &mut String,
+        mut field: impl FnMut(&Value, &mut String) -> Result<(), E>,
+    ) -> Result<(), E> {
+        out.push_str(&self.name);
         if self.fields.is_empty() && !always_parens {
-            return Ok(self.name.to_string());
+            return Ok(());
         }
-        let mut fields = Vec::with_capacity(self.fields.len());
+        out.push('(');
         for (i, v) in self.fields.iter().enumerate() {
-            let text = field(v)?;
-            fields.push(match &self.field_names {
-                Some(names) => format!("{} = {text}", names[i]),
-                None => text,
-            });
+            if i > 0 {
+                out.push_str(", ");
+            }
+            if let Some(names) = &self.field_names {
+                out.push_str(&names[i]);
+                out.push_str(" = ");
+            }
+            field(v, out)?;
         }
-        Ok(format!("{}({})", self.name, fields.join(", ")))
+        out.push(')');
+        Ok(())
     }
 
     pub fn unnamed(field_names: Option<Rc<[Rc<str>]>>, fields: Vec<Value>) -> Record {
@@ -265,58 +264,91 @@ impl Value {
     }
 
     pub fn code(&self) -> String {
-        crate::interp::grow(|| self.code_inner())
+        let mut out = String::new();
+        self.write_code(&mut out);
+        out
     }
 
-    fn code_inner(&self) -> String {
-        match self {
-            Value::Int(n) => n.to_string(),
-            Value::Float(f) => float_text(*f),
-            Value::Bool(b) => b.to_string(),
-            Value::Str(s) => quote(s),
-            Value::List(items) => format!(
-                "[{}]",
-                items.iter().map(Value::code).collect::<Vec<_>>().join(", ")
-            ),
-            Value::Map(entries) => map_code(entries.iter().map(|(k, v)| (k.code(), v.code()))),
-            Value::Set(items) => format!(
-                "Set([{}])",
-                items.iter().map(Value::code).collect::<Vec<_>>().join(", ")
-            ),
-            Value::Some(v) => match &**v {
-                Value::Void => "Some()".to_string(),
-                inner => format!("Some({})", inner.code()),
-            },
-            Value::None => "None".to_string(),
+    /// Writes the value as code into `out`; nested values write into the same buffer, so deep
+    /// values take time in proportion to their size.
+    pub fn write_code(&self, out: &mut String) {
+        let field = |v: &Value, out: &mut String| {
+            v.write_code(out);
+            Ok::<_, Infallible>(())
+        };
+        let done = crate::interp::grow(|| match self {
+            Value::Int(n) => Ok(out.push_str(&n.to_string())),
+            Value::Float(f) => Ok(out.push_str(&float_text(*f))),
+            Value::Bool(b) => Ok(out.push_str(&b.to_string())),
+            Value::Str(s) => Ok(out.push_str(&quote(s))),
+            Value::List(items) => write_items(out, "[", items.iter(), "]", field),
+            Value::Map(entries) => write_map(out, entries.iter(), field),
+            Value::Set(items) => write_items(out, "Set([", items.iter(), "])", field),
+            Value::Some(v) => write_items(out, "Some(", [&**v].into_iter(), ")", field),
+            Value::None => Ok(out.push_str("None")),
             Value::Range(a, b, inclusive) => {
-                format!("{a}..{}{b}", if *inclusive { "=" } else { "" })
+                let eq = if *inclusive { "=" } else { "" };
+                Ok(out.push_str(&format!("{a}..{eq}{b}")))
             }
             Value::Func(f) => match &**f {
-                Callable::Named(_, sig) | Callable::Lambda { sig, .. } => sig.clone(),
+                Callable::Named(_, sig) | Callable::Lambda { sig, .. } => Ok(out.push_str(sig)),
             },
-            Value::Object(r) => r.code(true),
+            Value::Object(r) | Value::Record(r) => r.write_with(true, out, field),
             Value::Shared(r) => match r.try_borrow_mut() {
-                Ok(record) => record.code(true),
-                Err(_) => "...".to_string(),
+                Ok(record) => record.write_with(true, out, field),
+                Err(_) => Ok(out.push_str("...")),
             },
             Value::Ref(v) => match v.try_borrow_mut() {
-                Ok(v) => format!("Ref({})", v.code()),
-                Err(_) => "Ref(...)".to_string(),
+                Ok(v) => write_items(out, "Ref(", [&*v].into_iter(), ")", field),
+                Err(_) => Ok(out.push_str("Ref(...)")),
             },
-            Value::Variant(r) => r.code(false),
-            Value::Record(r) => r.code(true),
-            Value::Void => String::new(),
-        }
+            Value::Variant(r) => r.write_with(false, out, field),
+            Value::Void => Ok(()),
+        });
+        let Ok(()) = done;
     }
 }
 
-pub fn map_code(entries: impl Iterator<Item = (String, String)>) -> String {
-    let parts: Vec<String> = entries.map(|(k, v)| format!("{k} = {v}")).collect();
-    if parts.is_empty() {
-        "[=]".to_string()
-    } else {
-        format!("[{}]", parts.join(", "))
+/// Writes `items` between `open` and `close`, separated by commas, with `item` writing each.
+pub fn write_items<'v, E>(
+    out: &mut String,
+    open: &str,
+    items: impl Iterator<Item = &'v Value>,
+    close: &str,
+    mut item: impl FnMut(&Value, &mut String) -> Result<(), E>,
+) -> Result<(), E> {
+    out.push_str(open);
+    for (i, v) in items.enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        item(v, out)?;
     }
+    out.push_str(close);
+    Ok(())
+}
+
+/// Writes a map literal, `[=]` when it's empty, with `item` writing each key and value.
+pub fn write_map<'v, E>(
+    out: &mut String,
+    entries: impl ExactSizeIterator<Item = (&'v Value, &'v Value)>,
+    mut item: impl FnMut(&Value, &mut String) -> Result<(), E>,
+) -> Result<(), E> {
+    if entries.len() == 0 {
+        out.push_str("[=]");
+        return Ok(());
+    }
+    out.push('[');
+    for (i, (k, v)) in entries.enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        item(k, out)?;
+        out.push_str(" = ");
+        item(v, out)?;
+    }
+    out.push(']');
+    Ok(())
 }
 
 pub fn float_text(f: f64) -> String {

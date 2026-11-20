@@ -10,7 +10,7 @@ use crate::diag::{Code, Span};
 use crate::host::{self, Io};
 use indexmap::{IndexMap, IndexSet};
 
-use crate::value::{Callable, Record, Value, map_code};
+use crate::value::{Callable, Record, Value, write_items, write_map};
 
 pub struct Panic {
     pub code: Code,
@@ -491,65 +491,77 @@ impl Interpreter<'_> {
         self.funcs[key].clone()
     }
 
-    fn texts(&mut self, items: &[Value], span: Span) -> Result<String, Flow> {
-        let mut parts = Vec::with_capacity(items.len());
-        for item in items {
-            parts.push(self.text(item, true, span)?);
-        }
-        Ok(parts.join(", "))
-    }
-
     /// How `print` and interpolation show a value, through `toString()` where it's `Printable`.
     fn text(&mut self, v: &Value, quoted: bool, span: Span) -> Result<String, Flow> {
-        grow(|| self.text_inner(v, quoted, span))
+        let mut out = String::new();
+        self.write_text(v, quoted, span, &mut out)?;
+        Ok(out)
     }
 
-    fn text_inner(&mut self, v: &Value, quoted: bool, span: Span) -> Result<String, Flow> {
+    /// Writes [`Interpreter::text`] into `out`, so nested values share one buffer.
+    fn write_text(
+        &mut self,
+        v: &Value,
+        quoted: bool,
+        span: Span,
+        out: &mut String,
+    ) -> Result<(), Flow> {
+        grow(|| self.write_text_inner(v, quoted, span, out))
+    }
+
+    fn write_text_inner(
+        &mut self,
+        v: &Value,
+        quoted: bool,
+        span: Span,
+        out: &mut String,
+    ) -> Result<(), Flow> {
         if self.implements(&v.tag(), PRINTABLE) {
             let decl = self.find_method(v, "toString");
-            return Ok(self
+            let text = self
                 .run_decl(&decl, Vec::new(), Some(v.clone()), span, &[])?
-                .0
-                .display());
+                .0;
+            out.push_str(&text.display());
+            return Ok(());
         }
-        Ok(match v {
-            Value::List(items) => format!("[{}]", self.texts(items, span)?),
-            Value::Set(items) => {
-                let items: Vec<Value> = items.iter().cloned().collect();
-                format!("Set([{}])", self.texts(&items, span)?)
-            }
-            Value::Map(entries) => {
-                let mut parts = Vec::with_capacity(entries.len());
-                for (k, v) in entries.iter() {
-                    parts.push((self.text(k, true, span)?, self.text(v, true, span)?));
-                }
-                map_code(parts.into_iter())
-            }
+        let field = |f: &Value, out: &mut String| self.write_text(f, true, span, out);
+        match v {
+            Value::List(items) => write_items(out, "[", items.iter(), "]", field),
+            Value::Set(items) => write_items(out, "Set([", items.iter(), "])", field),
+            Value::Map(entries) => write_map(out, entries.iter(), field),
             Value::Some(inner) if !matches!(**inner, Value::Void) => {
-                format!("Some({})", self.text(inner, true, span)?)
+                write_items(out, "Some(", [&**inner].into_iter(), ")", field)
             }
-            Value::Object(r) | Value::Record(r) => {
-                r.code_with(true, |f| self.text(f, true, span))?
-            }
-            Value::Variant(r) => r.code_with(false, |f| self.text(f, true, span))?,
+            Value::Object(r) | Value::Record(r) => r.write_with(true, out, field),
+            Value::Variant(r) => r.write_with(false, out, field),
             Value::Shared(r) => {
                 let address = Rc::as_ptr(r) as usize;
                 if self.printing.contains(&address) {
-                    return Ok("...".to_string());
+                    out.push_str("...");
+                    return Ok(());
                 }
+                // A copy, so `toString()` on a field can change this object while it's printed.
                 let record = r.borrow().clone();
                 self.printing.push(address);
-                let text = record.code_with(true, |f| self.text(f, true, span));
+                let done =
+                    record.write_with(true, out, |f, out| self.write_text(f, true, span, out));
                 self.printing.pop();
-                text?
+                done
             }
             Value::Ref(r) => {
+                // A copy, as for `Shared`: printing can run code that changes it.
                 let inner = r.borrow().clone();
-                format!("Ref({})", self.text(&inner, true, span)?)
+                write_items(out, "Ref(", [&inner].into_iter(), ")", field)
             }
-            Value::Str(_) if !quoted => v.display(),
-            _ => v.code(),
-        })
+            Value::Str(_) if !quoted => {
+                out.push_str(&v.display());
+                Ok(())
+            }
+            _ => {
+                v.write_code(out);
+                Ok(())
+            }
+        }
     }
 
     fn construct(&mut self, class_name: &str, args: &[Arg], span: Span) -> Eval {
