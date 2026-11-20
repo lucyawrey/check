@@ -387,7 +387,12 @@ impl Parser<'_> {
         {
             return self.let_pattern();
         }
-        if self.is_kw("let") || self.is_kw("var") {
+        if self.is_kw("let")
+            || self.is_kw("var")
+            || (self.is_soft("shared")
+                && matches!(self.peek_at(1), Tok::Ident(_))
+                && matches!(self.peek_at(2), Tok::Sym("=" | ":")))
+        {
             return self.let_stmt();
         }
         if self.is_kw("func") && matches!(self.peek_at(1), Tok::Ident(_)) {
@@ -424,7 +429,8 @@ impl Parser<'_> {
     }
 
     fn let_stmt(&mut self) -> PResult<Stmt> {
-        let is_var = self.is_kw("var");
+        let is_shared = self.is_soft("shared");
+        let is_var = is_shared || self.is_kw("var");
         let keyword = self.advance().span;
         let (name, span) = self.ident()?;
         let ty = if self.eat_sym(":") {
@@ -440,6 +446,7 @@ impl Parser<'_> {
             name,
             span,
             is_var,
+            is_shared,
             ty,
             value,
         })
@@ -710,14 +717,17 @@ impl Parser<'_> {
         })
     }
 
-    /// A `let` or `var` field in a class or interface body.
+    /// A `let`, `var` or `shared` field in a class or interface body.
     fn body_field(&mut self) -> PResult<Param> {
         let (is_private, is_readonly) = self.field_modifiers()?;
+        let is_shared = self.soft_before_name("shared");
         let is_var = self.is_kw("var");
-        if !is_var && !self.is_kw("let") {
-            return self.error(Code::unexpected_token, self.span());
+        if !is_shared {
+            if !is_var && !self.is_kw("let") {
+                return self.error(Code::unexpected_token, self.span());
+            }
+            self.advance();
         }
-        self.advance();
         let (name, span) = self.field_name()?;
         let ty = if self.eat_sym(":") {
             Some(self.type_expr()?)
@@ -737,6 +747,7 @@ impl Parser<'_> {
             is_var,
             is_rest: false,
             is_ref: false,
+            is_shared,
             is_private,
             is_readonly,
         })
@@ -1160,6 +1171,7 @@ impl Parser<'_> {
                 p.remove_token(Code::let_in_class_header);
             }
             let is_ref = allow_ref && p.soft_before_name("ref");
+            let is_shared = !is_ref && p.soft_before_name("shared");
             let is_var = p.eat_kw("var");
             let is_rest = p.eat_sym("...");
             let (name, span) = p.ident()?;
@@ -1181,6 +1193,7 @@ impl Parser<'_> {
                 is_var,
                 is_rest,
                 is_ref,
+                is_shared,
                 is_private,
                 is_readonly,
             });
@@ -1506,6 +1519,9 @@ impl Parser<'_> {
     }
 
     fn unary(&mut self) -> PResult<Expr> {
+        if let Some(e) = self.shared_of()? {
+            return Ok(e);
+        }
         let op = match self.peek() {
             Tok::Sym("-") => UnOp::Neg,
             Tok::Sym("~") => UnOp::BitNot,
@@ -1526,6 +1542,19 @@ impl Parser<'_> {
             start.to(operand.span),
             ExprKind::Unary(op, Box::new(operand)),
         ))
+    }
+
+    /// `shared x` or `shared a.field`, when `shared` comes before a name on the same line.
+    fn shared_of(&mut self) -> PResult<Option<Expr>> {
+        if !(self.is_soft("shared") && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Kw("this"))) {
+            return Ok(None);
+        }
+        let start = self.advance().span;
+        let operand = self.postfix()?;
+        Ok(Some(self.expr_node(
+            start.to(operand.span),
+            ExprKind::SharedOf(Box::new(operand)),
+        )))
     }
 
     fn power(&mut self) -> PResult<Expr> {

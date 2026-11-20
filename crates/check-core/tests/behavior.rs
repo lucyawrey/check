@@ -2656,9 +2656,10 @@ fn a_shared_where_its_value_is_expected_suggests_value() {
         )
     );
     for (src, value) in [
-        ("print(r + 1)", "r.value"),
-        ("print(1 < r)", "r.value"),
-        ("var v = r\nv += 1", "v.value"),
+        ("print(r + 1)", "r.value [or declare it with shared]"),
+        ("print(1 < r)", "r.value [or declare it with shared]"),
+        ("var v = r\nv += 1", "v.value [or declare it with shared]"),
+        ("func f(p: Shared<Int>) -> Int { p + 1 }", "p.value"),
     ] {
         let src = format!("let r = Shared(1)\n{src}");
         assert_eq!(
@@ -2925,6 +2926,57 @@ fn a_changed_copy_of_a_plain_path_offers_a_ref_binding() {
 }
 
 const COPIES: &str = "class P {\n  var n: Int\n  func bump() { this.n += 1 }\n  func doubled() -> Int { this.n * 2 }\n}\nclass Box(var p: P)\nvar ps = [P(1)]\nvar box = Box(P(1))\nprint(ps)\nbox = Box(P(2))\nps = []\n";
+
+#[test]
+fn a_lambda_shares_a_shared_local() {
+    let src = "shared clicks = 0\nlet click = func() { clicks += 1 }\nclick()\nclicks += 10\nclick()\nprint(clicks)\n\
+        func pair() -> (func(), func() -> Int) {\n  shared n: Int = 0\n  (func() { n += 1 }, func() -> Int { n })\n}\n\
+        let (bump, read) = pair()\nbump()\nbump()\nprint(read())";
+    assert_eq!(output(src), "12\n2");
+}
+
+#[test]
+fn a_shared_parameter_shares_the_callers_box() {
+    let src = "func track(shared total: Int) { total += 1 }\nfunc show(n: Int) -> Int { n }\n\
+        shared clicks = 0\ntrack(shared clicks)\nlet box = Shared(5)\ntrack(box)\n\
+        func setNine(ref x: Int) { x = 9 }\nshared other = 0\nsetNine(ref other)\n\
+        print(\"{clicks} {box} {show(clicks)} {other}\")";
+    assert_eq!(output(src), "1 Shared(6) 1 9");
+    let missing = "func track(shared total: Int) { total += 1 }\nshared clicks = 0\ntrack(clicks)";
+    assert_eq!(first_error(missing), "missing_shared");
+    assert_eq!(first_error("let m = 1\nlet s = shared m"), "not_shared");
+}
+
+#[test]
+fn a_shared_field_is_shared_by_the_objects_given_its_box() {
+    let src = "class Button(label: String, shared presses: Int)\nshared clicks = 0\n\
+        let a = Button(\"A\", presses = shared clicks)\nlet b = Button(\"B\", presses = shared clicks)\n\
+        let c = Button(\"C\", presses = 0)\na.presses += 2\nc.presses += 5\nlet copy = c\ncopy.presses += 1\n\
+        print(\"{b.presses} {clicks} {c} {a == Button(\"A\", presses = 2)}\")";
+    assert_eq!(output(src), "2 2 Button(label = \"C\", presses = 6) true");
+}
+
+#[test]
+fn a_class_with_a_shared_field_cant_be_a_key() {
+    assert_eq!(
+        first_error("class B(shared n: Int)\nlet m: Map<B, Int> = [=]"),
+        "invalid_key_type"
+    );
+}
+
+#[test]
+fn value_on_a_shared_name_offers_to_drop_it() {
+    assert_eq!(first_error_fix("shared n = 0\nprint(n.value)"), [""]);
+}
+
+#[test]
+fn shared_still_names_variables() {
+    assert_eq!(
+        output("let shared = 2\nprint(shared + 1)\nfunc f(x: Int) -> Int { x }\nprint(f(shared))"),
+        "3\n2"
+    );
+    assert_eq!(output("let ref = 1\nlet shared = ref\nprint(shared)"), "1");
+}
 
 #[test]
 fn a_ref_parameter_of_a_shared_class_is_a_warning() {

@@ -698,7 +698,10 @@ impl Resolver<'_> {
                 self.expr(callee);
                 self.args(args);
             }
-            ExprKind::Spread(x) | ExprKind::Unary(_, x) | ExprKind::Loop(x) => self.expr(x),
+            ExprKind::Spread(x)
+            | ExprKind::SharedOf(x)
+            | ExprKind::Unary(_, x)
+            | ExprKind::Loop(x) => self.expr(x),
             ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
                 self.expr(a);
                 self.expr(b);

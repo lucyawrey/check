@@ -269,6 +269,9 @@ fn result_variant(name: &str, value: Value) -> Value {
 }
 
 fn descend<'s>(v: &mut Value, steps: &'s [Step], f: Writer) -> Descent<'s> {
+    if let Value::Cell(rc) = v {
+        return Ok(Some((Holder::Value(rc.clone()), steps)));
+    }
     let Some((step, rest)) = steps.split_first() else {
         f(v)?;
         return Ok(None);
@@ -324,6 +327,25 @@ fn through_ref<R>(slot: &mut Value, f: impl FnOnce(&mut Value) -> R) -> R {
     }
 }
 
+fn uncell(v: Value) -> Value {
+    match v {
+        Value::Cell(v) => v.borrow().clone(),
+        v => v,
+    }
+}
+
+fn share_new(v: Value) -> Value {
+    Value::Cell(Rc::new(RefCell::new(v)))
+}
+
+/// A box for a `shared` parameter or field: the one a `Shared` value holds, else a new one.
+fn share(v: Value) -> Value {
+    match v {
+        Value::SharedBox(rc) => Value::Cell(rc),
+        v => share_new(v),
+    }
+}
+
 fn deref(v: Value) -> Value {
     match v {
         Value::SharedBox(v) => v.borrow().clone(),
@@ -331,7 +353,12 @@ fn deref(v: Value) -> Value {
     }
 }
 
+/// A field's value, read through the box of a `shared` field.
 fn field(v: &Value, name: &str, span: Span) -> Eval {
+    raw_field(v, name, span).map(uncell)
+}
+
+fn raw_field(v: &Value, name: &str, span: Span) -> Eval {
     let found = match v {
         Value::Object(r) | Value::Record(r) => r.index(name).map(|i| r.fields[i].clone()),
         Value::Shared(r) => {
@@ -567,6 +594,10 @@ impl Interpreter<'_> {
                 let inner = r.borrow().clone();
                 write_items(out, "Shared(", [&inner].into_iter(), ")", field)
             }
+            Value::Cell(r) => {
+                let inner = r.borrow().clone();
+                self.write_text(&inner, quoted, span, out)
+            }
             Value::Str(_) if !quoted => {
                 out.push_str(&v.display());
                 Ok(())
@@ -580,7 +611,12 @@ impl Interpreter<'_> {
 
     fn construct(&mut self, class_name: &str, args: &[Arg], span: Span) -> Eval {
         let class = self.classes[class_name].clone();
-        let (fields, _) = self.bind_args(&class.fields, args)?;
+        let (mut fields, _) = self.bind_args(&class.fields, args)?;
+        for (value, f) in fields.iter_mut().zip(&class.fields) {
+            if f.is_shared {
+                *value = share(std::mem::replace(value, Value::Void));
+            }
+        }
         let record = Record {
             name: class_name.into(),
             ty: class_name.into(),
@@ -621,7 +657,11 @@ impl Interpreter<'_> {
                     change.value.span,
                 );
             };
-            record.fields[i] = value;
+            let class = self.classes.get(&*record.name);
+            record.fields[i] = match class.is_some_and(|c| c.fields[i].is_shared) {
+                true => share(value),
+                false => value,
+            };
         }
         let class = self.classes.get(&*record.name).cloned();
         copy = match &copy {
@@ -844,9 +884,14 @@ impl Interpreter<'_> {
 
     fn stmt(&mut self, stmt: &Stmt) -> Eval {
         match stmt {
-            Stmt::Let { name, value, .. } => {
+            Stmt::Let {
+                name,
+                value,
+                is_shared,
+                ..
+            } => {
                 let v = self.scoped(|i| i.expr(value))?;
-                self.define(name, v);
+                self.define(name, if *is_shared { share_new(v) } else { v });
                 Ok(Value::Void)
             }
             Stmt::Assign {
@@ -1019,9 +1064,20 @@ impl Interpreter<'_> {
                 Ok(Value::Str(out.into()))
             }
             ExprKind::Name(name) => match self.lookup(name) {
-                Some(v) => Ok(v),
+                Some(v) => Ok(uncell(v)),
                 None => internal(&format!("no variable `{name}`"), expr.span),
             },
+            ExprKind::SharedOf(x) => {
+                let cell = match &x.kind {
+                    ExprKind::Field(base, name) => raw_field(&self.expr(base)?, name, x.span)?,
+                    ExprKind::Name(name) => self.lookup(name).unwrap_or(Value::Void),
+                    _ => Value::Void,
+                };
+                match cell {
+                    Value::Cell(rc) => Ok(Value::SharedBox(rc)),
+                    _ => internal("`shared` of something without a box", x.span),
+                }
+            }
             ExprKind::This => match self.lookup("this") {
                 Some(v) => Ok(v),
                 None => internal("no `this`", expr.span),
@@ -1503,8 +1559,8 @@ impl Interpreter<'_> {
         let mut scope: HashMap<String, Value> = decl
             .params
             .iter()
-            .map(|p| p.name.clone())
             .zip(values)
+            .map(|(p, v)| (p.name.clone(), if p.is_shared { share(v) } else { v }))
             .collect();
         if let Some(this) = this {
             scope.insert("this".to_string(), this);

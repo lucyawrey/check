@@ -22,6 +22,8 @@ pub struct Param {
     pub is_var: bool,
     pub is_rest: bool,
     pub is_ref: bool,
+    /// A `shared` parameter or field: the value is held in a box that copies share.
+    pub is_shared: bool,
     pub is_private: bool,
     pub is_readonly: bool,
 }
@@ -180,11 +182,13 @@ pub struct Arm {
 pub enum Stmt {
     Let {
         id: NodeId,
-        /// The `let` or `var` keyword.
+        /// The `let`, `var` or `shared` keyword.
         keyword: Span,
         name: String,
         span: Span,
         is_var: bool,
+        /// `shared name = value`: the value is held in a box that lambdas capture.
+        is_shared: bool,
         ty: Option<TypeExpr>,
         value: Expr,
     },
@@ -284,6 +288,8 @@ pub enum ExprKind {
     Map(Vec<(Expr, Expr)>),
     Record(Vec<Arg>),
     Spread(Box<Expr>),
+    /// `shared x`: the box behind a shared local, parameter or field.
+    SharedOf(Box<Expr>),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Arg>),

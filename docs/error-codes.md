@@ -61,6 +61,8 @@
 - `assign_to_parameter` assigning to a parameter not written `var`
 - `change_let_collection` changing a `let` list, map or set (`push`, `pop`, `removeAt`, `add`, `remove`)
 - `changes_let` calling a method that changes its value on a `let`, a parameter or a temporary (`k.bump()`)
+- `missing_shared` a plain value for a `shared` parameter (pass `shared x` or a `Shared<T>`)
+- `not_shared` `shared` before something that isn't a shared local, parameter or field
 - `ref_binding_overlap` using what a `ref` binding points to, other than through it, before the binding's last use
 - `ref_binding_captured` a lambda capturing a `ref` binding
 - `invalid_key_type` a map key or set item whose type has no exact equality (`Float`, a function, a collection, a `shared class` or anything holding one)
