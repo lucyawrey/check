@@ -64,23 +64,24 @@ fn load() -> HashMap<String, String> {
     let ExprKind::Record(lines) = file.value.kind else {
         panic!("copy.con isn't a list of `key = \"text\"` lines");
     };
-    lines
-        .into_iter()
-        .map(|line| {
-            let key = line.name.expect("each line in copy.con has a key");
-            let ExprKind::Str(segments) = line.value.kind else {
-                panic!("`{key}` in copy.con isn't a string");
-            };
-            let text = segments
-                .into_iter()
-                .map(|s| match s {
-                    StrSeg::Text(t) => t,
-                    StrSeg::Expr(_) => unreachable!("pure data has no interpolation"),
-                })
-                .collect();
-            (key, text)
-        })
-        .collect()
+    let mut copy = HashMap::new();
+    for line in lines {
+        let key = line.name.expect("each line in copy.con has a key");
+        let ExprKind::Str(segments) = line.value.kind else {
+            panic!("`{key}` in copy.con isn't a string");
+        };
+        let text = segments
+            .into_iter()
+            .map(|s| match s {
+                StrSeg::Text(t) => t,
+                StrSeg::Expr(_) => unreachable!("pure data has no interpolation"),
+            })
+            .collect();
+        if copy.insert(key.clone(), text).is_some() {
+            panic!("copy.con has `{key}` twice");
+        }
+    }
+    copy
 }
 
 #[cfg(test)]
