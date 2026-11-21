@@ -51,9 +51,7 @@
 - `try_error_mismatch` `try` on a `Result` whose error type differs from the function's
 - `assign_to_let` assigning to a `let`
 - `assign_to_captured` assigning to or changing a variable from outside a lambda inside it, top-level `var`s included, since a lambda keeps a copy of what it captures
-- `missing_ref` an argument for a `ref` parameter written without `ref` (quick fix: add it)
-- `ref_not_allowed` `ref` on an argument whose parameter isn't `ref`
-- `overlapping_ref` a `ref` argument that overlaps another argument of the same call (`swap(ref a, ref a)`)
+- `overlapping_ref` a `ref` argument that overlaps another argument of the same call (`swap(a, a)`)
 - `ref_default` a `ref` parameter with a default (a `ref` rest parameter doesn't parse)
 - `ref_func_as_value` a function with `ref` parameters used as a value, which would drop the write-back
 - `shared_where_value_expected` a `Shared<T>` where a `T` is expected (suggests `r.value`)

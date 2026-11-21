@@ -249,6 +249,6 @@ fn the_loaders_style_fixes_wait_too() {
 
 #[test]
 fn never_applies_a_quick_fix_only_fix() {
-    let src = "func setNine(ref a: Int) { a = 9 }\nvar x = 1\nsetNine(x)\nprint(x)";
+    let src = "shared n = 1\nprint(n.value)";
     assert_eq!(tidied(src), src);
 }

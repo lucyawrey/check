@@ -1067,17 +1067,7 @@ impl Interpreter<'_> {
                 Some(v) => Ok(uncell(v)),
                 None => internal(&format!("no variable `{name}`"), expr.span),
             },
-            ExprKind::SharedOf(x) => {
-                let cell = match &x.kind {
-                    ExprKind::Field(base, name) => raw_field(&self.expr(base)?, name, x.span)?,
-                    ExprKind::Name(name) => self.lookup(name).unwrap_or(Value::Void),
-                    _ => Value::Void,
-                };
-                match cell {
-                    Value::Cell(rc) => Ok(Value::SharedBox(rc)),
-                    _ => internal("`shared` of something without a box", x.span),
-                }
-            }
+            ExprKind::SharedOf(x) => self.shared_of(x),
             ExprKind::This => match self.lookup("this") {
                 Some(v) => Ok(v),
                 None => internal("no `this`", expr.span),
@@ -1413,15 +1403,31 @@ impl Interpreter<'_> {
             .collect())
     }
 
+    fn shared_of(&mut self, x: &Expr) -> Eval {
+        let cell = match &x.kind {
+            ExprKind::Field(base, name) => raw_field(&self.expr(base)?, name, x.span)?,
+            ExprKind::Name(name) => self.lookup(name).unwrap_or(Value::Void),
+            _ => Value::Void,
+        };
+        match cell {
+            Value::Cell(rc) => Ok(Value::SharedBox(rc)),
+            _ => internal("`shared` of something without a box", x.span),
+        }
+    }
+
     fn spread_args(&mut self, args: &[Arg]) -> Result<Vec<ArgValue>, Flow> {
         let mut out = Vec::new();
         for arg in args {
             let name = arg.name.as_deref().map(Rc::from);
-            if arg.is_ref {
+            if self.info.ref_args.contains_key(&arg.value.id) {
                 let mut steps = Vec::new();
                 let mut root = self.path(&arg.value, &mut steps)?;
                 let value = self.read_steps(&mut root, &steps)?;
                 out.push((name, value, Some((root, steps))));
+                continue;
+            }
+            if self.info.shared_args.contains_key(&arg.value.id) {
+                out.push((name, self.shared_of(&arg.value)?, None));
                 continue;
             }
             let ExprKind::Spread(inner) = &arg.value.kind else {

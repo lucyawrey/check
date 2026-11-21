@@ -265,7 +265,6 @@ pub enum StrSeg {
 pub struct Arg {
     pub name: Option<String>,
     pub value: Expr,
-    pub is_ref: bool,
 }
 
 #[derive(Debug, Clone)]

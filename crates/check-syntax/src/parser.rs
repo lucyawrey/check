@@ -240,7 +240,6 @@ impl Parser<'_> {
             args.push(Arg {
                 name: Some(name),
                 value: self.expr()?,
-                is_ref: false,
             });
             self.end_statement(false);
             self.skip_newlines();
@@ -1577,19 +1576,14 @@ impl Parser<'_> {
                 }
                 _ => None,
             };
-            let is_ref = p.soft_before_name("ref");
             let start = p.span();
-            let value = if name.is_none() && !is_ref && p.eat_sym("...") {
+            let value = if name.is_none() && p.eat_sym("...") {
                 let inner = p.expr()?;
                 p.expr_node(start.to(inner.span), ExprKind::Spread(Box::new(inner)))
             } else {
                 p.expr()?
             };
-            args.push(Arg {
-                name,
-                value,
-                is_ref,
-            });
+            args.push(Arg { name, value });
             Ok(())
         })?;
         Ok(args)

@@ -41,6 +41,10 @@ pub struct Info {
     pub ref_ends: HashMap<NodeId, usize>,
     /// Methods whose body changes `this`, so calls write it back, with where the body starts.
     pub changes_this: HashMap<String, Span>,
+    /// Arguments passed to a `ref` parameter, which the call writes back.
+    pub ref_args: HashMap<NodeId, Span>,
+    /// Shared names passed to a `shared` parameter or field, which pass their box.
+    pub shared_args: HashMap<NodeId, Span>,
 }
 
 #[derive(Clone)]
@@ -143,7 +147,7 @@ type Binding = (String, Span, Ty, bool);
 type OwnMethod = (String, Vec<(Sig, HashMap<String, Ty>)>);
 
 enum ArgSource<'a> {
-    Expr(&'a Expr, bool),
+    Expr(&'a Expr),
     Spread(Ty, Span),
 }
 
@@ -230,6 +234,11 @@ pub struct Checker<'s> {
     /// Collection and key names whose index can't miss, and the innermost scope they
     /// may come from, so a shadowing name isn't narrowed.
     narrowed: Vec<(String, String, usize)>,
+    /// Names of functions and methods with a `ref` parameter, for checks that run before calls
+    /// are resolved.
+    ref_callees: HashSet<String>,
+    /// Field reads of a `shared` field.
+    boxed_fields: HashSet<NodeId>,
     top_level_names: HashSet<String>,
     lambda_types: Vec<(NodeId, Ty)>,
     type_names: HashSet<String>,
@@ -291,6 +300,8 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         loops: Vec::new(),
         lambdas: Vec::new(),
         narrowed: Vec::new(),
+        ref_callees: HashSet::new(),
+        boxed_fields: HashSet::new(),
         top_level_names: HashSet::new(),
         lambda_types: Vec::new(),
         type_names: HashSet::new(),
@@ -398,6 +409,10 @@ impl Checker<'_> {
         }
         self.current_type = None;
         let interface_methods = self.check_signatures(own_methods);
+        self.ref_callees = (self.funcs.iter())
+            .filter(|(_, f)| f.sig.params.iter().any(|p| p.is_ref))
+            .map(|(key, _)| key.rsplit('.').next().unwrap_or(key).to_string())
+            .collect();
         for (i, stmt) in program.iter().enumerate() {
             self.ref_binding(stmt, &program[i + 1..]);
             self.stmt(stmt);
@@ -1918,28 +1933,23 @@ impl Checker<'_> {
 
     /// `shared x`: the box behind a shared local, parameter or field.
     fn shared_of(&mut self, x: &Expr) -> Ty {
-        let boxed = match &x.kind {
-            ExprKind::Name(n) => self.lookup(n).is_some_and(|v| v.kind == VarKind::Shared),
-            ExprKind::Field(base, name) => {
-                let bt = self.expr(base, None);
-                match self.unref(&bt) {
-                    Ty::Named(class, args) => self
-                        .visible_field(&class, &args, name, x.span)
-                        .is_some_and(|f| f.boxed),
-                    _ => false,
-                }
-            }
-            _ => false,
-        };
-        if !boxed {
-            self.expr(x, None);
-            return self.error(Code::not_shared, x.span);
-        }
         let t = match &x.kind {
             ExprKind::Name(n) => self.name(x.id, n, x.span, None),
             _ => self.expr(x, None),
         };
+        if !self.is_boxed(x) {
+            return self.error(Code::not_shared, x.span);
+        }
         Ty::Named(SHARED.to_string(), vec![t])
+    }
+
+    /// A shared local, parameter or field, already checked as an expression.
+    fn is_boxed(&self, x: &Expr) -> bool {
+        match &x.kind {
+            ExprKind::Name(n) => self.lookup(n).is_some_and(|v| v.kind == VarKind::Shared),
+            ExprKind::Field(..) => self.boxed_fields.contains(&x.id),
+            _ => false,
+        }
     }
 
     fn changing_method(&mut self, ty: &Ty, name: &str) -> bool {
@@ -2504,12 +2514,14 @@ impl Checker<'_> {
             ExprKind::Unary(op, operand) => self.unary(*op, operand, expr.span),
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expr.span),
             ExprKind::Call(callee, args) => {
+                let ty = self.call(expr.id, callee, args, expr.span, expected);
                 self.check_overlap(None, args);
-                self.call(expr.id, callee, args, expr.span, expected)
+                ty
             }
             ExprKind::Method(recv, name, args) => {
+                let ty = self.method(expr.id, recv, name, args, expr.span);
                 self.check_overlap(Some(recv), args);
-                self.method(expr.id, recv, name, args, expr.span)
+                ty
             }
             ExprKind::Index(list, index) => self.index(expr.id, list, index, expr.span),
             ExprKind::Lambda(params, ret, body) => {
@@ -2662,7 +2674,6 @@ impl Checker<'_> {
 
     fn record_literal(&mut self, expr: &Expr, args: &[Arg], expected: Option<&Ty>) -> Ty {
         if let Some(ExprKind::Spread(inner)) = args.first().map(|a| &a.value.kind) {
-            self.no_ref_args(&args[1..]);
             return self.record_copy(inner, &args[1..]);
         }
         let expected = expected.map(|e| match self.subst.shallow(e) {
@@ -2674,7 +2685,6 @@ impl Checker<'_> {
         {
             return self.construct(expr.id, class, args, expr.span);
         }
-        self.no_ref_args(args);
         if args.is_empty() {
             return self.error(Code::type_needed, expr.span);
         }
@@ -2800,7 +2810,12 @@ impl Checker<'_> {
                 }
             }
             Ty::Named(class, args) => match self.visible_field(&class, &args, name, span) {
-                Some(f) => f.ty,
+                Some(f) => {
+                    if f.boxed {
+                        self.boxed_fields.insert(id);
+                    }
+                    f.ty
+                }
                 None => self.error(Code::unknown_field, span),
             },
             Ty::Record(names, fields) => match record_field(&names, &fields, name) {
@@ -3096,7 +3111,7 @@ impl Checker<'_> {
         let mut known = true;
         for (i, arg) in args.iter().enumerate() {
             let ExprKind::Spread(inner) = &arg.value.kind else {
-                out.push((arg.name.clone(), ArgSource::Expr(&arg.value, arg.is_ref)));
+                out.push((arg.name.clone(), ArgSource::Expr(&arg.value)));
                 continue;
             };
             let t = self.expr(inner, None);
@@ -3120,7 +3135,7 @@ impl Checker<'_> {
         }
         if !known {
             for (_, source) in out {
-                if let ArgSource::Expr(e, _) = source {
+                if let ArgSource::Expr(e) = source {
                     self.expr(e, None);
                 }
             }
@@ -3131,11 +3146,17 @@ impl Checker<'_> {
 
     fn check_arg(&mut self, source: &ArgSource, param: &Ty, ref_param: bool, sharing: Sharing) {
         if sharing != Sharing::No
-            && let ArgSource::Expr(e, false) = source
+            && let ArgSource::Expr(e) = source
         {
             let t = self.expr(e, Some(param));
             let boxed = Ty::Named(SHARED.to_string(), vec![param.clone()]);
-            if matches!(self.subst.shallow(&t), Ty::Named(n, _) if n == SHARED) {
+            if self.is_boxed(e) {
+                self.info.shared_args.insert(e.id, e.span);
+                if !self.subst.unify(&t, param) {
+                    let code = self.mismatch(&t, param, Code::type_mismatch);
+                    self.error(code, e.span);
+                }
+            } else if matches!(self.subst.shallow(&t), Ty::Named(n, _) if n == SHARED) {
                 self.expect(e, &t, &boxed);
             } else if sharing == Sharing::Field {
                 self.expect(e, &t, param);
@@ -3145,7 +3166,8 @@ impl Checker<'_> {
             return;
         }
         match source {
-            ArgSource::Expr(e, true) if ref_param => {
+            ArgSource::Expr(e) if ref_param => {
+                self.info.ref_args.insert(e.id, e.span);
                 let (t, err) = self.place(e);
                 if let Some(code) = err {
                     self.error(code, e.span);
@@ -3154,25 +3176,7 @@ impl Checker<'_> {
                     self.error(code, e.span);
                 }
             }
-            ArgSource::Expr(e, is_ref) => {
-                if ref_param {
-                    let mut d = Diagnostic::error(Code::missing_ref, e.span);
-                    if ref_path(e).is_some() {
-                        d = d.with_quick_fix(vec![Edit {
-                            span: Span::new(e.span.start, e.span.start),
-                            text: "ref ".to_string(),
-                        }]);
-                    }
-                    self.diags.push(d);
-                    if let Some((root, _)) = ref_path(e)
-                        && let Some(var) =
-                            self.scopes.iter_mut().rev().find_map(|s| s.get_mut(root))
-                    {
-                        var.reassigned = true;
-                    }
-                } else if *is_ref {
-                    self.error(Code::ref_not_allowed, e.span);
-                }
+            ArgSource::Expr(e) => {
                 let t = self.expr(e, Some(param));
                 self.expect(e, &t, param);
             }
@@ -3186,14 +3190,8 @@ impl Checker<'_> {
     }
 
     fn skip_arg(&mut self, source: &ArgSource) {
-        if let ArgSource::Expr(e, _) = source {
+        if let ArgSource::Expr(e) = source {
             self.expr(e, None);
-        }
-    }
-
-    fn no_ref_args(&mut self, args: &[Arg]) {
-        for a in args.iter().filter(|a| a.is_ref) {
-            self.error(Code::ref_not_allowed, a.value.span);
         }
     }
 
@@ -3227,9 +3225,6 @@ impl Checker<'_> {
         {
             if self.funcs.contains_key(name) {
                 return self.call_named(name, args, span);
-            }
-            if matches!(name.as_str(), "print" | "Some" | SHARED | "same") {
-                self.no_ref_args(args);
             }
             match name.as_str() {
                 "print" => {
@@ -3863,8 +3858,11 @@ impl Checker<'_> {
         let is_map = self
             .lookup(m)
             .is_some_and(|v| matches!(self.subst.shallow(&v.ty), Ty::Named(n, _) if n == MAP));
-        (method == "contains" && is_map && !mutates(then, m) && !mutates(then, k))
-            .then(|| (m.clone(), k.clone(), self.scopes.len() - 1))
+        (method == "contains"
+            && is_map
+            && !mutates(then, m, &self.ref_callees)
+            && !mutates(then, k, &self.ref_callees))
+        .then(|| (m.clone(), k.clone(), self.scopes.len() - 1))
     }
 
     fn match_expr(
@@ -4419,14 +4417,16 @@ impl Checker<'_> {
     }
 
     fn check_overlap(&mut self, recv: Option<&Expr>, args: &[Arg]) {
-        let refs: Vec<(&Expr, RefPath)> = args
+        let (refs, plain): (Vec<&Arg>, Vec<&Arg>) = args
             .iter()
-            .filter(|a| a.is_ref)
+            .partition(|a| self.info.ref_args.contains_key(&a.value.id));
+        let refs: Vec<(&Expr, RefPath)> = refs
+            .into_iter()
             .filter_map(|a| Some((&a.value, ref_path(&a.value)?)))
             .collect();
         for (i, (e, path)) in refs.iter().enumerate() {
             let mut readers: Vec<&Expr> = recv.into_iter().collect();
-            readers.extend(args.iter().filter(|a| !a.is_ref).map(|a| &a.value));
+            readers.extend(plain.iter().map(|a| &a.value));
             for (j, (other, _)) in refs.iter().enumerate() {
                 if j != i {
                     index_exprs(other, &mut readers);
@@ -4601,7 +4601,9 @@ impl Checker<'_> {
             return self.error(Code::unexpected_token, pattern.span);
         };
         if let Some(path) = ref_path(iter)
-            && let Some(hit) = changes(body, &|e| ref_path(e).is_some_and(|p| overlaps(&p, &path)))
+            && let Some(hit) = changes(body, &self.ref_callees, &|e| {
+                ref_path(e).is_some_and(|p| overlaps(&p, &path))
+            })
         {
             self.error(Code::changed_in_for_ref, hit.span);
         }
@@ -4629,7 +4631,7 @@ impl Checker<'_> {
         self.report_missing(vec![vec![Cell::Pat(pattern)]], &elem, pattern.span);
         let narrowed_list = match &pattern.kind {
             PatternKind::Name(name) => narrowing_list(iter)
-                .filter(|list| !mutates(body, list))
+                .filter(|list| !mutates(body, list, &self.ref_callees))
                 .map(|list| (list, name.clone(), self.scopes.len())),
             _ => None,
         };
@@ -4675,19 +4677,34 @@ fn narrowing_list(iter: &Expr) -> Option<String> {
     }
 }
 
-fn mutates(expr: &Expr, list: &str) -> bool {
-    changes(expr, &|e| matches!(&e.kind, ExprKind::Name(n) if n == list)).is_some()
+fn mutates(expr: &Expr, list: &str, ref_callees: &HashSet<String>) -> bool {
+    changes(
+        expr,
+        ref_callees,
+        &|e| matches!(&e.kind, ExprKind::Name(n) if n == list),
+    )
+    .is_some()
 }
 
-fn changes<'a>(expr: &'a Expr, is_target: &dyn Fn(&Expr) -> bool) -> Option<&'a Expr> {
+/// Calls are matched by name only, before they're resolved, so any argument to a function or
+/// method with a `ref` parameter counts as changed.
+fn changes<'a>(
+    expr: &'a Expr,
+    ref_callees: &HashSet<String>,
+    is_target: &dyn Fn(&Expr) -> bool,
+) -> Option<&'a Expr> {
+    let passes = |name: &str, args: &[Arg]| {
+        ref_callees.contains(name) && args.iter().any(|a| is_target(&a.value))
+    };
     find_expr(expr, &mut |e, assigned| {
         (assigned && is_target(e))
             || match &e.kind {
                 ExprKind::Method(recv, m, args) => {
-                    (is_target(recv) && MUTATING.contains(&m.as_str()))
-                        || args.iter().any(|a| a.is_ref && is_target(&a.value))
+                    (is_target(recv) && MUTATING.contains(&m.as_str())) || passes(m, args)
                 }
-                ExprKind::Call(_, args) => args.iter().any(|a| a.is_ref && is_target(&a.value)),
+                ExprKind::Call(callee, args) => {
+                    matches!(&callee.kind, ExprKind::Name(n) if passes(n, args))
+                }
                 ExprKind::For(_, iter, _, true) => is_target(iter),
                 _ => false,
             }

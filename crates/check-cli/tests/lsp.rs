@@ -252,19 +252,43 @@ fn saving_a_new_file_rechecks_the_files_that_use_it() {
     assert!(codes_for(&saved, &main).is_empty());
 }
 
-#[test]
-fn hints_each_method_that_changes_this() {
-    let dir = folder("inlay hints", &[("main.check", "")]);
+fn hint_positions(test: &str, src: &str) -> Vec<Value> {
+    let dir = folder(test, &[("main.check", "")]);
     let main = dir.join("main.check");
     let mut lsp = Lsp::start();
-    lsp.open(
-        &main,
-        "class C {\n  var n: Int = 0\n  func bump() { this.n += 1 }\n  func get() -> Int { this.n }\n}",
-    );
+    lsp.open(&main, src);
     let range =
         json!({ "start": { "line": 0, "character": 0 }, "end": { "line": 9, "character": 0 } });
     let params = json!({ "textDocument": { "uri": uri(&main) }, "range": range });
     let hints = lsp.request("textDocument/inlayHint", params).0;
-    assert_eq!(hints.as_array().unwrap().len(), 1, "{hints}");
-    assert_eq!(hints[0]["position"], json!({ "line": 2, "character": 14 }));
+    let mut positions: Vec<Value> = (hints.as_array().unwrap().iter())
+        .map(|h| h["position"].clone())
+        .collect();
+    positions.sort_by_key(|p| (p["line"].as_u64(), p["character"].as_u64()));
+    positions
+}
+
+#[test]
+fn hints_each_method_that_changes_this() {
+    let positions = hint_positions(
+        "this hints",
+        "class C {\n  var n: Int = 0\n  func bump() { this.n += 1 }\n  func get() -> Int { this.n }\n}",
+    );
+    assert_eq!(positions, [json!({ "line": 2, "character": 14 })]);
+}
+
+#[test]
+fn hints_each_argument_a_call_can_change() {
+    let positions = hint_positions(
+        "argument hints",
+        "func setNine(ref a: Int) { a = 9 }\nfunc track(shared t: Int) { t += 1 }\nvar x = 1\n\
+         shared s = 0\nsetNine(x)\ntrack(s)\ntrack(shared s)",
+    );
+    assert_eq!(
+        positions,
+        [
+            json!({ "line": 4, "character": 8 }),
+            json!({ "line": 5, "character": 6 })
+        ]
+    );
 }

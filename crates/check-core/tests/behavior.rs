@@ -2536,45 +2536,45 @@ fn a_shared_of_a_shared_class_is_a_warning() {
 #[test]
 fn a_ref_parameter_changes_the_callers_variable_or_path() {
     let src = format!(
-        "{SET_NINE}class Game(var scores: List<Int>)\nvar x = 1\nvar g = Game([1])\nvar l = [[1], [2]]\nsetNine(ref x)\nsetNine(ref g.scores[0])\nsetNine(ref l[1][0])\nprint(\"{{x}} {{g}} {{l}}\")"
+        "{SET_NINE}class Game(var scores: List<Int>)\nvar x = 1\nvar g = Game([1])\nvar l = [[1], [2]]\nsetNine(x)\nsetNine(g.scores[0])\nsetNine(l[1][0])\nprint(\"{{x}} {{g}} {{l}}\")"
     );
     assert_eq!(output(&src), "9 Game(scores = [9]) [[1], [9]]");
 }
 
 #[test]
 fn a_ref_parameter_writes_back_through_return_and_further_refs() {
-    let src = "func inner(ref a: Int) { a += 1 }\nfunc outer(ref a: Int) {\n  inner(ref a)\n  if a > 0 { return }\n  a = 0\n}\nvar x = 1\nouter(ref x)\nprint(x)";
+    let src = "func inner(ref a: Int) { a += 1 }\nfunc outer(ref a: Int) {\n  inner(a)\n  if a > 0 { return }\n  a = 0\n}\nvar x = 1\nouter(x)\nprint(x)";
     assert_eq!(output(src), "2");
 }
 
 #[test]
 fn a_ref_path_is_resolved_once_and_can_go_through_a_let_ref() {
     let src = format!(
-        "{SET_NINE}class P(var x: Int)\nvar n = 0\nfunc next() -> Int {{\n  n += 1\n  0\n}}\nvar xs = [1]\nsetNine(ref xs[next()])\nlet r = Shared(P(1))\nsetNine(ref r.x)\nprint(\"{{xs}} {{n}} {{r.x}}\")"
+        "{SET_NINE}class P(var x: Int)\nvar n = 0\nfunc next() -> Int {{\n  n += 1\n  0\n}}\nvar xs = [1]\nsetNine(xs[next()])\nlet r = Shared(P(1))\nsetNine(r.x)\nprint(\"{{xs}} {{n}} {{r.x}}\")"
     );
     assert_eq!(output(&src), "[9] 1 9");
 }
 
 #[test]
 fn a_named_ref_argument_puts_ref_after_the_name() {
-    let src = "func f(n: Int, ref a: Int) { a = n }\nvar x = 1\nf(a = ref x, n = 3)\nprint(x)";
+    let src = "func f(n: Int, ref a: Int) { a = n }\nvar x = 1\nf(a = x, n = 3)\nprint(x)";
     assert_eq!(output(src), "3");
 }
 
 #[test]
 fn a_ref_argument_must_be_a_var_or_a_path_in_one() {
     assert_eq!(
-        first_error(&format!("{SET_NINE}let x = 1\nsetNine(ref x)")),
+        first_error(&format!("{SET_NINE}let x = 1\nsetNine(x)")),
         "assign_to_let"
     );
     assert_eq!(
         first_error(&format!(
-            "{SET_NINE}class P(x: Int)\nvar p = P(1)\nsetNine(ref p.x)"
+            "{SET_NINE}class P(x: Int)\nvar p = P(1)\nsetNine(p.x)"
         )),
         "assign_to_let"
     );
     assert_eq!(
-        first_error(&format!("{SET_NINE}var x = 1\nsetNine(ref x + 1)")),
+        first_error(&format!("{SET_NINE}var x = 1\nsetNine(x + 1)")),
         "assign_to_let"
     );
     assert_eq!(
@@ -2587,62 +2587,33 @@ fn a_ref_argument_must_be_a_var_or_a_path_in_one() {
 #[test]
 fn overlapping_arguments_are_an_error_but_distinct_fields_are_fine() {
     assert_eq!(
-        first_error(&format!("{SWAP}var x = 1\nswap(ref x, ref x)")),
+        first_error(&format!("{SWAP}var x = 1\nswap(x, x)")),
         "overlapping_ref"
     );
     assert_eq!(
-        first_error(&format!(
-            "{SWAP}var xs = [0, 0]\nvar i = 0\nswap(ref xs[i], ref i)"
-        )),
+        first_error(&format!("{SWAP}var xs = [0, 0]\nvar i = 0\nswap(xs[i], i)")),
         "overlapping_ref"
     );
     assert_eq!(
         first_error(
-            "func f(ref a: List<Int>, n: Int) { a.push(n) }\nvar xs = [1]\nf(ref xs, xs.length())"
+            "func f(ref a: List<Int>, n: Int) { a.push(n) }\nvar xs = [1]\nf(xs, xs.length())"
         ),
         "overlapping_ref"
     );
-    assert_eq!(
-        first_error("var xs = [1]\nxs.push(ref xs[0])"),
-        "overlapping_ref"
-    );
     let src = format!(
-        "{SWAP}class P(var x: Int, var y: Int)\nvar p = P(1, 2)\nswap(ref p.x, ref p.y)\nprint(\"{{p}}\")"
+        "{SWAP}class P(var x: Int, var y: Int)\nvar p = P(1, 2)\nswap(p.x, p.y)\nprint(\"{{p}}\")"
     );
     assert_eq!(output(&src), "P(x = 2, y = 1)");
-    let src = "func f(ref a: Int, b: Int) { a = b }\nclass P(var x: Int, var y: Int)\nvar p = P(1, 2)\nvar xs = [5]\nf(ref p.x, p.y)\nf(ref xs[p.x - 2], p.y)\nprint(\"{p} {xs}\")";
+    let src = "func f(ref a: Int, b: Int) { a = b }\nclass P(var x: Int, var y: Int)\nvar p = P(1, 2)\nvar xs = [5]\nf(p.x, p.y)\nf(xs[p.x - 2], p.y)\nprint(\"{p} {xs}\")";
     assert_eq!(output(src), "P(x = 2, y = 2) [2]");
 }
 
 #[test]
 fn a_ref_index_out_of_range_panics_at_the_call() {
     panics_with(
-        &format!("{SET_NINE}var xs = [1]\nsetNine(ref xs[5])"),
+        &format!("{SET_NINE}var xs = [1]\nsetNine(xs[5])"),
         "index_out_of_range",
     );
-}
-
-#[test]
-fn ref_must_match_the_parameter() {
-    assert_eq!(
-        first_error(&format!("{SET_NINE}var x = 1\nsetNine(x)")),
-        "missing_ref"
-    );
-    assert_eq!(
-        first_error_fix(&format!("{SET_NINE}var x = 1\nsetNine(x)")),
-        ["ref "]
-    );
-    assert!(first_error_fix(&format!("{SET_NINE}setNine(5)")).is_empty());
-    for call in [
-        "f(ref x)",
-        "print(ref x)",
-        "Shared(ref x)",
-        "let r = (a = ref x)",
-    ] {
-        let src = format!("func f(a: Int) => print(a)\nvar x = 1\n{call}");
-        assert_eq!(first_error(&src), "ref_not_allowed", "{call}");
-        assert!(first_error_fix(&src).is_empty(), "{call}");
-    }
 }
 
 #[test]
@@ -2764,7 +2735,7 @@ print(\"{t.box} {t.owner.hits}\")";
 
 #[test]
 fn a_receiver_overlapping_a_ref_argument_is_an_error() {
-    let src = "class C {\n  var n: Int = 0\n  func add(ref x: Int) { this.n += x }\n}\nvar c = C()\nc.add(ref c.n)";
+    let src = "class C {\n  var n: Int = 0\n  func add(ref x: Int) { this.n += x }\n}\nvar c = C()\nc.add(c.n)";
     assert_eq!(first_error(src), "overlapping_ref");
 }
 
@@ -2938,11 +2909,11 @@ fn a_lambda_shares_a_shared_local() {
 #[test]
 fn a_shared_parameter_shares_the_callers_box() {
     let src = "func track(shared total: Int) { total += 1 }\nfunc show(n: Int) -> Int { n }\n\
-        shared clicks = 0\ntrack(shared clicks)\nlet box = Shared(5)\ntrack(box)\n\
-        func setNine(ref x: Int) { x = 9 }\nshared other = 0\nsetNine(ref other)\n\
+        shared clicks = 0\ntrack(clicks)\ntrack(shared clicks)\nlet box = Shared(5)\ntrack(box)\n\
+        func setNine(ref x: Int) { x = 9 }\nshared other = 0\nsetNine(other)\n\
         print(\"{clicks} {box} {show(clicks)} {other}\")";
-    assert_eq!(output(src), "1 Shared(6) 1 9");
-    let missing = "func track(shared total: Int) { total += 1 }\nshared clicks = 0\ntrack(clicks)";
+    assert_eq!(output(src), "2 Shared(6) 2 9");
+    let missing = "func track(shared total: Int) { total += 1 }\ntrack(5)";
     assert_eq!(first_error(missing), "missing_shared");
     assert_eq!(first_error("let m = 1\nlet s = shared m"), "not_shared");
 }
@@ -2950,7 +2921,7 @@ fn a_shared_parameter_shares_the_callers_box() {
 #[test]
 fn a_shared_field_is_shared_by_the_objects_given_its_box() {
     let src = "class Button(label: String, shared presses: Int)\nshared clicks = 0\n\
-        let a = Button(\"A\", presses = shared clicks)\nlet b = Button(\"B\", presses = shared clicks)\n\
+        let a = Button(\"A\", presses = clicks)\nlet b = Button(\"B\", presses = shared clicks)\n\
         let c = Button(\"C\", presses = 0)\na.presses += 2\nc.presses += 5\nlet copy = c\ncopy.presses += 1\n\
         print(\"{b.presses} {clicks} {c} {a == Button(\"A\", presses = 2)}\")";
     assert_eq!(output(src), "2 2 Button(label = \"C\", presses = 6) true");
@@ -2997,6 +2968,15 @@ fn for_ref_writes_each_element_back() {
 fn for_ref_keeps_the_changes_made_before_a_break() {
     let src = "var xs = [1, 2, 3]\nfor ref x in xs {\n  x *= 10\n  if x == 20 { break }\n}\nprint(\"{xs}\")";
     assert_eq!(output(src), "[10, 20, 3]");
+}
+
+#[test]
+fn for_ref_cant_pass_its_list_to_a_ref_parameter() {
+    let clear = "func clear(ref a: List<Int>) { a = [] }\nclass C {\n  func clear(ref a: List<Int>) { a = [] }\n}\nlet c = C()\nvar xs = [1]\n";
+    for call in ["clear(xs)", "c.clear(xs)"] {
+        let src = format!("{clear}for ref x in xs {{ {call} }}");
+        assert_eq!(first_error(&src), "changed_in_for_ref", "{call}");
+    }
 }
 
 #[test]

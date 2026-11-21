@@ -89,8 +89,6 @@ codes! {
     try_error_mismatch => "[try on a Result whose error type differs from the function's]",
     assign_to_let => "[assigning to a let]",
     assign_to_captured => "[changing a variable a lambda captured]",
-    missing_ref => "[an argument for a ref parameter without ref]",
-    ref_not_allowed => "[ref on an argument whose parameter isn't ref]",
     overlapping_ref => "[a ref argument that overlaps another argument of the same call]",
     ref_default => "[a ref parameter with a default]",
     ref_func_as_value => "[a function with ref parameters used as a value]",
