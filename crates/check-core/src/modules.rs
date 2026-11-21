@@ -265,13 +265,7 @@ impl<'a> Loader<'a> {
 
     fn finish(mut self) -> Loaded {
         let mut sources = std::mem::take(&mut self.parsed);
-        resolve(
-            &mut sources,
-            &self.access,
-            &self.labels,
-            &mut self.diags,
-            &mut self.next_id,
-        );
+        resolve(&mut sources, &self.access, &self.labels, &mut self.diags);
         let mut program = Vec::new();
         let mut library = Vec::new();
         for file in sources {

@@ -3,20 +3,20 @@ shared class Board {
   var best: String? = None
 
   func add(name: String, points: Int) {
-    let total = (scores[name] ?? 0) + points
-    scores[name] = total
-    if total > top() {
-      best = Some(name)
+    let total = (this.scores[name] ?? 0) + points
+    this.scores[name] = total
+    if total > this.top() {
+      this.best = Some(name)
     }
   }
 
   func top() -> Int {
-    let leader = best ?? ""
-    scores[leader] ?? 0
+    let leader = this.best ?? ""
+    this.scores[leader] ?? 0
   }
 
   func grade(name: String) -> String {
-    let points = scores[name] ?? 0
+    let points = this.scores[name] ?? 0
     let label
     if points >= 10 {
       label = "gold"
