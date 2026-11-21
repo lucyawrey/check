@@ -26,9 +26,7 @@ pub enum Resolved {
 #[derive(Default)]
 pub struct Info {
     pub coercions: HashMap<NodeId, Coercion>,
-    /// Values inside a `try` that it unwraps, returning early on a failure, with their spans.
     pub try_unwraps: HashMap<NodeId, Span>,
-    /// Each `try` whose own operand can't fail, only values inside it.
     pub plain_tries: HashSet<NodeId>,
     pub wrapping: HashSet<NodeId>,
     pub signatures: HashMap<NodeId, String>,
@@ -224,11 +222,10 @@ struct LoopCtx {
     break_flow: Option<Flow>,
 }
 
-/// Variables declared without a value, by declaration, that may be unset or may be set here.
 #[derive(Clone, Default)]
 struct Flow {
-    unset: HashSet<Span>,
-    set: HashSet<Span>,
+    maybe_unset: HashSet<Span>,
+    maybe_set: HashSet<Span>,
     dead: bool,
 }
 
@@ -241,8 +238,8 @@ impl Flow {
             return self;
         }
         Flow {
-            unset: &self.unset | &other.unset,
-            set: &self.set | &other.set,
+            maybe_unset: &self.maybe_unset | &other.maybe_unset,
+            maybe_set: &self.maybe_set | &other.maybe_set,
             dead: false,
         }
     }
@@ -258,12 +255,9 @@ pub struct Checker<'s> {
     fns: Vec<FnCtx>,
     loops: Vec<LoopCtx>,
     flow: Flow,
-    /// Checking a `try`'s operand, outside any lambda in it.
     in_try: bool,
-    /// How many points that can return early on a failure `try`s have found so far.
     try_points: usize,
-    /// Each `let` declared without a value, by declaration, and how many loops it's inside.
-    pending_lets: HashMap<Span, usize>,
+    lets_without_value: HashMap<Span, usize>,
     /// The lambdas being checked, innermost last: each one's first scope (variables below it are
     /// captured) and what it has captured so far.
     lambdas: Vec<(usize, BTreeSet<String>)>,
@@ -338,7 +332,7 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         flow: Flow::default(),
         in_try: false,
         try_points: 0,
-        pending_lets: HashMap::new(),
+        lets_without_value: HashMap::new(),
         lambdas: Vec::new(),
         narrowed: Vec::new(),
         ref_callees: HashSet::new(),
@@ -1735,10 +1729,10 @@ impl Checker<'_> {
                         self.error(Code::top_level_without_value, *span);
                     }
                     let ty = declared.unwrap_or_else(|| self.subst.fresh());
-                    self.flow.unset.insert(*span);
-                    self.flow.set.remove(span);
+                    self.flow.maybe_unset.insert(*span);
+                    self.flow.maybe_set.remove(span);
                     if !is_var {
-                        self.pending_lets.insert(*span, self.loops.len());
+                        self.lets_without_value.insert(*span, self.loops.len());
                     }
                     let var = Var {
                         ty,
@@ -1968,7 +1962,7 @@ impl Checker<'_> {
         !self.flow.dead
             && self
                 .lookup(name)
-                .is_some_and(|v| self.flow.unset.contains(&v.span))
+                .is_some_and(|v| self.flow.maybe_unset.contains(&v.span))
     }
 
     /// Whether `name` comes from outside the lambda being checked.
@@ -2433,24 +2427,25 @@ impl Checker<'_> {
         if op.is_none()
             && let ExprKind::Name(n) = &target.kind
             && let Some(var) = self.lookup(n)
-            && (self.flow.unset.contains(&var.span) || self.flow.set.contains(&var.span))
+            && (self.flow.maybe_unset.contains(&var.span)
+                || self.flow.maybe_set.contains(&var.span))
             && !self.is_captured(n)
         {
             let (decl, ty) = (var.span, var.ty.clone());
-            let again = self.flow.set.contains(&decl)
+            let again = self.flow.maybe_set.contains(&decl)
                 || self
-                    .pending_lets
+                    .lets_without_value
                     .get(&decl)
                     .is_some_and(|&d| self.loops.len() > d);
-            if again && self.pending_lets.contains_key(&decl) {
+            if again && self.lets_without_value.contains_key(&decl) {
                 self.error(Code::let_set_twice, target.span);
             } else if again && let Some(var) = self.lookup_mut(n) {
                 var.reassigned = true;
             }
             let actual = self.expr(value, Some(&ty));
             self.expect(value, &actual, &ty);
-            self.flow.unset.remove(&decl);
-            self.flow.set.insert(decl);
+            self.flow.maybe_unset.remove(&decl);
+            self.flow.maybe_set.insert(decl);
             return;
         }
         let (ty, err) = self.place(target);
@@ -3084,7 +3079,6 @@ impl Checker<'_> {
         }
     }
 
-    /// Inside a `try`, a `Maybe` or `Result` where its inner type is expected unwraps.
     fn try_unwrap(&mut self, expr: &Expr, actual: &Ty, expected: &Ty) -> bool {
         let e = self.subst.shallow(expected);
         let failable =
@@ -3102,7 +3096,6 @@ impl Checker<'_> {
         true
     }
 
-    /// Inside a `try`, an operand, receiver or field base that can fail unwraps to its inner type.
     fn try_operand(&mut self, expr: &Expr, ty: Ty) -> Ty {
         let Some((inner, fails)) = failure_of(&self.subst.shallow(&ty)).filter(|_| self.in_try)
         else {
@@ -3152,7 +3145,6 @@ impl Checker<'_> {
             (Fails::Maybe, Some(Fails::Result(_))) => (Code::try_maybe_in_result, "orErr(...)"),
         };
         let mut d = Diagnostic::error(code, span);
-        // A value a `try` unwraps inside its operand is already covered by that `try`.
         let prefix = if span == operand.span { "" } else { "try " };
         d.detail = Some(format!("{prefix}{}.{fix}", self.operand_text(operand)));
         self.diags.push(d);
@@ -4701,7 +4693,6 @@ impl Checker<'_> {
     /// Warns about a `var` copied from a field, index or map lookup whose last change is never
     /// read. Reads in a loop or branch with the change count as after it, and a var a lambda
     /// captures never warns.
-    /// `let x` then an `if` or `match` whose every branch only sets `x`.
     fn set_in_branches(&mut self, stmts: &[Stmt]) {
         for pair in stmts.windows(2) {
             let [
@@ -5178,7 +5169,6 @@ fn copied_path(e: &Expr) -> Option<&Expr> {
     }
 }
 
-/// A `Maybe` or `Result` type's inner type, and what a `try` on it passes up.
 fn failure_of(t: &Ty) -> Option<(Ty, Fails)> {
     match t {
         Ty::Maybe(inner) => Some(((**inner).clone(), Fails::Maybe)),
@@ -5193,7 +5183,6 @@ fn mentions(e: &Expr, name: &str) -> bool {
     find_expr(e, &mut |x, _| is_name(x, name)).is_some()
 }
 
-/// Whether every branch of `e` only sets `name`, collecting each `name = ` to remove.
 fn branch_sets(e: &Expr, name: &str, sets: &mut Vec<Span>) -> bool {
     match &e.kind {
         ExprKind::If(cond, then, Some(other)) => {

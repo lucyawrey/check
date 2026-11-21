@@ -3330,7 +3330,7 @@ fn one_try_covers_every_failure_in_its_expression() {
     );
     let passes_through = "func f(xs: List<Int?>) -> List<Int?> { xs }\nfunc g() -> Int? { try f([Int.parse(\"1\")])[0] }\nprint(g())";
     assert_eq!(output(passes_through), "Some(1)");
-    let operands = "func ops(a: String) -> Int? { try (Int.parse(a) * 2 + Int.parse(a)) }\nfunc size(m: Map<String, List<Int>>) -> Int? { try m[\"a\"].length() }\nprint(\"{ops(\"2\")} {ops(\"x\")} {size([\"a\" = [1, 2]])} {size([=])}\")";
+    let operands = "func ops(a: String) -> Int? { try Int.parse(a) * 2 + Int.parse(a) }\nfunc size(m: Map<String, List<Int>>) -> Int? { try m[\"a\"].length() }\nprint(\"{ops(\"2\")} {ops(\"x\")} {size([\"a\" = [1, 2]])} {size([=])}\")";
     assert_eq!(output(operands), "Some(6) None Some(2) None");
     assert_eq!(
         error_and_fix("func at(i: Int) -> Int { i }\nfunc f() -> Int? { try at(parse(\"1\")) }"),

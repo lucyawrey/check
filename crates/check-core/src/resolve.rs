@@ -225,12 +225,14 @@ struct Resolver<'a> {
     /// Type parameters in scope, which hide types of the same name.
     type_params: HashSet<String>,
     diags: &'a mut Vec<Diagnostic>,
-    /// Each type's fields and methods, by its key.
     members: &'a HashMap<String, ThisMembers>,
-    /// In a method or `init`: what bare names can reach on `this`, and the first scope that
-    /// belongs to the method, so names bound from there on hide them.
-    this: Option<(ThisMembers, usize)>,
+    this: Option<MethodScope>,
     next_id: &'a mut NodeId,
+}
+
+struct MethodScope {
+    members: ThisMembers,
+    first_scope: usize,
 }
 
 #[derive(Clone, Default)]
@@ -266,10 +268,12 @@ impl Resolver<'_> {
         self.scopes.iter().any(|s| s.contains(name))
     }
 
-    /// Whether a bare `name` reaches a member of `this`, and if so whether it's a method.
     fn this_member(&self, name: &str) -> Option<bool> {
-        let (m, base) = self.this.as_ref()?;
-        if self.scopes[*base..].iter().any(|s| s.contains(name)) {
+        let MethodScope {
+            members: m,
+            first_scope,
+        } = self.this.as_ref()?;
+        if self.scopes[*first_scope..].iter().any(|s| s.contains(name)) {
             return None;
         }
         if m.methods.contains(name) {
@@ -306,7 +310,7 @@ impl Resolver<'_> {
         if shadows || self.user_roots.contains(name) {
             self.diags
                 .push(Diagnostic::warning(Code::shadowed_name, span));
-        } else if let Some((m, _)) = &self.this
+        } else if let Some(MethodScope { members: m, .. }) = &self.this
             && (m.fields.contains(name) || m.methods.contains(name))
         {
             self.diags
@@ -460,7 +464,10 @@ impl Resolver<'_> {
                 }
                 if let Some(init) = &mut c.init {
                     init.name = format!("{key}.init");
-                    self.this = Some((this.clone(), self.scopes.len()));
+                    self.this = Some(MethodScope {
+                        members: this.clone(),
+                        first_scope: self.scopes.len(),
+                    });
                     self.func(init, &HashSet::new());
                     self.this = None;
                 }
@@ -560,7 +567,10 @@ impl Resolver<'_> {
             if let Some(rest) = f.name.strip_prefix(owner) {
                 f.name = format!("{key}{rest}");
             }
-            self.this = (i < statics).then(|| (this.clone(), self.scopes.len()));
+            self.this = (i < statics).then(|| MethodScope {
+                members: this.clone(),
+                first_scope: self.scopes.len(),
+            });
             let names = HashSet::from(["this".to_string()]);
             self.func(f, &names);
         }
@@ -723,7 +733,7 @@ impl Resolver<'_> {
                     && self
                         .this
                         .as_ref()
-                        .is_some_and(|(m, _)| m.fields.contains(a))
+                        .is_some_and(|t| t.members.fields.contains(a))
                 {
                     self.error(Code::assigns_itself, target.span, None);
                 }

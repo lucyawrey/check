@@ -1041,7 +1041,6 @@ impl Interpreter<'_> {
         Ok(self.coerce(expr.id, value))
     }
 
-    /// What `try` does with a value: the `Some` or `Ok` inside, or else returning the failure.
     fn unwrap_or_return(&mut self, value: Value, span: Span) -> Eval {
         match value {
             Value::Some(v) => Ok((*v).clone()),
