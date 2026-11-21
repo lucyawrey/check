@@ -6,6 +6,8 @@ use crate::lexer::{StrPart, Tok, Token};
 
 pub struct Parser<'a> {
     tokens: Vec<Token>,
+    src: &'a str,
+    base: usize,
     pos: usize,
     next_id: &'a mut NodeId,
     diags: &'a mut Vec<Diagnostic>,
@@ -20,6 +22,8 @@ pub fn parse_data(
 ) -> DataFile {
     let mut parser = Parser {
         tokens,
+        src: "",
+        base: 0,
         pos: 0,
         next_id,
         diags,
@@ -29,11 +33,15 @@ pub fn parse_data(
 
 pub fn parse_program(
     tokens: Vec<Token>,
+    src: &str,
+    base: usize,
     next_id: &mut NodeId,
     diags: &mut Vec<Diagnostic>,
 ) -> File {
     let mut parser = Parser {
         tokens,
+        src,
+        base,
         pos: 0,
         next_id,
         diags,
@@ -717,7 +725,13 @@ impl Parser<'_> {
                 && members.methods.is_empty()
                 && members.statics.is_empty()
                 && members.consts.is_empty();
-            if fields_only && self.error_count() == errors_before {
+            let names_a_header_reads_as_keywords = fields
+                .iter()
+                .any(|f| matches!(f.name.as_str(), "let" | "var"));
+            if fields_only
+                && !names_a_header_reads_as_keywords
+                && self.error_count() == errors_before
+            {
                 self.warn_fields_only_body(name_span, open, self.pos - 1);
             }
         }
@@ -741,19 +755,65 @@ impl Parser<'_> {
             .count()
     }
 
+    fn text_between(&self, start: usize, end: usize) -> &str {
+        &self.src[start - self.base..end - self.base]
+    }
+
+    fn line_indent(&self, at: usize) -> &str {
+        let before = &self.src[..at - self.base];
+        let line = &before[before.rfind('\n').map_or(0, |i| i + 1)..];
+        &line[..line.len() - line.trim_start().len()]
+    }
+
     fn warn_fields_only_body(&mut self, name: Span, open: usize, close: usize) {
-        let one_line = !self.tokens[open..close]
-            .iter()
-            .any(|t| t.tok == Tok::Newline);
-        let open_end = if one_line {
-            self.tokens[open + 1].span.start
+        let before_brace = self.tokens[open - 1].span.end;
+        let brace = self.tokens[open].span;
+        let first = self.tokens[open + 1].span.start;
+        let last = (self.tokens[..close].iter().rev())
+            .find(|t| t.tok != Tok::Newline)
+            .map_or(brace.end, |t| t.span.end);
+        let close_brace = self.tokens[close].span;
+        let (open_edit, close_edit) = if !self
+            .text_between(brace.end, close_brace.start)
+            .contains('\n')
+        {
+            (
+                Edit {
+                    span: Span::new(before_brace, first),
+                    text: "(".to_string(),
+                },
+                Edit {
+                    span: Span::new(last, close_brace.end),
+                    text: ")".to_string(),
+                },
+            )
         } else {
-            self.tokens[open].span.end
+            let indent = self.line_indent(name.start);
+            let open_edit = if self.text_between(brace.end, first).contains('\n') {
+                Edit {
+                    span: Span::new(before_brace, brace.end),
+                    text: "(".to_string(),
+                }
+            } else {
+                Edit {
+                    span: Span::new(before_brace, first),
+                    text: format!("(\n{indent}  "),
+                }
+            };
+            let close_edit = if self.text_between(last, close_brace.start).contains('\n') {
+                Edit {
+                    span: close_brace,
+                    text: ")".to_string(),
+                }
+            } else {
+                Edit {
+                    span: Span::new(last, close_brace.end),
+                    text: format!("\n{indent})"),
+                }
+            };
+            (open_edit, close_edit)
         };
-        let mut fix = vec![Edit {
-            span: Span::new(self.tokens[open - 1].span.end, open_end),
-            text: "(".to_string(),
-        }];
+        let mut fix = vec![open_edit];
         let mut depth = 0;
         for i in open + 1..close {
             match &self.tokens[i].tok {
@@ -770,15 +830,7 @@ impl Parser<'_> {
                 _ => {}
             }
         }
-        let close_start = if one_line {
-            self.tokens[close - 1].span.end
-        } else {
-            self.tokens[close].span.start
-        };
-        fix.push(Edit {
-            span: Span::new(close_start, self.tokens[close].span.end),
-            text: ")".to_string(),
-        });
+        fix.push(close_edit);
         self.diags
             .push(Diagnostic::warning(Code::fields_only_body, name).with_fix(fix));
     }
@@ -1272,7 +1324,12 @@ impl Parser<'_> {
     /// `private` in front of a field's name.
     fn field_modifiers(&mut self, header: bool) -> PResult<(bool, bool)> {
         let modifies = matches!(self.peek_at(1), Tok::Kw("let" | "var"));
-        let before_name = header && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Kw(_));
+        let before_name = header
+            && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Kw(_))
+            && matches!(
+                self.peek_at(2),
+                Tok::Sym(":" | "=" | "," | ")") | Tok::Newline
+            );
         let is_private = (modifies || before_name) && self.is_soft("private");
         let is_readonly = modifies && self.is_soft("readonly");
         if is_readonly && matches!(self.peek_at(1), Tok::Kw("let")) {
@@ -1884,6 +1941,8 @@ impl Parser<'_> {
                     }
                     let mut sub = Parser {
                         tokens,
+                        src: self.src,
+                        base: self.base,
                         pos: 0,
                         next_id: self.next_id,
                         diags: self.diags,
