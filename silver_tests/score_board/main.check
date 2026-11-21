@@ -1,0 +1,49 @@
+shared class Board {
+  var scores: Map<String, Int> = [=]
+  var best: String? = None
+
+  func add(name: String, points: Int) {
+    let total = (scores[name] ?? 0) + points
+    scores[name] = total
+    if total > top() {
+      best = Some(name)
+    }
+  }
+
+  func top() -> Int {
+    let leader = best ?? ""
+    scores[leader] ?? 0
+  }
+
+  func grade(name: String) -> String {
+    let points = scores[name] ?? 0
+    let label
+    if points >= 10 {
+      label = "gold"
+    } else if points >= 5 {
+      print("{name} is close")
+      label = "silver"
+    } else {
+      label = "bronze"
+    }
+    label
+  }
+}
+
+func parsePair(line: String) -> (String, Int)? {
+  let parts = line.split()
+  let name = try parts[0]
+  (name, try Int.parse(parts[1]))
+}
+
+let board = Board()
+for line in ["ana 4", "bo 7", "ana 8", "cy x", "bo"] {
+  match parsePair(line) {
+    Some((name, points)) => board.add(name, points)
+    None => print("skipped {line}")
+  }
+}
+let missing: Int? = None
+print(board.best ?? "nobody")
+print(missing ?? board.scores["cy"] ?? board.top())
+print("{board.grade("ana")} {board.grade("bo")} {board.grade("cy")}")
