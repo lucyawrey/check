@@ -158,24 +158,17 @@ impl Server {
         }
     }
 
-    /// A hint before the body of each method that changes `this`, and before each argument a
-    /// call can change.
+    /// A hint before each argument a call can change.
     fn inlay_hints(&self, path: &str) -> Vec<InlayHint> {
         let (_, checked) = self.check(path);
         let sources = &checked.sources;
         let info = &checked.info;
-        let this = info
-            .changes_this
-            .values()
-            .map(|span| (span, Text::hint_changes_this.get()));
-        let args = (info.ref_args.values())
+        (info.ref_args.values())
             .chain(info.shared_args.values())
-            .map(|span| (span, Text::hint_changed_by_call.get()));
-        this.chain(args)
-            .filter(|(span, _)| sources.file(span.start).path == path)
-            .map(|(span, label)| InlayHint {
+            .filter(|span| sources.file(span.start).path == path)
+            .map(|span| InlayHint {
                 position: range_of(*span, sources).start,
-                label: InlayHintLabel::String(label.to_string()),
+                label: InlayHintLabel::String(Text::hint_changed_by_call.get().to_string()),
                 kind: None,
                 text_edits: None,
                 tooltip: None,

@@ -1,5 +1,4 @@
 // Editor
-hint_changes_this = "[changes this]"
 hint_changed_by_call = "[may change]"
 hint_try_returns = "[If this fails, `try` returns from the function here]"
 detail_or_shared = "[or declare it with `shared`]"

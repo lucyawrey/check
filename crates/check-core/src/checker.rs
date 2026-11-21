@@ -45,8 +45,8 @@ pub struct Info {
     pub implements: HashMap<String, HashSet<String>>,
     /// Each `ref` binding, by its target, and how many statements after it its last use is.
     pub ref_ends: HashMap<NodeId, usize>,
-    /// Methods whose body changes `this`, so calls write it back, with where the body starts.
-    pub changes_this: HashMap<String, Span>,
+    /// Methods whose body changes `this`, so calls write it back.
+    pub changes_this: HashSet<String>,
     /// Arguments passed to a `ref` parameter, which the call writes back.
     pub ref_args: HashMap<NodeId, Span>,
     /// Shared names passed to a `shared` parameter or field, which pass their box.
@@ -1507,10 +1507,7 @@ impl Checker<'_> {
         }
         self.info.changes_this = (self.funcs.iter())
             .filter(|(_, f)| f.changes_this)
-            .map(|(k, f)| {
-                let at = f.decl.body.as_ref().map_or(f.decl.span, |b| b.span).start;
-                (k.clone(), Span::new(at, at))
-            })
+            .map(|(k, _)| k.clone())
             .collect();
     }
 

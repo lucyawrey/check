@@ -27,7 +27,6 @@ macro_rules! texts {
 }
 
 texts! {
-    hint_changes_this,
     hint_changed_by_call,
     hint_try_returns,
     detail_or_shared,
