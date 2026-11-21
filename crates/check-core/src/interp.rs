@@ -890,7 +890,10 @@ impl Interpreter<'_> {
                 is_shared,
                 ..
             } => {
-                let v = self.scoped(|i| i.expr(value))?;
+                let v = match value {
+                    Some(value) => self.scoped(|i| i.expr(value))?,
+                    None => Value::Void,
+                };
                 self.define(name, if *is_shared { share_new(v) } else { v });
                 Ok(Value::Void)
             }

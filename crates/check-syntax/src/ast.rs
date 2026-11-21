@@ -190,7 +190,7 @@ pub enum Stmt {
         /// `shared name = value`: the value is held in a box that lambdas capture.
         is_shared: bool,
         ty: Option<TypeExpr>,
-        value: Expr,
+        value: Option<Expr>,
     },
     Assign {
         target: Expr,

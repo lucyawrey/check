@@ -217,6 +217,31 @@ enum LoopKind {
 struct LoopCtx {
     kind: LoopKind,
     break_ty: Option<Ty>,
+    break_flow: Option<Flow>,
+}
+
+/// Variables declared without a value, by declaration, that may be unset or may be set here.
+#[derive(Clone, Default)]
+struct Flow {
+    unset: HashSet<Span>,
+    set: HashSet<Span>,
+    dead: bool,
+}
+
+impl Flow {
+    fn join(self, other: Flow) -> Flow {
+        if self.dead {
+            return other;
+        }
+        if other.dead {
+            return self;
+        }
+        Flow {
+            unset: &self.unset | &other.unset,
+            set: &self.set | &other.set,
+            dead: false,
+        }
+    }
 }
 
 pub struct Checker<'s> {
@@ -228,6 +253,9 @@ pub struct Checker<'s> {
     funcs: HashMap<String, FuncEntry>,
     fns: Vec<FnCtx>,
     loops: Vec<LoopCtx>,
+    flow: Flow,
+    /// Each `let` declared without a value, by declaration, and how many loops it's inside.
+    pending_lets: HashMap<Span, usize>,
     /// The lambdas being checked, innermost last: each one's first scope (variables below it are
     /// captured) and what it has captured so far.
     lambdas: Vec<(usize, BTreeSet<String>)>,
@@ -299,6 +327,8 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         funcs: HashMap::new(),
         fns: Vec::new(),
         loops: Vec::new(),
+        flow: Flow::default(),
+        pending_lets: HashMap::new(),
         lambdas: Vec::new(),
         narrowed: Vec::new(),
         ref_callees: HashSet::new(),
@@ -1050,6 +1080,7 @@ impl Checker<'_> {
         );
         let saved_scopes = self.scopes.split_off(1);
         let saved_loops = std::mem::take(&mut self.loops);
+        let saved_flow = std::mem::take(&mut self.flow);
         let saved_lambdas = std::mem::take(&mut self.lambdas);
         let saved_narrowed = std::mem::take(&mut self.narrowed);
         let mut scope = HashMap::new();
@@ -1099,6 +1130,7 @@ impl Checker<'_> {
         self.scopes.truncate(1);
         self.scopes.extend(saved_scopes);
         self.loops = saved_loops;
+        self.flow = saved_flow;
         self.lambdas = saved_lambdas;
         self.narrowed = saved_narrowed;
         let entry = self.funcs.get_mut(name)?;
@@ -1683,6 +1715,27 @@ impl Checker<'_> {
                     self.var_keywords.insert(span.start, *keyword);
                 }
                 let declared = ty.as_ref().map(|t| self.type_from(t));
+                let Some(value) = value else {
+                    if self.fns.is_empty() && self.scopes.len() == 1 {
+                        self.error(Code::top_level_without_value, *span);
+                    }
+                    let ty = declared.unwrap_or_else(|| self.subst.fresh());
+                    self.flow.unset.insert(*span);
+                    self.flow.set.remove(span);
+                    if !is_var {
+                        self.pending_lets.insert(*span, self.loops.len());
+                    }
+                    let var = Var {
+                        ty,
+                        mutable: *is_var,
+                        kind: VarKind::Local,
+                        span: *span,
+                        reassigned: false,
+                        list_len: None,
+                    };
+                    self.declare(name, *span, var);
+                    return Ty::Void;
+                };
                 if let (ExprKind::Record(args), Some(Ty::Named(class, _))) =
                     (&value.kind, &declared)
                     && self.class(class).is_some()
@@ -1853,6 +1906,9 @@ impl Checker<'_> {
                 return (self.const_type(&key), Some(Code::assign_to_let));
             }
         }
+        if self.is_unset(name) {
+            return (self.error(Code::unset_read, span), None);
+        }
         let captured = self.is_captured(name);
         // A write into a `Shared` or `shared class` it captured goes through the captured copy.
         self.capture(name);
@@ -1891,6 +1947,13 @@ impl Checker<'_> {
         }
         self.place_root = Some(name.to_string());
         (ty, captured.then_some(Code::assign_to_captured))
+    }
+
+    fn is_unset(&self, name: &str) -> bool {
+        !self.flow.dead
+            && self
+                .lookup(name)
+                .is_some_and(|v| self.flow.unset.contains(&v.span))
     }
 
     /// Whether `name` comes from outside the lambda being checked.
@@ -2352,6 +2415,29 @@ impl Checker<'_> {
     }
 
     fn assign(&mut self, target: &Expr, op: Option<BinOp>, value: &Expr, span: Span) {
+        if op.is_none()
+            && let ExprKind::Name(n) = &target.kind
+            && let Some(var) = self.lookup(n)
+            && (self.flow.unset.contains(&var.span) || self.flow.set.contains(&var.span))
+            && !self.is_captured(n)
+        {
+            let (decl, ty) = (var.span, var.ty.clone());
+            let again = self.flow.set.contains(&decl)
+                || self
+                    .pending_lets
+                    .get(&decl)
+                    .is_some_and(|&d| self.loops.len() > d);
+            if again && self.pending_lets.contains_key(&decl) {
+                self.error(Code::let_set_twice, target.span);
+            } else if again && let Some(var) = self.lookup_mut(n) {
+                var.reassigned = true;
+            }
+            let actual = self.expr(value, Some(&ty));
+            self.expect(value, &actual, &ty);
+            self.flow.unset.remove(&decl);
+            self.flow.set.insert(decl);
+            return;
+        }
         let (ty, err) = self.place(target);
         if let Some(code) = err {
             self.error(code, target.span);
@@ -2391,8 +2477,11 @@ impl Checker<'_> {
                     }
                 }
             };
-            if self.subst.shallow(&last) == Ty::Never && !is_last {
-                last = Ty::Void;
+            if self.subst.shallow(&last) == Ty::Never {
+                self.flow.dead = true;
+                if !is_last {
+                    last = Ty::Void;
+                }
             }
         }
         self.changed_copies(stmts);
@@ -2407,16 +2496,22 @@ impl Checker<'_> {
                 self.scopes.push(HashMap::new());
                 for (i, stmt) in stmts.iter().enumerate() {
                     self.ref_binding(stmt, &stmts[i + 1..]);
-                    self.stmt(stmt);
+                    let t = self.stmt(stmt);
+                    if self.subst.shallow(&t) == Ty::Never {
+                        self.flow.dead = true;
+                    }
                 }
                 self.changed_copies(stmts);
                 self.finish_scope();
             }
             ExprKind::If(cond, then, otherwise) => {
+                let before = self.flow.clone();
                 self.then_branch(cond, then, |c| c.unused(then));
+                let after_then = std::mem::replace(&mut self.flow, before);
                 if let Some(other) = otherwise {
                     self.unused(other);
                 }
+                self.flow = after_then.join(std::mem::take(&mut self.flow));
             }
             ExprKind::Match(scrutinee, arms) => {
                 self.match_expr(expr, scrutinee, arms, None, false);
@@ -2564,9 +2659,14 @@ impl Checker<'_> {
                 self.loops.push(LoopCtx {
                     kind: LoopKind::Loop,
                     break_ty: None,
+                    break_flow: None,
                 });
                 self.unused(body);
                 let ctx = self.loops.pop().expect("loop context");
+                self.flow = ctx.break_flow.clone().unwrap_or(Flow {
+                    dead: true,
+                    ..Flow::default()
+                });
                 ctx.break_ty.unwrap_or(Ty::Never)
             }
             ExprKind::Break(value) => {
@@ -2574,9 +2674,21 @@ impl Checker<'_> {
                     Some(v) => self.expr(v, None),
                     None => Ty::Void,
                 };
-                let Some(ctx) = self.loops.last() else {
+                let flow = std::mem::replace(
+                    &mut self.flow,
+                    Flow {
+                        dead: true,
+                        ..Flow::default()
+                    },
+                );
+                let Some(ctx) = self.loops.last_mut() else {
                     return self.error(Code::break_outside_loop, expr.span);
                 };
+                ctx.break_flow = Some(match ctx.break_flow.take() {
+                    Some(b) => b.join(flow),
+                    None => flow,
+                });
+                let ctx = self.loops.last().expect("loop");
                 match ctx.break_ty.clone() {
                     None => self.loops.last_mut().expect("loop").break_ty = Some(ty),
                     Some(prev) => {
@@ -2592,6 +2704,7 @@ impl Checker<'_> {
                 Ty::Never
             }
             ExprKind::Continue => {
+                self.flow.dead = true;
                 if self.loops.is_empty() {
                     return self.error(Code::break_outside_loop, expr.span);
                 }
@@ -2611,6 +2724,7 @@ impl Checker<'_> {
                     .expect("fn")
                     .returns
                     .push((id, span, ty));
+                self.flow.dead = true;
                 Ty::Never
             }
         }
@@ -2846,6 +2960,9 @@ impl Checker<'_> {
     }
 
     fn name(&mut self, id: NodeId, name: &str, span: Span, expected: Option<&Ty>) -> Ty {
+        if self.is_unset(name) {
+            self.error(Code::unset_read, span);
+        }
         if let Some(var) = self.lookup(name) {
             let ty = var.ty.clone();
             self.capture(name);
@@ -3821,11 +3938,14 @@ impl Checker<'_> {
         }
         let declared = ret.map(|t| self.type_from(t));
         let saved_loops = std::mem::take(&mut self.loops);
+        let saved_flow = self.flow.clone();
+        self.flow.dead = false;
         self.lambdas.push((self.scopes.len(), BTreeSet::new()));
         self.scopes.push(scope);
         let ret = self.function_body(body, declared);
         self.finish_scope();
         self.loops = saved_loops;
+        self.flow = saved_flow;
         let (_, captures) = self.lambdas.pop().expect("lambda");
         self.info
             .captures
@@ -3843,16 +3963,17 @@ impl Checker<'_> {
         otherwise: Option<&Expr>,
         expected: Option<&Ty>,
     ) -> Ty {
+        let before = self.flow.clone();
         let tt = self.then_branch(cond, then, |c| c.expr(then, expected));
-        match otherwise {
-            Some(other) => {
-                let ot = self.expr(other, expected);
-                match self.join((then, tt), (other, ot)) {
-                    Some(t) => t,
-                    None => self.error(Code::branch_type_mismatch, expr.span),
-                }
-            }
-            None => self.optional_value(expr, tt),
+        let after_then = std::mem::replace(&mut self.flow, before);
+        let ot = otherwise.map(|other| self.expr(other, expected));
+        self.flow = after_then.join(std::mem::take(&mut self.flow));
+        match (otherwise, ot) {
+            (Some(other), Some(ot)) => match self.join((then, tt), (other, ot)) {
+                Some(t) => t,
+                None => self.error(Code::branch_type_mismatch, expr.span),
+            },
+            _ => self.optional_value(expr, tt),
         }
     }
 
@@ -3906,7 +4027,10 @@ impl Checker<'_> {
     ) -> Ty {
         let st = self.expr(scrutinee, None);
         let mut bodies = Vec::new();
+        let before = self.flow.clone();
+        let mut after: Option<Flow> = None;
         for arm in arms {
+            self.flow = before.clone();
             let mut binds = Vec::new();
             self.pattern(&arm.pattern, &st, &mut binds);
             self.push_bindings(binds);
@@ -3920,8 +4044,14 @@ impl Checker<'_> {
                 self.unused(&arm.body)
             };
             self.finish_scope();
+            let flow = std::mem::take(&mut self.flow);
+            after = Some(match after {
+                Some(a) => a.join(flow),
+                None => flow,
+            });
             bodies.push((&arm.body, t));
         }
+        self.flow = after.unwrap_or(before);
         let rows = arms
             .iter()
             .filter(|a| a.guard.is_none())
@@ -4434,9 +4564,16 @@ impl Checker<'_> {
         self.loops.push(LoopCtx {
             kind: LoopKind::Valued,
             break_ty: None,
+            break_flow: None,
         });
+        let before = self.flow.clone();
         self.unused(body);
         let ctx = self.loops.pop().expect("loop context");
+        let after = std::mem::take(&mut self.flow).join(before);
+        self.flow = match ctx.break_flow.clone() {
+            Some(b) => after.join(b),
+            None => after,
+        };
         debug_assert!(ctx.kind == LoopKind::Valued);
         match ctx.break_ty.map(|t| self.subst.shallow(&t)) {
             None | Some(Ty::Void) | Some(Ty::Error) => Ty::Void,
@@ -4481,7 +4618,7 @@ impl Checker<'_> {
                 is_var: true,
                 is_shared: false,
                 ty,
-                value,
+                value: Some(value),
                 ..
             } = stmt
             else {
@@ -4783,7 +4920,8 @@ fn find_expr<'a>(e: &'a Expr, hit: &mut dyn FnMut(&Expr, bool) -> bool) -> Optio
                         kids.push(target);
                         kids.push(value);
                     }
-                    Stmt::Let { value, .. } | Stmt::LetPattern { value, .. } => kids.push(value),
+                    Stmt::Let { value, .. } => kids.extend(value),
+                    Stmt::LetPattern { value, .. } => kids.push(value),
                     Stmt::RefLet { target, .. } => kids.push(target),
                     Stmt::Expr(x) => kids.push(x),
                     _ => {}
@@ -4938,7 +5076,7 @@ fn steps_root<'a>(e: &'a Expr, name: &str) -> Option<&'a Expr> {
 fn stmt_exprs(s: &Stmt) -> Vec<&Expr> {
     match s {
         Stmt::Assign { target, value, .. } => vec![target, value],
-        Stmt::Let { value, .. } => vec![value],
+        Stmt::Let { value, .. } => value.iter().collect(),
         Stmt::LetPattern {
             value, otherwise, ..
         } => std::iter::once(value).chain(otherwise).collect(),

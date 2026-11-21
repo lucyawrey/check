@@ -1,6 +1,6 @@
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
@@ -63,6 +63,9 @@ codes! {
     redefined_builtin => "[redefining or shadowing a reserved name]",
     used_before_declared => "[a variable used above its own line]",
     used_before_set => "[a function run before a top-level variable it uses is set]",
+    unset_read => "[a variable read where it might not be set yet]",
+    let_set_twice => "[a let set where it might already be set]",
+    top_level_without_value => "[a top-level let or var without a value]",
     nested_named_function => "[a named function declared inside a function body]",
     type_mismatch => "[a type mismatch]",
     type_needed => "[a type that can't be worked out and needs writing]",

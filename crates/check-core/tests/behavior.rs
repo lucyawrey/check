@@ -3260,3 +3260,28 @@ fn a_lambda_changes_shared_values_it_captured_and_calls_its_own_captures() {
     let callback = "shared class Player {\n  var score: Int = 0\n  func bump() -> func() { func() { this.score += 1 } }\n}\nlet p = Player()\np.bump()()\nprint(p.score)";
     assert_eq!(output(callback), "1");
 }
+
+#[test]
+fn a_variable_declared_without_a_value_is_set_on_every_path_before_a_read() {
+    let src = "func grade(score: Int) -> String {\n  let g\n  if score > 90 { g = \"A\" } else if score > 80 { g = \"B\" } else { g = \"C\" }\n  g\n}\nfunc firstEven(xs: List<Int>) -> Int {\n  var found: Int\n  var i = 0\n  loop {\n    let x = xs[i] ?? 0\n    if x mod 2 == 0 {\n      found = x\n      break\n    }\n    i += 1\n  }\n  found\n}\nfunc sign(n: Int) -> Int {\n  let s\n  match n {\n    0 => s = 0\n    _ => if n > 0 { s = 1 } else { return -1 }\n  }\n  s\n}\nfor i in 0..2 {\n  let y\n  y = i * 10\n  print(y)\n}\nprint(\"{grade(95)} {grade(85)} {firstEven([1, 3, 4])} {sign(0)} {sign(5)} {sign(-5)}\")";
+    assert_eq!(output(src), "0\n10\nA B 4 0 1 -1");
+}
+
+#[test]
+fn reading_a_variable_that_might_not_be_set_is_an_error() {
+    let wrap = |body: &str| first_error(&format!("func f(c: Bool) {{\n{body}\n}}"));
+    assert_eq!(wrap("let x: Int\nif c { x = 1 }\nprint(x)"), "unset_read");
+    assert_eq!(
+        wrap("var x: Int\nwhile c { x = 1 }\nprint(x)"),
+        "unset_read"
+    );
+    assert_eq!(wrap("let x: Int\nlet g = func() => x\nx = 1"), "unset_read");
+    assert_eq!(wrap("var x: Int\nx += 1"), "unset_read");
+    assert_eq!(wrap("let x: Int\nif c { x = 1 }\nx = 2"), "let_set_twice");
+    assert_eq!(wrap("let x: Int\nfor i in 0..3 { x = i }"), "let_set_twice");
+    assert_eq!(
+        wrap("let x\nif c { x = 1 } else { x = \"a\" }"),
+        "type_mismatch"
+    );
+    assert_eq!(first_error("let x: Int\nx = 1"), "top_level_without_value");
+}

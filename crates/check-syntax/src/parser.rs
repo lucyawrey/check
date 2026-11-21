@@ -382,7 +382,10 @@ impl Parser<'_> {
         }
         if (self.is_kw("let") || self.is_kw("var"))
             && !(matches!(self.peek_at(1), Tok::Ident(_))
-                && matches!(self.peek_at(2), Tok::Sym("=" | ":")))
+                && matches!(
+                    self.peek_at(2),
+                    Tok::Sym("=" | ":" | ";" | "}") | Tok::Newline | Tok::Eof
+                ))
         {
             return self.let_pattern();
         }
@@ -437,8 +440,12 @@ impl Parser<'_> {
         } else {
             None
         };
-        self.expect_sym("=")?;
-        let value = self.expr()?;
+        let value = if is_shared || self.is_sym("=") {
+            self.expect_sym("=")?;
+            Some(self.expr()?)
+        } else {
+            None
+        };
         Ok(Stmt::Let {
             id: self.id(),
             keyword,
