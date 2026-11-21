@@ -2485,6 +2485,7 @@ impl Checker<'_> {
             }
         }
         self.changed_copies(stmts);
+        self.set_in_branches(stmts);
         self.finish_scope();
         last
     }
@@ -2502,6 +2503,7 @@ impl Checker<'_> {
                     }
                 }
                 self.changed_copies(stmts);
+                self.set_in_branches(stmts);
                 self.finish_scope();
             }
             ExprKind::If(cond, then, otherwise) => {
@@ -4610,6 +4612,40 @@ impl Checker<'_> {
     /// Warns about a `var` copied from a field, index or map lookup whose last change is never
     /// read. Reads in a loop or branch with the change count as after it, and a var a lambda
     /// captures never warns.
+    /// `let x` then an `if` or `match` whose every branch only sets `x`.
+    fn set_in_branches(&mut self, stmts: &[Stmt]) {
+        for pair in stmts.windows(2) {
+            let [
+                Stmt::Let {
+                    name,
+                    span,
+                    ty,
+                    value: None,
+                    ..
+                },
+                Stmt::Expr(e),
+            ] = pair
+            else {
+                continue;
+            };
+            let mut sets = Vec::new();
+            if !branch_sets(e, name, &mut sets) {
+                continue;
+            }
+            let decl_end = ty.as_ref().map_or(span.end, |t| type_span(t).end);
+            let mut fix = vec![Edit {
+                span: Span::new(decl_end, e.span.start),
+                text: " = ".to_string(),
+            }];
+            fix.extend(sets.into_iter().map(|span| Edit {
+                span,
+                text: String::new(),
+            }));
+            self.diags
+                .push(Diagnostic::warning(Code::set_in_every_branch, *span).with_fix(fix));
+        }
+    }
+
     fn changed_copies(&mut self, stmts: &[Stmt]) {
         for (i, stmt) in stmts.iter().enumerate() {
             let Stmt::Let {
@@ -5051,6 +5087,51 @@ fn copied_path(e: &Expr) -> Option<&Expr> {
         ExprKind::Method(x, m, _) if m == "orPanic" => copied_path(x),
         _ => None,
     }
+}
+
+fn mentions(e: &Expr, name: &str) -> bool {
+    find_expr(e, &mut |x, _| is_name(x, name)).is_some()
+}
+
+/// Whether every branch of `e` only sets `name`, collecting each `name = ` to remove.
+fn branch_sets(e: &Expr, name: &str, sets: &mut Vec<Span>) -> bool {
+    match &e.kind {
+        ExprKind::If(cond, then, Some(other)) => {
+            !mentions(cond, name)
+                && block_sets(then, name, sets)
+                && (branch_sets(other, name, sets) || block_sets(other, name, sets))
+        }
+        ExprKind::Match(subject, arms) => {
+            !mentions(subject, name)
+                && arms.iter().all(|a| {
+                    a.guard.as_ref().is_none_or(|g| !mentions(g, name))
+                        && block_sets(&a.body, name, sets)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn block_sets(body: &Expr, name: &str, sets: &mut Vec<Span>) -> bool {
+    let ExprKind::Block(stmts) = &body.kind else {
+        return false;
+    };
+    let [
+        Stmt::Assign {
+            target,
+            op: None,
+            value,
+            ..
+        },
+    ] = stmts.as_slice()
+    else {
+        return false;
+    };
+    let clean = is_name(target, name) && !mentions(value, name);
+    if clean {
+        sets.push(Span::new(target.span.start, value.span.start));
+    }
+    clean
 }
 
 fn is_name(e: &Expr, name: &str) -> bool {

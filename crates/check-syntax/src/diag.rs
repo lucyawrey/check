@@ -181,6 +181,7 @@ codes! {
     nested_maybe => "[an if or loop value that is a T??]",
     let_else_some => "[let Some(x) = e else, which ?? can replace]",
     repeated_namespace => "[a namespace line that only repeats its package's]",
+    set_in_every_branch => "[a variable declared without a value, then set at the end of every branch]",
     record_beside_class => "[a record literal with its class written right beside it]",
 }
 
