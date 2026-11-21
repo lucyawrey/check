@@ -3243,20 +3243,12 @@ impl Checker<'_> {
 
     fn compare_maybe_with_value(&mut self, lhs: &Expr, lt: Ty, rhs: &Expr, rt: Ty) -> (Ty, Ty) {
         let (a, b) = (self.subst.shallow(&lt), self.subst.shallow(&rt));
+        let plain = |t: &Ty| !matches!(t, Ty::Maybe(_) | Ty::Var(_));
         match (&a, &b) {
-            (Ty::Maybe(_), b) if !matches!(b, Ty::Maybe(_) | Ty::Var(_)) => {
-                if self.subsume(rhs.id, &rt, &lt) {
-                    return (lt.clone(), lt);
-                }
-            }
-            (a, Ty::Maybe(_)) if !matches!(a, Ty::Maybe(_) | Ty::Var(_)) => {
-                if self.subsume(lhs.id, &lt, &rt) {
-                    return (rt.clone(), rt);
-                }
-            }
-            _ => {}
+            (Ty::Maybe(_), b) if plain(b) && self.subsume(rhs.id, &rt, &lt) => (lt.clone(), lt),
+            (a, Ty::Maybe(_)) if plain(a) && self.subsume(lhs.id, &lt, &rt) => (rt.clone(), rt),
+            _ => (lt, rt),
         }
-        (lt, rt)
     }
 
     fn widen_to_maybe(&mut self, elem: &Ty, item: &Ty) -> Option<Ty> {
