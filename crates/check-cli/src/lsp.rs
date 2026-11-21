@@ -157,8 +157,8 @@ impl Server {
         }
     }
 
-    /// A hint before the body of each method that changes `this`, before each argument a call
-    /// can change, and before each value a `try` unwraps inside its operand.
+    /// A hint before the body of each method that changes `this`, and before each argument a
+    /// call can change.
     fn inlay_hints(&self, path: &str) -> Vec<InlayHint> {
         let (_, checked) = self.check(path);
         let sources = &checked.sources;
@@ -170,9 +170,7 @@ impl Server {
         let args = (info.ref_args.values())
             .chain(info.shared_args.values())
             .map(|span| (span, "[changed by the call]"));
-        let returns = (info.try_unwraps.values()).map(|span| (span, "[returns here on a failure]"));
         this.chain(args)
-            .chain(returns)
             .filter(|(span, _)| sources.file(span.start).path == path)
             .map(|(span, label)| InlayHint {
                 position: range_of(*span, sources).start,
@@ -269,6 +267,22 @@ impl Server {
                 let path = &checked.sources.file(d.span.start).path;
                 if let Some(list) = by_file.get_mut(path) {
                     let d = to_lsp(d, &checked.sources);
+                    if !list.contains(&d) {
+                        list.push(d);
+                    }
+                }
+            }
+            // A hint, not an inlay hint: the editor marks each place a `try` can return from
+            // without adding text to the line, and shows the message on hover.
+            for span in checked.info.try_unwraps.values() {
+                if let Some(list) = by_file.get_mut(&checked.sources.file(span.start).path) {
+                    let d = lsp_types::Diagnostic {
+                        range: range_of(*span, &checked.sources),
+                        severity: Some(DiagnosticSeverity::HINT),
+                        source: Some("check".to_string()),
+                        message: "[returns here on a failure]".to_string(),
+                        ..Default::default()
+                    };
                     if !list.contains(&d) {
                         list.push(d);
                     }
