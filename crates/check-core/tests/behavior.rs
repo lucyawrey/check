@@ -2152,13 +2152,16 @@ fn a_map_key_can_be_any_expression() {
 #[test]
 fn map_lookups_writes_and_removals_keep_insertion_order() {
     let src = format!(
-        "{AGES}print(ages[\"cy\"])\nages[\"ana\"] = 32\nages[\"bo\"] += 1\nprint(ages.remove(\"ana\"))\nages[\"ana\"] = 1\nprint(ages.keys())\nprint(ages.values())\nprint(\"{{ages.length()}} {{ages.isEmpty()}} {{ages.contains(\"bo\")}}\")"
+        "{AGES}print(ages[\"cy\"])\nages[\"ana\"] = 32\nlet bo = \"bo\"\nif ages.contains(bo) {{ ages[bo] += 1 }}\nprint(ages.remove(\"ana\"))\nages[\"ana\"] = 1\nprint(ages.keys())\nprint(ages.values())\nprint(\"{{ages.length()}} {{ages.isEmpty()}} {{ages.contains(\"bo\")}}\")"
     );
     assert_eq!(
         output(&src),
         "None\nSome(32)\n[\"bo\", \"ana\"]\n[28, 1]\n2 false true"
     );
-    panics_with(&format!("{AGES}ages[\"cy\"] += 1"), "missing_key");
+    assert_eq!(
+        first_error(&format!("{AGES}ages[\"cy\"] += 1")),
+        "compound_on_missing_index"
+    );
 }
 
 #[test]
@@ -3090,10 +3093,10 @@ fn a_write_through_a_call_reaches_only_shared_values() {
 
 #[test]
 fn paths_run_left_to_right_and_their_base_once() {
-    let src = "var log = Shared([\"\"])\nfunc note(s: String, n: Int) -> Int {\n  log.push(s)\n  n\n}\nvar xs = [0]\nvar grid = [[0]]\nxs[note(\"index\", 0)] = note(\"value\", 1)\nxs[note(\"index\", 0)] += note(\"value\", 1)\ngrid[note(\"index\", 0)].push(note(\"value\", 1))\nshared class Box(var n: Int)\nlet b = Box(1)\nfunc make() -> Box {\n  log.push(\"make\")\n  b\n}\nmake().n = 7\nprint(\"{log} {xs} {grid} {b}\")";
+    let src = "var log = Shared([\"\"])\nfunc note(s: String, n: Int) -> Int {\n  log.push(s)\n  n\n}\nvar xs = [0]\nvar grid = [[0]]\nxs[note(\"index\", 0)] = note(\"value\", 1)\ngrid[note(\"index\", 0)].push(note(\"value\", 1))\nshared class Box(var n: Int)\nlet b = Box(1)\nfunc make() -> Box {\n  log.push(\"make\")\n  b\n}\nmake().n = 7\nprint(\"{log} {xs} {grid} {b}\")";
     assert_eq!(
         output(src),
-        "Shared([\"\", \"index\", \"value\", \"index\", \"value\", \"index\", \"value\", \"make\"]) [2] [[0, 1]] Box(n = 7)"
+        "Shared([\"\", \"index\", \"value\", \"index\", \"value\", \"make\"]) [1] [[0, 1]] Box(n = 7)"
     );
 }
 
@@ -3366,5 +3369,17 @@ fn a_value_wraps_into_a_maybe_in_comparisons_defaults_and_conversions() {
     assert_eq!(
         first_error("var t = None\nt = \"\"\nlet n: Int? = t"),
         "type_mismatch"
+    );
+}
+
+#[test]
+fn a_compound_assignment_to_an_index_needs_the_index_narrowed() {
+    assert_eq!(
+        output("var r = [1, 2]\nfor i in r.indices() { r[i] += 1 }\nprint(r)"),
+        "[2, 3]"
+    );
+    assert_eq!(
+        first_error_fix("var r = [1, 2]\nlet i = 1\nr[i] += 1"),
+        ["r[i] = (r[i] ?? 0) + 1"]
     );
 }

@@ -186,6 +186,7 @@ codes! {
     assigns_itself => "[assigning a name to itself while it hides a field of that name]",
     needless_this => "[this. before a field or method that needs no this.]",
     nested_try => "[a try inside another try, which already covers it]",
+    compound_on_missing_index => "[a compound assignment to an index that might be missing]",
     record_beside_class => "[a record literal with its class written right beside it]",
 }
 

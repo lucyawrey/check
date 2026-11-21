@@ -2462,6 +2462,12 @@ impl Checker<'_> {
         if let Some(code) = err {
             self.error(code, target.span);
         }
+        if op.is_some()
+            && let ExprKind::Index(list, index) = &target.kind
+            && !self.index_narrowed(list, index)
+        {
+            self.compound_on_missing_index(target, &ty, value);
+        }
         let actual = match op {
             None => self.expr(value, Some(&ty)),
             Some(op) => {
@@ -4006,30 +4012,55 @@ impl Checker<'_> {
             Ty::Var(_) => return self.error(Code::type_needed, list.span),
             _ => return self.error(Code::invalid_operand_types, span),
         };
-        if let ExprKind::Name(list_name) = &list.kind {
-            if let ExprKind::Int(k) = index.kind
-                && self
-                    .lookup(list_name)
-                    .and_then(|v| v.list_len)
-                    .is_some_and(|n| k >= 0 && (k as usize) < n)
-            {
-                self.info.unwrapped_index.insert(id);
-                return elem;
-            }
-            if let ExprKind::Name(index_name) = &index.kind
-                && self.narrowed.iter().any(|(l, i, depth)| {
-                    l == list_name
-                        && i == index_name
-                        && [l, i]
-                            .iter()
-                            .all(|n| self.scope_of(n).is_some_and(|s| s <= *depth))
-                })
-            {
-                self.info.unwrapped_index.insert(id);
-                return elem;
-            }
+        if self.index_narrowed(list, index) {
+            self.info.unwrapped_index.insert(id);
+            return elem;
         }
         Ty::maybe(elem)
+    }
+
+    fn index_narrowed(&self, list: &Expr, index: &Expr) -> bool {
+        let ExprKind::Name(list_name) = &list.kind else {
+            return false;
+        };
+        let known_length = |k: i64| {
+            self.lookup(list_name)
+                .and_then(|v| v.list_len)
+                .is_some_and(|n| k >= 0 && (k as usize) < n)
+        };
+        match &index.kind {
+            ExprKind::Int(k) => known_length(*k),
+            ExprKind::Name(index_name) => self.narrowed.iter().any(|(l, i, depth)| {
+                l == list_name
+                    && i == index_name
+                    && [l, i]
+                        .iter()
+                        .all(|n| self.scope_of(n).is_some_and(|s| s <= *depth))
+            }),
+            _ => false,
+        }
+    }
+
+    fn compound_on_missing_index(&mut self, target: &Expr, ty: &Ty, value: &Expr) {
+        let mut d = Diagnostic::error(Code::compound_on_missing_index, target.span);
+        let zero = match self.subst.shallow(ty) {
+            Ty::Int => Some("0"),
+            Ty::Float => Some("0.0"),
+            _ => None,
+        };
+        if let Some(zero) = zero {
+            let place = self.sources.text(target.span);
+            let op = self
+                .sources
+                .text(Span::new(target.span.end, value.span.start));
+            let op = op.trim().trim_end_matches('=');
+            let value_text = self.sources.text(value.span);
+            d = d.with_quick_fix(vec![Edit {
+                span: Span::new(target.span.start, value.span.end),
+                text: format!("{place} = ({place} ?? {zero}) {op} {value_text}"),
+            }]);
+        }
+        self.diags.push(d);
     }
 
     fn lambda(
