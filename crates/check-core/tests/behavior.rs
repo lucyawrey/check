@@ -3383,3 +3383,9 @@ fn a_compound_assignment_to_an_index_needs_the_index_narrowed() {
         ["r[i] = (r[i] ?? 0) + 1"]
     );
 }
+
+#[test]
+fn a_shared_name_given_a_shared_box_shares_that_box() {
+    let src = "func setNine(shared n: Int) { n = 9 }\nlet y = Shared(1)\nshared x = y\nsetNine(x)\nx += 1\nprint(\"{x} {y.value}\")";
+    assert_eq!(output(src), "10 10");
+}

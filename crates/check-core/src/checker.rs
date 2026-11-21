@@ -30,6 +30,7 @@ pub struct Info {
     pub try_unwraps: HashMap<NodeId, Span>,
     pub plain_tries: HashSet<NodeId>,
     pub coalesce_to_maybe: HashSet<NodeId>,
+    pub shared_from_box: HashSet<NodeId>,
     pub wrapping: HashSet<NodeId>,
     pub signatures: HashMap<NodeId, String>,
     /// Each lambda's captured variables: what its body, or a lambda inside it, reads from outside.
@@ -1782,7 +1783,13 @@ impl Checker<'_> {
                         self.expect(value, &actual, &d);
                         d
                     }
-                    None => actual,
+                    None => match self.subst.shallow(&actual) {
+                        Ty::Named(n, mut args) if *is_shared && n == SHARED => {
+                            self.info.shared_from_box.insert(value.id);
+                            args.remove(0)
+                        }
+                        _ => actual,
+                    },
                 };
                 let list_len = match &value.kind {
                     ExprKind::List(items) if !is_var => Some(items.len()),

@@ -896,11 +896,19 @@ impl Interpreter<'_> {
                 is_shared,
                 ..
             } => {
-                let v = match value {
-                    Some(value) => self.scoped(|i| i.expr(value))?,
-                    None => Value::Void,
+                let (v, from_box) = match value {
+                    Some(value) => (
+                        self.scoped(|i| i.expr(value))?,
+                        self.info.shared_from_box.contains(&value.id),
+                    ),
+                    None => (Value::Void, false),
                 };
-                self.define(name, if *is_shared { share_new(v) } else { v });
+                let v = match (is_shared, from_box) {
+                    (true, true) => share(v),
+                    (true, false) => share_new(v),
+                    _ => v,
+                };
+                self.define(name, v);
                 Ok(Value::Void)
             }
             Stmt::Assign {
