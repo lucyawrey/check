@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ast::*;
+use crate::copy::Text;
 use crate::diag::{Code, Diagnostic, Edit, Severity, Sources, Span};
 use crate::types::{Show, Subst, Ty};
 
@@ -44,8 +45,8 @@ pub struct Info {
     pub implements: HashMap<String, HashSet<String>>,
     /// Each `ref` binding, by its target, and how many statements after it its last use is.
     pub ref_ends: HashMap<NodeId, usize>,
-    /// Methods whose body changes `this`, so calls write it back, with where the body starts.
-    pub changes_this: HashMap<String, Span>,
+    /// Methods whose body changes `this`, so calls write it back.
+    pub changes_this: HashSet<String>,
     /// Arguments passed to a `ref` parameter, which the call writes back.
     pub ref_args: HashMap<NodeId, Span>,
     /// Shared names passed to a `shared` parameter or field, which pass their box.
@@ -1506,10 +1507,7 @@ impl Checker<'_> {
         }
         self.info.changes_this = (self.funcs.iter())
             .filter(|(_, f)| f.changes_this)
-            .map(|(k, f)| {
-                let at = f.decl.body.as_ref().map_or(f.decl.span, |b| b.span).start;
-                (k.clone(), Span::new(at, at))
-            })
+            .map(|(k, _)| k.clone())
             .collect();
     }
 
@@ -1617,7 +1615,8 @@ impl Checker<'_> {
             && self.lookup(n).is_some_and(|v| v.kind == VarKind::Local)
             && !self.is_captured(n)
         {
-            detail.push_str(" [or declare it with shared]");
+            detail.push(' ');
+            detail.push_str(Text::detail_or_shared.get());
         }
         d.detail = Some(detail);
         self.diags.push(d);
@@ -2653,7 +2652,7 @@ impl Checker<'_> {
                 let missing = (self.diags[before..].iter_mut())
                     .find(|d| d.code == Code::unknown_field && d.span == expr.span);
                 if let Some(d) = missing.filter(|_| shared_name) {
-                    d.detail = Some("[it's shared: it already reads as its value]".to_string());
+                    d.detail = Some(Text::detail_already_shared.get().to_string());
                     d.fix = vec![Edit {
                         span: Span::new(base.span.end, expr.span.end),
                         text: String::new(),

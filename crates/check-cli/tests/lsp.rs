@@ -269,15 +269,6 @@ fn hint_positions(test: &str, src: &str) -> Vec<Value> {
 }
 
 #[test]
-fn hints_each_method_that_changes_this() {
-    let positions = hint_positions(
-        "this hints",
-        "class C {\n  var n: Int = 0\n  func bump() { this.n += 1 }\n  func get() -> Int { this.n }\n}",
-    );
-    assert_eq!(positions, [json!({ "line": 2, "character": 14 })]);
-}
-
-#[test]
 fn hints_each_argument_a_call_can_change() {
     let positions = hint_positions(
         "argument hints",

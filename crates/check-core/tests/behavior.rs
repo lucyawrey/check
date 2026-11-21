@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use check_core::ast::Stmt;
+use check_core::copy::Text;
 use check_core::diag::Severity;
 use check_core::modules::{MemFiles, entry_of};
 use check_core::{Outcome, Report, run_program, run_source};
@@ -2629,11 +2630,15 @@ fn a_shared_where_its_value_is_expected_suggests_value() {
             Some("r.value".to_string())
         )
     );
+    let or_shared = |fix: &str| format!("{fix} {}", Text::detail_or_shared.get());
     for (src, value) in [
-        ("print(r + 1)", "r.value [or declare it with shared]"),
-        ("print(1 < r)", "r.value [or declare it with shared]"),
-        ("var v = r\nv += 1", "v.value [or declare it with shared]"),
-        ("func f(p: Shared<Int>) -> Int { p + 1 }", "p.value"),
+        ("print(r + 1)", or_shared("r.value")),
+        ("print(1 < r)", or_shared("r.value")),
+        ("var v = r\nv += 1", or_shared("v.value")),
+        (
+            "func f(p: Shared<Int>) -> Int { p + 1 }",
+            "p.value".to_string(),
+        ),
     ] {
         let src = format!("let r = Shared(1)\n{src}");
         assert_eq!(
@@ -2641,7 +2646,7 @@ fn a_shared_where_its_value_is_expected_suggests_value() {
             ["shared_where_value_expected"],
             "{src}"
         );
-        assert_eq!(error_and_fix(&src).1.as_deref(), Some(value), "{src}");
+        assert_eq!(error_and_fix(&src).1, Some(value), "{src}");
     }
     for keyword in ["let", "var"] {
         let src = format!("{SET_NINE}{keyword} b = Shared(1)\nsetNine(b)");

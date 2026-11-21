@@ -1747,7 +1747,7 @@ impl Interpreter<'_> {
         match info.resolved.get(&id) {
             Some(Resolved::Method(key)) => {
                 let decl = self.funcs[key].clone();
-                if !info.changes_this.contains_key(key) {
+                if !info.changes_this.contains(key) {
                     let this = deref(self.expr(recv)?);
                     return self.call_named(&decl, args, span, Some(this));
                 }

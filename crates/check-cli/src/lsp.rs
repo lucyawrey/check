@@ -6,6 +6,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::str::FromStr;
 
+use check_core::copy::Text;
 use check_core::diag::{Diagnostic, Severity, Sources, Span};
 use check_core::modules::{entry_of, is_entry_source};
 use check_core::tidy::tidy;
@@ -157,24 +158,18 @@ impl Server {
         }
     }
 
-    /// A hint before the body of each method that changes `this`, and before each argument a
-    /// call can change.
+    /// A hint before each argument a call can change, naming its parameter's `ref` or `shared`.
     fn inlay_hints(&self, path: &str) -> Vec<InlayHint> {
         let (_, checked) = self.check(path);
         let sources = &checked.sources;
         let info = &checked.info;
-        let this = info
-            .changes_this
-            .values()
-            .map(|span| (span, "[changes this]"));
-        let args = (info.ref_args.values())
-            .chain(info.shared_args.values())
-            .map(|span| (span, "[changed by the call]"));
-        this.chain(args)
+        let refs = (info.ref_args.values()).map(|span| (span, Text::hint_ref_argument));
+        let shared = (info.shared_args.values()).map(|span| (span, Text::hint_shared_argument));
+        refs.chain(shared)
             .filter(|(span, _)| sources.file(span.start).path == path)
-            .map(|(span, label)| InlayHint {
+            .map(|(span, text)| InlayHint {
                 position: range_of(*span, sources).start,
-                label: InlayHintLabel::String(label.to_string()),
+                label: InlayHintLabel::String(text.get().to_string()),
                 kind: None,
                 text_edits: None,
                 tooltip: None,
@@ -280,7 +275,7 @@ impl Server {
                         range: range_of(*span, &checked.sources),
                         severity: Some(DiagnosticSeverity::HINT),
                         source: Some("check".to_string()),
-                        message: "[returns here on a failure]".to_string(),
+                        message: Text::hint_try_returns.get().to_string(),
                         ..Default::default()
                     };
                     if !list.contains(&d) {
@@ -325,7 +320,7 @@ impl Server {
                         ));
                 }
                 CodeActionOrCommand::CodeAction(CodeAction {
-                    title: "[title of the quick fix for one diagnostic]".to_string(),
+                    title: Text::fix_title.get().to_string(),
                     kind: Some(CodeActionKind::QUICKFIX),
                     diagnostics: Some(vec![to_lsp(d, sources)]),
                     edit: Some(WorkspaceEdit::new(changes)),
@@ -361,7 +356,7 @@ impl Server {
         let new_text = text[start..text.len() - same_end].to_string();
         let changes = HashMap::from([(uri_of(path), vec![TextEdit::new(changed, new_text)])]);
         vec![CodeActionOrCommand::CodeAction(CodeAction {
-            title: "[title of the action that applies every tidy fix in the file]".to_string(),
+            title: Text::fix_all_title.get().to_string(),
             kind: Some(CodeActionKind::from(FIX_ALL.to_string())),
             edit: Some(WorkspaceEdit::new(changes)),
             ..Default::default()

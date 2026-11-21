@@ -1,5 +1,7 @@
 use std::fmt;
 
+use check_syntax::copy::Text;
+
 use crate::data::Data;
 use serde::de::{self, IntoDeserializer, Visitor};
 
@@ -68,7 +70,7 @@ impl<'de> de::Deserializer<'de> for ValueDe {
                 ..
             } => visitor.visit_map(MapDe::fields(names, fields)),
             Data::Named { fields, .. } => visitor.visit_seq(SeqDe::new(fields)),
-            Data::Other => Err(de::Error::custom("[a value a .con file can't hold]")),
+            Data::Other => Err(de::Error::custom(Text::con_value_unsupported.get())),
         }
     }
 
