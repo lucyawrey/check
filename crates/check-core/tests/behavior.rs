@@ -3302,6 +3302,12 @@ fn reading_a_variable_that_might_not_be_set_is_an_error() {
 }
 
 #[test]
+fn a_var_set_only_inside_a_loop_counts_as_reassigned() {
+    let src = "func f(xs: List<Int>) {\n  var last\n  for x in xs {\n    last = x\n    print(last)\n  }\n}";
+    assert!(warnings(src).is_empty());
+}
+
+#[test]
 fn a_maybe_of_a_maybe_is_written_with_two_question_marks() {
     let src = "let m: Map<String, Int?> = [\"a\" = None]\nlet x: Int?? = m[\"a\"]\nlet y: List<Int??> = [x]\nfunc f(v: Int??) -> Int?? { v }\nprint(\"{x} {y} {f(None)}\")";
     assert_eq!(output(src), "Some(None) [Some(None)] None");
@@ -3318,8 +3324,8 @@ fn one_try_covers_every_failure_in_its_expression() {
     assert_eq!(output(passes_through), "Some(1)");
     let operands = "func ops(a: String) -> Int? { try Int.parse(a) * 2 + Int.parse(a) }\nfunc size(m: Map<String, List<Int>>) -> Int? { try m[\"a\"].length() }\nprint(\"{ops(\"2\")} {ops(\"x\")} {size([\"a\" = [1, 2]])} {size([=])}\")";
     assert_eq!(output(operands), "Some(6) None Some(2) None");
-    let compared = "func a() -> Int? { 1 }\nfunc b() -> Int? { None }\nfunc f() -> Bool? { try a() == 1 }\nfunc g() -> Bool? { try a() != b() }\nprint(\"{f()} {g()}\")";
-    assert_eq!(output(compared), "Some(true) None");
+    let compared = "func a() -> Int? { None }\nfunc pick(same: Bool, n: Int) -> Int { if same { n } else { -n } }\nfunc f() -> Int? { try pick(a() == 1, Int.parse(\"2\")) }\nfunc g() -> Int? { try pick(a() == None, Int.parse(\"2\")) }\nprint(\"{f()} {g()}\")";
+    assert_eq!(output(compared), "Some(-2) Some(2)");
     assert_eq!(
         diagnostics(
             "func a() -> Int? { 1 }\nfunc f() -> Result<Int, String> { Ok(try a() + 1) }",

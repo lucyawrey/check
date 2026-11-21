@@ -264,7 +264,7 @@ pub struct Checker<'s> {
     body_writes: HashSet<String>,
     in_try: bool,
     try_points: usize,
-    lets_without_value: HashMap<Span, usize>,
+    without_value: HashMap<Span, usize>,
     let_sets: HashMap<Span, Span>,
     /// The lambdas being checked, innermost last: each one's first scope (variables below it are
     /// captured) and what it has captured so far.
@@ -341,7 +341,7 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         body_writes: HashSet::new(),
         in_try: false,
         try_points: 0,
-        lets_without_value: HashMap::new(),
+        without_value: HashMap::new(),
         let_sets: HashMap::new(),
         lambdas: Vec::new(),
         narrowed: Vec::new(),
@@ -1753,9 +1753,7 @@ impl Checker<'_> {
                     let ty = declared.unwrap_or_else(|| self.subst.fresh());
                     self.flow.maybe_unset.insert(*span);
                     self.flow.maybe_set.remove(span);
-                    if !is_var {
-                        self.lets_without_value.insert(*span, self.loops.len());
-                    }
+                    self.without_value.insert(*span, self.loops.len());
                     let var = Var {
                         ty,
                         mutable: *is_var,
@@ -2044,11 +2042,7 @@ impl Checker<'_> {
         let depth = self.loops.len() - 1;
         let repeated: Vec<Span> = (self.flow.maybe_set.iter())
             .filter(|decl| !ctx.set_before.contains(decl))
-            .filter(|decl| {
-                self.lets_without_value
-                    .get(decl)
-                    .is_some_and(|&d| d <= depth)
-            })
+            .filter(|decl| self.without_value.get(decl).is_some_and(|&d| d <= depth))
             .filter_map(|decl| self.let_sets.get(decl).copied())
             .collect();
         for span in repeated {
@@ -2515,13 +2509,10 @@ impl Checker<'_> {
                 || self.flow.maybe_set.contains(&var.span))
             && !self.is_captured(n)
         {
-            let (decl, ty) = (var.span, var.ty.clone());
+            let (decl, ty, is_var) = (var.span, var.ty.clone(), var.mutable);
             let again = self.flow.maybe_set.contains(&decl)
-                || self
-                    .lets_without_value
-                    .get(&decl)
-                    .is_some_and(|&d| self.loops.len() > d);
-            if self.lets_without_value.contains_key(&decl) {
+                || (self.without_value.get(&decl)).is_some_and(|&d| self.loops.len() > d);
+            if !is_var {
                 if self.flow.maybe_set.contains(&decl) {
                     self.error(Code::let_set_twice, target.span);
                 }
@@ -3315,7 +3306,6 @@ impl Checker<'_> {
                     let rt = self.expr(rhs, Some(&lt));
                     (lt, rt)
                 };
-                let (lt, rt) = self.unwrap_compared(lhs, lt, rhs, rt);
                 let (lt, rt) = self.compare_maybe_with_value(lhs, lt, rhs, rt);
                 self.binary_type(op, lhs, &lt, rhs, &rt, span)
             }
@@ -3334,13 +3324,6 @@ impl Checker<'_> {
                 self.binary_type(op, lhs, &lt, rhs, &rt, span)
             }
         }
-    }
-
-    fn unwrap_compared(&mut self, lhs: &Expr, lt: Ty, rhs: &Expr, rt: Ty) -> (Ty, Ty) {
-        if is_name(lhs, "None") || is_name(rhs, "None") {
-            return (lt, rt);
-        }
-        (self.try_operand(lhs, lt), self.try_operand(rhs, rt))
     }
 
     fn compare_maybe_with_value(&mut self, lhs: &Expr, lt: Ty, rhs: &Expr, rt: Ty) -> (Ty, Ty) {
