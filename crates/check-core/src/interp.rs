@@ -244,6 +244,12 @@ fn coerce(info: &Info, id: NodeId, mut value: Value) -> Value {
         {
             value = Value::Float(n as f64);
         }
+        if c.maybe_to_float
+            && let Value::Some(v) = &value
+            && let Value::Int(n) = **v
+        {
+            value = Value::Some(Rc::new(Value::Float(n as f64)));
+        }
         for _ in 0..c.wraps {
             value = Value::Some(Rc::new(value));
         }
@@ -1396,6 +1402,7 @@ impl Interpreter<'_> {
                 self.expr(rhs)
             }
             BinOp::Coalesce => match self.expr(lhs)? {
+                v @ Value::Some(_) if self.info.coalesce_to_maybe.contains(&lhs.id) => Ok(v),
                 Value::Some(v) => Ok((*v).clone()),
                 Value::Variant(r) if &*r.name == "Ok" => Ok(r.fields[0].clone()),
                 _ => self.expr(rhs),

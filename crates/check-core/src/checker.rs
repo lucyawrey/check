@@ -7,6 +7,7 @@ use crate::types::{Show, Subst, Ty};
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Coercion {
     pub to_float: bool,
+    pub maybe_to_float: bool,
     pub wraps: usize,
     /// Wraps the value in `Ok` after any `Some`s, for a function that infers a `Result`.
     pub ok: bool,
@@ -28,6 +29,7 @@ pub struct Info {
     pub coercions: HashMap<NodeId, Coercion>,
     pub try_unwraps: HashMap<NodeId, Span>,
     pub plain_tries: HashSet<NodeId>,
+    pub coalesce_to_maybe: HashSet<NodeId>,
     pub wrapping: HashSet<NodeId>,
     pub signatures: HashMap<NodeId, String>,
     /// Each lambda's captured variables: what its body, or a lambda inside it, reads from outside.
@@ -1540,6 +1542,12 @@ impl Checker<'_> {
                 self.add_coercion(id, true, 0);
                 true
             }
+            (Ty::Maybe(x), Ty::Maybe(y))
+                if self.subst.shallow(x) == Ty::Int && self.subst.shallow(y) == Ty::Float =>
+            {
+                self.info.coercions.entry(id).or_default().maybe_to_float = true;
+                true
+            }
             (Ty::Maybe(_), Ty::Maybe(_)) => self.conforms(&a, &e),
             (_, Ty::Maybe(inner)) => {
                 let inner = (**inner).clone();
@@ -1569,11 +1577,12 @@ impl Checker<'_> {
             self.ref_value_hint(expr, false);
             return;
         }
-        let code = if matches!(a, Ty::Maybe(_)) {
-            Code::unhandled_maybe
-        } else {
-            self.mismatch(&a, expected, Code::type_mismatch)
-        };
+        let code =
+            if matches!(a, Ty::Maybe(_)) && !matches!(self.subst.shallow(expected), Ty::Maybe(_)) {
+                Code::unhandled_maybe
+            } else {
+                self.mismatch(&a, expected, Code::type_mismatch)
+            };
         self.error(code, expr.span);
     }
 
@@ -2315,6 +2324,7 @@ impl Checker<'_> {
                 None => false,
             },
             Ty::Record(_, fields) => fields.iter().all(|f| self.is_key(f, seen)),
+            Ty::Maybe(inner) => self.is_key(inner, seen),
             Ty::Named(name, _) if name == MAP || name == SET || name == SHARED => false,
             Ty::Named(..) if self.is_interface(&ty) || self.is_shared_class(&ty) => false,
             Ty::Named(name, _)
@@ -2590,12 +2600,21 @@ impl Checker<'_> {
                     Some(Ty::Maybe(inner)) => Some(self.subst.shallow(&inner)),
                     e => e,
                 };
-                let (elem, declared) = match expected {
+                let (mut elem, declared) = match expected {
                     Some(Ty::List(e)) => (*e, true),
                     _ => (self.subst.fresh(), false),
                 };
+                let mut typed = Vec::new();
                 for item in items {
                     let t = self.expr(item, Some(&elem));
+                    if !declared && matches!(self.subst.shallow(&elem), Ty::Var(_)) {
+                        self.subst.unify(&elem, &t);
+                    } else if !declared && let Some(widened) = self.widen_to_maybe(&elem, &t) {
+                        elem = widened;
+                    }
+                    typed.push((item, t));
+                }
+                for (item, t) in typed {
                     let different_types = !declared
                         && matches!(
                             (self.subst.shallow(&t), self.subst.shallow(&elem)),
@@ -3183,6 +3202,13 @@ impl Checker<'_> {
                     _ => return self.error(Code::type_mismatch, lhs.span),
                 };
                 let rt = self.expr(rhs, Some(&inner));
+                let maybe = Ty::maybe(inner.clone());
+                if matches!(self.subst.shallow(&rt), Ty::Maybe(_))
+                    && self.subsume(rhs.id, &rt, &maybe)
+                {
+                    self.info.coalesce_to_maybe.insert(lhs.id);
+                    return maybe;
+                }
                 self.expect(rhs, &rt, &inner);
                 inner
             }
@@ -3195,6 +3221,7 @@ impl Checker<'_> {
                     let rt = self.expr(rhs, Some(&lt));
                     (lt, rt)
                 };
+                let (lt, rt) = self.compare_maybe_with_value(lhs, lt, rhs, rt);
                 self.binary_type(op, lhs, &lt, rhs, &rt, span)
             }
             _ => {
@@ -3211,6 +3238,35 @@ impl Checker<'_> {
                 }
                 self.binary_type(op, lhs, &lt, rhs, &rt, span)
             }
+        }
+    }
+
+    fn compare_maybe_with_value(&mut self, lhs: &Expr, lt: Ty, rhs: &Expr, rt: Ty) -> (Ty, Ty) {
+        let (a, b) = (self.subst.shallow(&lt), self.subst.shallow(&rt));
+        match (&a, &b) {
+            (Ty::Maybe(_), b) if !matches!(b, Ty::Maybe(_) | Ty::Var(_)) => {
+                if self.subsume(rhs.id, &rt, &lt) {
+                    return (lt.clone(), lt);
+                }
+            }
+            (a, Ty::Maybe(_)) if !matches!(a, Ty::Maybe(_) | Ty::Var(_)) => {
+                if self.subsume(lhs.id, &lt, &rt) {
+                    return (rt.clone(), rt);
+                }
+            }
+            _ => {}
+        }
+        (lt, rt)
+    }
+
+    fn widen_to_maybe(&mut self, elem: &Ty, item: &Ty) -> Option<Ty> {
+        match (self.subst.shallow(elem), self.subst.shallow(item)) {
+            (e, Ty::Maybe(x))
+                if !matches!(e, Ty::Maybe(_) | Ty::Var(_)) && self.subst.unify(&e, &x) =>
+            {
+                Some(Ty::Maybe(x))
+            }
+            _ => None,
         }
     }
 
@@ -4017,7 +4073,11 @@ impl Checker<'_> {
                 },
             );
         }
-        let declared = ret.map(|t| self.type_from(t));
+        let expected_maybe = match expected.map(|e| self.subst.shallow(e)) {
+            Some(Ty::Func(_, r)) if matches!(self.subst.shallow(&r), Ty::Maybe(_)) => Some(*r),
+            _ => None,
+        };
+        let declared = ret.map(|t| self.type_from(t)).or(expected_maybe);
         let saved_loops = std::mem::take(&mut self.loops);
         let saved_flow = self.flow.clone();
         let saved_try = std::mem::take(&mut self.in_try);

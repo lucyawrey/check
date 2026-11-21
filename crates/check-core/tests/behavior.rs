@@ -3355,3 +3355,16 @@ fn a_try_inside_another_is_flagged() {
         ["nested_try"]
     );
 }
+
+#[test]
+fn a_value_wraps_into_a_maybe_in_comparisons_defaults_and_conversions() {
+    let src = "func run(f: func() -> Int?) -> Int? { f() }\nfunc half(x: Float?) -> Float? { x }\nlet a: Int? = 5\nlet b: Int? = None\nlet f: Float? = a\nlet zs: List<Float?> = [a, 2.5]\nlet xs = [1, None, 3]\nlet s: Set<Int?> = Set([1, None])\nprint(\"{a == 5} {a != 5} {5 == a} {b == None} {a == b}\")\nprint(\"{a ?? b} {b ?? a} {b ?? b ?? 0} {f} {half(a)} {zs}\")\nprint(\"{xs} {run(func() => 5)} {s.length()}\")\nvar ys: List<Int?> = [None]\nlet i = 0\nprint(ys[i])";
+    assert_eq!(
+        output(src),
+        "true false true true false\nSome(5) Some(5) 0 Some(5.0) Some(5.0) [Some(5.0), Some(2.5)]\n[Some(1), None, Some(3)] Some(5) 2\nSome(None)"
+    );
+    assert_eq!(
+        first_error("var t = None\nt = \"\"\nlet n: Int? = t"),
+        "type_mismatch"
+    );
+}
