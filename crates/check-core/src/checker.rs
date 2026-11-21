@@ -89,6 +89,7 @@ struct FuncEntry {
     state: FuncState,
     this: Option<(Ty, bool)>,
     changes_this: bool,
+    writes_globals: HashSet<String>,
     owner: Option<String>,
     library: bool,
     /// The type parameters it's generic over, its owner's included, and their bounds.
@@ -211,6 +212,7 @@ struct FnCtx {
     declared: Option<Ty>,
     fails: Option<Fails>,
     returns: Vec<(NodeId, Span, Ty)>,
+    writes_globals: HashSet<String>,
 }
 
 #[derive(PartialEq)]
@@ -258,6 +260,7 @@ pub struct Checker<'s> {
     fns: Vec<FnCtx>,
     loops: Vec<LoopCtx>,
     flow: Flow,
+    body_writes: HashSet<String>,
     in_try: bool,
     try_points: usize,
     lets_without_value: HashMap<Span, usize>,
@@ -333,6 +336,7 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         fns: Vec::new(),
         loops: Vec::new(),
         flow: Flow::default(),
+        body_writes: HashSet::new(),
         in_try: false,
         try_points: 0,
         lets_without_value: HashMap::new(),
@@ -822,6 +826,7 @@ impl Checker<'_> {
             state: FuncState::Unchecked,
             this,
             changes_this: false,
+            writes_globals: HashSet::new(),
             owner: owner.map(str::to_string),
             library: self.in_library,
             bounds,
@@ -1142,9 +1147,11 @@ impl Checker<'_> {
         self.in_try = saved_try;
         self.lambdas = saved_lambdas;
         self.narrowed = saved_narrowed;
+        let writes = std::mem::take(&mut self.body_writes);
         let entry = self.funcs.get_mut(name)?;
         entry.sig.ret = Some(ret);
         entry.bounds = bounds;
+        entry.writes_globals = writes;
         entry.state = FuncState::Done;
         Some(entry.sig.clone())
     }
@@ -1155,9 +1162,11 @@ impl Checker<'_> {
             declared: declared.clone(),
             fails: None,
             returns: Vec::new(),
+            writes_globals: HashSet::new(),
         });
         let body_ty = self.expr(body, declared.as_ref());
-        let ctx = self.fns.pop().expect("function context");
+        let mut ctx = self.fns.pop().expect("function context");
+        self.body_writes = std::mem::take(&mut ctx.writes_globals);
         let ret = match declared {
             Some(t) => t,
             None => {
@@ -2012,11 +2021,38 @@ impl Checker<'_> {
                 self.mark_changes_this(key);
             }
         }
+        if let Some(root) = &root {
+            self.note_global_write(root);
+        }
         // A change through a `Shared` or `shared class` leaves the variable itself as it was.
         if !through && let Some(var) = root.and_then(|n| self.lookup_mut(&n)) {
             var.reassigned = true;
         }
         (ty, err)
+    }
+
+    fn note_global_write(&mut self, name: &str) {
+        if self.scope_of(name) == Some(0)
+            && let Some(f) = self.fns.last_mut()
+        {
+            f.writes_globals.insert(name.to_string());
+        }
+    }
+
+    fn ref_to_global_the_callee_writes(&mut self, callee: &str, args: &[Arg]) {
+        let writes = self.funcs[callee].writes_globals.clone();
+        for arg in args {
+            if self.info.ref_args.contains_key(&arg.value.id)
+                && let Some((root, _)) = ref_path(&arg.value)
+                && writes.contains(root)
+                && self.scope_of(root) == Some(0)
+            {
+                self.error(Code::ref_global_written, arg.value.span);
+            }
+        }
+        if let Some(f) = self.fns.last_mut() {
+            f.writes_globals.extend(writes);
+        }
     }
 
     /// `shared x`: the box behind a shared local, parameter or field.
@@ -3641,6 +3677,7 @@ impl Checker<'_> {
             })
             .collect();
         self.match_args(&params, args, span);
+        self.ref_to_global_the_callee_writes(name, args);
         match sig {
             Some(sig) => sig.ret.unwrap_or(Ty::Void).substitute(&map),
             None => Ty::Error,
@@ -3770,7 +3807,10 @@ impl Checker<'_> {
             // Typed as a write path (`grid[i]` is a list, not a maybe), but only a collection's
             // method changes it.
             let (t, _) = self.place_path(recv);
-            (self.through_shared, self.place_root) = (false, None);
+            if let Some(root) = self.place_root.take() {
+                self.note_global_write(&root);
+            }
+            self.through_shared = false;
             if self.is_collection(&t) {
                 self.changed_receiver(recv, Code::change_let_collection);
             }

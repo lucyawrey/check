@@ -1531,8 +1531,9 @@ impl Interpreter<'_> {
     ) -> Eval {
         let (values, places) = self.bind_args(&decl.params, args)?;
         let names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+        let passed = values.clone();
         let (result, kept) = self.run_decl(decl, values, this, span, &names)?;
-        self.write_back(places, kept)?;
+        self.write_back(places, passed, kept, span)?;
         Ok(result)
     }
 
@@ -1548,20 +1549,36 @@ impl Interpreter<'_> {
         let (values, places) = self.bind_args(&decl.params, args)?;
         let mut names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
         names.push("this".to_string());
+        let passed = values.clone();
+        let passed_this = this.clone();
         let (result, mut kept) = self.run_decl(decl, values, Some(this), span, &names)?;
         let this = kept.pop().expect("this is kept last");
-        self.write_back(places, kept)?;
+        self.write_back(places, passed, kept, span)?;
         self.write_steps(&mut root, &steps, &mut |slot| {
-            through_ref(slot, |slot| *slot = this.clone());
-            Ok(())
+            through_ref(slot, |slot| {
+                if *slot != passed_this {
+                    return panic(Code::ref_changed_elsewhere, span);
+                }
+                *slot = this.clone();
+                Ok(())
+            })
         })?;
         Ok(result)
     }
 
-    fn write_back(&mut self, places: Vec<Option<Place>>, kept: Vec<Value>) -> Result<(), Flow> {
-        for (place, value) in places.into_iter().zip(kept) {
+    fn write_back(
+        &mut self,
+        places: Vec<Option<Place>>,
+        passed: Vec<Value>,
+        kept: Vec<Value>,
+        span: Span,
+    ) -> Result<(), Flow> {
+        for ((place, before), value) in places.into_iter().zip(passed).zip(kept) {
             if let Some((mut root, steps)) = place {
                 self.write_steps(&mut root, &steps, &mut |slot| {
+                    if *slot != before {
+                        return panic(Code::ref_changed_elsewhere, span);
+                    }
                     *slot = value.clone();
                     Ok(())
                 })?;

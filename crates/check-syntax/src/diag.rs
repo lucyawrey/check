@@ -187,6 +187,8 @@ codes! {
     needless_this => "[this. before a field or method that needs no this.]",
     nested_try => "[a try inside another try, which already covers it]",
     compound_on_missing_index => "[a compound assignment to an index that might be missing]",
+    ref_changed_elsewhere => "[a ref argument's place changed another way during the call]",
+    ref_global_written => "[a global passed as ref to a function that also writes it]",
     record_beside_class => "[a record literal with its class written right beside it]",
 }
 

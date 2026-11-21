@@ -3393,3 +3393,24 @@ fn a_shared_name_given_a_shared_box_shares_that_box() {
     let src = "func setNine(shared n: Int) { n = 9 }\nlet y = Shared(1)\nshared x = y\nsetNine(x)\nx += 1\nprint(\"{x} {y.value}\")";
     assert_eq!(output(src), "10 10");
 }
+
+#[test]
+fn a_ref_to_a_global_the_function_also_writes_is_an_error() {
+    let src = "var n = 0\nvar xs = [1]\nfunc touch() { xs.push(2) }\nfunc bump(ref a: Int) {\n  a += 1\n  n += 10\n}\nfunc h(ref l: List<Int>) { touch() }\n";
+    assert_eq!(
+        diagnostics(&format!("{src}bump(n)\nh(xs)"), Severity::Error),
+        ["ref_global_written", "ref_global_written"]
+    );
+    assert_eq!(
+        output(&format!("{src}var k = 0\nbump(k)\nprint(\"{{k}} {{n}}\")")),
+        "1 10"
+    );
+}
+
+#[test]
+fn a_ref_place_changed_another_way_during_the_call_panics() {
+    let callback = "var n = 0\nfunc calls(ref a: Int, f: func()) {\n  a += 1\n  f()\n}\nfunc addFive() { n += 5 }\ncalls(n, addFive)";
+    panics_with(callback, "ref_changed_elsewhere");
+    let field = "shared class Count(var n: Int)\nclass Holder(shared c: Count)\nfunc g(ref a: Int, h: Holder) {\n  a += 1\n  h.c.n += 10\n}\nlet c = Count(1)\nlet x = Holder(c)\nlet y = Holder(c)\ng(x.c.n, y)";
+    panics_with(field, "ref_changed_elsewhere");
+}
