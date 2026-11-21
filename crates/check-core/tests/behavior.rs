@@ -2152,13 +2152,16 @@ fn a_map_key_can_be_any_expression() {
 #[test]
 fn map_lookups_writes_and_removals_keep_insertion_order() {
     let src = format!(
-        "{AGES}print(ages[\"cy\"])\nages[\"ana\"] = 32\nages[\"bo\"] += 1\nprint(ages.remove(\"ana\"))\nages[\"ana\"] = 1\nprint(ages.keys())\nprint(ages.values())\nprint(\"{{ages.length()}} {{ages.isEmpty()}} {{ages.contains(\"bo\")}}\")"
+        "{AGES}print(ages[\"cy\"])\nages[\"ana\"] = 32\nlet bo = \"bo\"\nif ages.contains(bo) {{ ages[bo] += 1 }}\nprint(ages.remove(\"ana\"))\nages[\"ana\"] = 1\nprint(ages.keys())\nprint(ages.values())\nprint(\"{{ages.length()}} {{ages.isEmpty()}} {{ages.contains(\"bo\")}}\")"
     );
     assert_eq!(
         output(&src),
         "None\nSome(32)\n[\"bo\", \"ana\"]\n[28, 1]\n2 false true"
     );
-    panics_with(&format!("{AGES}ages[\"cy\"] += 1"), "missing_key");
+    assert_eq!(
+        first_error(&format!("{AGES}ages[\"cy\"] += 1")),
+        "compound_on_missing_index"
+    );
 }
 
 #[test]
@@ -2974,9 +2977,13 @@ fn value_on_a_shared_name_offers_to_drop_it() {
     assert_eq!(first_error_fix("shared n = 0\nprint(n.value)"), [""]);
     assert_eq!(
         output(
-            "class Wrapper(var value: Int)\nshared w = Wrapper(1)\nshared b = Shared(2)\nprint(\"{w.value} {b.value}\")"
+            "class Wrapper(var value: Int)\nshared w = Wrapper(1)\nshared b = Shared(2)\nprint(\"{w.value} {b}\")"
         ),
         "1 2"
+    );
+    assert_eq!(
+        first_error_fix("shared b = Shared(2)\nprint(b.value)"),
+        [""]
     );
 }
 
@@ -3090,10 +3097,10 @@ fn a_write_through_a_call_reaches_only_shared_values() {
 
 #[test]
 fn paths_run_left_to_right_and_their_base_once() {
-    let src = "var log = Shared([\"\"])\nfunc note(s: String, n: Int) -> Int {\n  log.push(s)\n  n\n}\nvar xs = [0]\nvar grid = [[0]]\nxs[note(\"index\", 0)] = note(\"value\", 1)\nxs[note(\"index\", 0)] += note(\"value\", 1)\ngrid[note(\"index\", 0)].push(note(\"value\", 1))\nshared class Box(var n: Int)\nlet b = Box(1)\nfunc make() -> Box {\n  log.push(\"make\")\n  b\n}\nmake().n = 7\nprint(\"{log} {xs} {grid} {b}\")";
+    let src = "var log = Shared([\"\"])\nfunc note(s: String, n: Int) -> Int {\n  log.push(s)\n  n\n}\nvar xs = [0]\nvar grid = [[0]]\nxs[note(\"index\", 0)] = note(\"value\", 1)\ngrid[note(\"index\", 0)].push(note(\"value\", 1))\nshared class Box(var n: Int)\nlet b = Box(1)\nfunc make() -> Box {\n  log.push(\"make\")\n  b\n}\nmake().n = 7\nprint(\"{log} {xs} {grid} {b}\")";
     assert_eq!(
         output(src),
-        "Shared([\"\", \"index\", \"value\", \"index\", \"value\", \"index\", \"value\", \"make\"]) [2] [[0, 1]] Box(n = 7)"
+        "Shared([\"\", \"index\", \"value\", \"index\", \"value\", \"make\"]) [1] [[0, 1]] Box(n = 7)"
     );
 }
 
@@ -3259,4 +3266,149 @@ fn a_lambda_changes_shared_values_it_captured_and_calls_its_own_captures() {
     assert_eq!(output(src), "Shared([1, 2]) Box(x = 7) 2");
     let callback = "shared class Player {\n  var score: Int = 0\n  func bump() -> func() { func() { this.score += 1 } }\n}\nlet p = Player()\np.bump()()\nprint(p.score)";
     assert_eq!(output(callback), "1");
+}
+
+#[test]
+fn a_variable_declared_without_a_value_is_set_on_every_path_before_a_read() {
+    let src = "func grade(score: Int) -> String {\n  let g\n  if score > 90 { g = \"A\" } else if score > 80 { g = \"B\" } else { g = \"C\" }\n  g\n}\nfunc firstEven(xs: List<Int>) -> Int {\n  var found: Int\n  var i = 0\n  loop {\n    let x = xs[i] ?? 0\n    if x mod 2 == 0 {\n      found = x\n      break\n    }\n    i += 1\n  }\n  found\n}\nfunc sign(n: Int) -> Int {\n  let s\n  match n {\n    0 => s = 0\n    _ => if n > 0 { s = 1 } else { return -1 }\n  }\n  s\n}\nfor i in 0..2 {\n  let y\n  y = i * 10\n  print(y)\n}\nprint(\"{grade(95)} {grade(85)} {firstEven([1, 3, 4])} {sign(0)} {sign(5)} {sign(-5)}\")";
+    assert_eq!(output(src), "0\n10\nA B 4 0 1 -1");
+}
+
+#[test]
+fn reading_a_variable_that_might_not_be_set_is_an_error() {
+    let wrap = |body: &str| first_error(&format!("func f(c: Bool) {{\n{body}\n}}"));
+    assert_eq!(wrap("let x: Int\nif c { x = 1 }\nprint(x)"), "unset_read");
+    assert_eq!(
+        wrap("var x: Int\nwhile c { x = 1 }\nprint(x)"),
+        "unset_read"
+    );
+    assert_eq!(wrap("let x: Int\nlet g = func() => x\nx = 1"), "unset_read");
+    assert_eq!(wrap("var x: Int\nx += 1"), "unset_read");
+    assert_eq!(wrap("let x: Int\nif c { x = 1 }\nx = 2"), "let_set_twice");
+    assert_eq!(wrap("let x: Int\nfor i in 0..3 { x = i }"), "let_set_twice");
+    assert_eq!(
+        wrap("let x: Int\nfor i in 0..3 {\n  if c {\n    x = i\n    continue\n  }\n}"),
+        "let_set_twice"
+    );
+    assert_eq!(
+        wrap("let x: Int\nloop {\n  x = 1\n  break\n}\nprint(x)"),
+        ""
+    );
+    assert_eq!(
+        wrap("let x\nif c { x = 1 } else { x = \"a\" }"),
+        "type_mismatch"
+    );
+    assert_eq!(first_error("let x: Int\nx = 1"), "top_level_without_value");
+}
+
+#[test]
+fn a_var_set_only_inside_a_loop_counts_as_reassigned() {
+    let src = "func f(xs: List<Int>) {\n  var last\n  for x in xs {\n    last = x\n    print(last)\n  }\n}";
+    assert!(warnings(src).is_empty());
+}
+
+#[test]
+fn a_maybe_of_a_maybe_is_written_with_two_question_marks() {
+    let src = "let m: Map<String, Int?> = [\"a\" = None]\nlet x: Int?? = m[\"a\"]\nlet y: List<Int??> = [x]\nfunc f(v: Int??) -> Int?? { v }\nprint(\"{x} {y} {f(None)}\")";
+    assert_eq!(output(src), "Some(None) [Some(None)] None");
+}
+
+#[test]
+fn one_try_covers_every_failure_in_its_expression() {
+    let src = "func add(a: Int, b: Int) -> Int { a + b }\nfunc sum(a: String, b: String) -> Result<Int, String> {\n  print(\"start {a}\")\n  Ok(try add(parse(a), parse(b) * 2))\n}\nfunc first(a: String) -> Int? { try add(Int.parse(a), 1) }\nprint(\"{sum(\"1\", \"2\")} {first(\"4\")} {first(\"x\")}\")\nprint(sum(\"1\", \"x\"))";
+    assert_eq!(
+        with_parse(src),
+        "start 1\nOk(5) Some(5) None\nstart 1\nErr(\"bad x\")"
+    );
+    let passes_through = "func f(xs: List<Int?>) -> List<Int?> { xs }\nfunc g() -> Int? { try f([Int.parse(\"1\")])[0] }\nprint(g())";
+    assert_eq!(output(passes_through), "Some(1)");
+    let operands = "func ops(a: String) -> Int? { try Int.parse(a) * 2 + Int.parse(a) }\nfunc size(m: Map<String, List<Int>>) -> Int? { try m[\"a\"].length() }\nprint(\"{ops(\"2\")} {ops(\"x\")} {size([\"a\" = [1, 2]])} {size([=])}\")";
+    assert_eq!(output(operands), "Some(6) None Some(2) None");
+    let compared = "func a() -> Int? { None }\nfunc pick(same: Bool, n: Int) -> Int { if same { n } else { -n } }\nfunc f() -> Int? { try pick(a() == 1, Int.parse(\"2\")) }\nfunc g() -> Int? { try pick(a() == None, Int.parse(\"2\")) }\nprint(\"{f()} {g()}\")";
+    assert_eq!(output(compared), "Some(-2) Some(2)");
+    assert_eq!(
+        diagnostics(
+            "func a() -> Int? { 1 }\nfunc f() -> Result<Int, String> { Ok(try a() + 1) }",
+            Severity::Error
+        ),
+        ["try_maybe_in_result"]
+    );
+    assert_eq!(
+        error_and_fix("func at(i: Int) -> Int { i }\nfunc f() -> Int? { try at(parse(\"1\")) }"),
+        (
+            "try_result_in_maybe".into(),
+            Some("parse(\"1\").ok()".into())
+        )
+    );
+    assert_eq!(
+        first_error("func f() -> Int { (func() -> Int { try Int.parse(\"1\") })() }"),
+        "try_outside_failable"
+    );
+}
+
+#[test]
+fn a_try_inside_another_is_flagged() {
+    assert_eq!(
+        diagnostics(
+            "func f(m: Map<String, String>) -> Int? { try Int.parse(try m[\"a\"]) }",
+            Severity::Warning
+        ),
+        ["nested_try"]
+    );
+}
+
+#[test]
+fn a_value_wraps_into_a_maybe_in_comparisons_defaults_and_conversions() {
+    let src = "func run(f: func() -> Int?) -> Int? { f() }\nfunc half(x: Float?) -> Float? { x }\nlet a: Int? = 5\nlet b: Int? = None\nlet f: Float? = a\nlet zs: List<Float?> = [a, 2.5]\nlet xs = [1, None, 3]\nlet s: Set<Int?> = Set([1, None])\nprint(\"{a == 5} {a != 5} {5 == a} {b == None} {a == b}\")\nprint(\"{a ?? b} {b ?? a} {b ?? b ?? 0} {f} {half(a)} {zs}\")\nprint(\"{xs} {run(func() => 5)} {s.length()}\")\nvar ys: List<Int?> = [None]\nlet i = 0\nprint(ys[i])";
+    assert_eq!(
+        output(src),
+        "true false true true false\nSome(5) Some(5) 0 Some(5.0) Some(5.0) [Some(5.0), Some(2.5)]\n[Some(1), None, Some(3)] Some(5) 2\nSome(None)"
+    );
+    assert_eq!(
+        first_error("var t = None\nt = \"\"\nlet n: Int? = t"),
+        "type_mismatch"
+    );
+}
+
+#[test]
+fn a_compound_assignment_to_an_index_needs_the_index_narrowed() {
+    assert_eq!(
+        output("var r = [1, 2]\nfor i in r.indices() { r[i] += 1 }\nprint(r)"),
+        "[2, 3]"
+    );
+    assert!(first_error_fix("var r = [1, 2]\nlet i = 1\nr[i] += 1").is_empty());
+    assert_eq!(
+        first_error_fix("var m = [\"a\" = 1]\nm[\"b\"] += 1"),
+        ["m[\"b\"] = (m[\"b\"] ?? 0) + 1"]
+    );
+}
+
+#[test]
+fn a_shared_name_given_a_shared_box_shares_that_box() {
+    let src = "func setNine(shared n: Int) { n = 9 }\nlet y = Shared(1)\nshared x = y\nsetNine(x)\nx += 1\nprint(\"{x} {y.value}\")";
+    assert_eq!(output(src), "10 10");
+}
+
+#[test]
+fn a_ref_to_a_global_the_function_also_writes_is_an_error() {
+    let src = "var n = 0\nvar xs = [1]\nfunc touch() { xs.push(2) }\nfunc bump(ref a: Int) {\n  a += 1\n  n += 10\n}\nfunc h(ref l: List<Int>) { touch() }\n";
+    assert_eq!(
+        diagnostics(&format!("{src}bump(n)\nh(xs)"), Severity::Error),
+        ["ref_global_written", "ref_global_written"]
+    );
+    assert_eq!(
+        output(&format!("{src}var k = 0\nbump(k)\nprint(\"{{k}} {{n}}\")")),
+        "1 10"
+    );
+}
+
+#[test]
+fn a_ref_place_changed_another_way_during_the_call_panics() {
+    let callback = "var n = 0\nfunc calls(ref a: Int, f: func()) {\n  a += 1\n  f()\n}\nfunc addFive() { n += 5 }\ncalls(n, addFive)";
+    panics_with(callback, "ref_changed_elsewhere");
+    let field = "shared class Count(var n: Int)\nclass Holder(shared c: Count)\nfunc g(ref a: Int, h: Holder) {\n  a += 1\n  h.c.n += 10\n}\nlet c = Count(1)\nlet x = Holder(c)\nlet y = Holder(c)\ng(x.c.n, y)";
+    panics_with(field, "ref_changed_elsewhere");
+    let nan =
+        "func add(ref x: Float, d: Float) { x += d }\nvar a = 0.0 / 0.0\nadd(a, 1.0)\nprint(a)";
+    assert_eq!(output(nan), "NaN");
 }

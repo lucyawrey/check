@@ -595,7 +595,9 @@ impl Resolver<'_> {
                 if let Some(t) = ty {
                     self.type_expr(t);
                 }
-                self.expr(value);
+                if let Some(value) = value {
+                    self.expr(value);
+                }
                 let (name, span) = (name.clone(), *span);
                 self.bind(&name, span);
             }

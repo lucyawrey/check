@@ -272,6 +272,22 @@ impl Server {
                     }
                 }
             }
+            // A hint, not an inlay hint: the editor marks each place a `try` can return from
+            // without adding text to the line, and shows the message on hover.
+            for span in checked.info.try_unwraps.values() {
+                if let Some(list) = by_file.get_mut(&checked.sources.file(span.start).path) {
+                    let d = lsp_types::Diagnostic {
+                        range: range_of(*span, &checked.sources),
+                        severity: Some(DiagnosticSeverity::HINT),
+                        source: Some("check".to_string()),
+                        message: "[returns here on a failure]".to_string(),
+                        ..Default::default()
+                    };
+                    if !list.contains(&d) {
+                        list.push(d);
+                    }
+                }
+            }
         }
         by_file
             .into_iter()

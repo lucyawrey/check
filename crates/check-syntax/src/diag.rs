@@ -1,6 +1,6 @@
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
@@ -63,6 +63,9 @@ codes! {
     redefined_builtin => "[redefining or shadowing a reserved name]",
     used_before_declared => "[a variable used above its own line]",
     used_before_set => "[a function run before a top-level variable it uses is set]",
+    unset_read => "[a variable read where it might not be set yet]",
+    let_set_twice => "[a let set where it might already be set]",
+    top_level_without_value => "[a top-level let or var without a value]",
     nested_named_function => "[a named function declared inside a function body]",
     type_mismatch => "[a type mismatch]",
     type_needed => "[a type that can't be worked out and needs writing]",
@@ -178,6 +181,11 @@ codes! {
     nested_maybe => "[an if or loop value that is a T??]",
     let_else_some => "[let Some(x) = e else, which ?? can replace]",
     repeated_namespace => "[a namespace line that only repeats its package's]",
+    set_in_every_branch => "[a variable declared without a value, then set at the end of every branch]",
+    nested_try => "[a try inside another try, which already covers it]",
+    compound_on_missing_index => "[a compound assignment to an index that might be missing]",
+    ref_changed_elsewhere => "[a ref argument's place changed another way during the call]",
+    ref_global_written => "[a global passed as ref to a function that also writes it]",
     record_beside_class => "[a record literal with its class written right beside it]",
 }
 

@@ -1,12 +1,13 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ast::*;
-use crate::diag::{Code, Diagnostic, Edit, Sources, Span};
+use crate::diag::{Code, Diagnostic, Edit, Severity, Sources, Span};
 use crate::types::{Show, Subst, Ty};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Coercion {
     pub to_float: bool,
+    pub maybe_to_float: bool,
     pub wraps: usize,
     /// Wraps the value in `Ok` after any `Some`s, for a function that infers a `Result`.
     pub ok: bool,
@@ -26,6 +27,10 @@ pub enum Resolved {
 #[derive(Default)]
 pub struct Info {
     pub coercions: HashMap<NodeId, Coercion>,
+    pub try_unwraps: HashMap<NodeId, Span>,
+    pub plain_tries: HashSet<NodeId>,
+    pub coalesce_to_maybe: HashSet<NodeId>,
+    pub shared_from_box: HashSet<NodeId>,
     pub wrapping: HashSet<NodeId>,
     pub signatures: HashMap<NodeId, String>,
     /// Each lambda's captured variables: what its body, or a lambda inside it, reads from outside.
@@ -84,6 +89,7 @@ struct FuncEntry {
     state: FuncState,
     this: Option<(Ty, bool)>,
     changes_this: bool,
+    writes_globals: HashSet<String>,
     owner: Option<String>,
     library: bool,
     /// The type parameters it's generic over, its owner's included, and their bounds.
@@ -206,6 +212,7 @@ struct FnCtx {
     declared: Option<Ty>,
     fails: Option<Fails>,
     returns: Vec<(NodeId, Span, Ty)>,
+    writes_globals: HashSet<String>,
 }
 
 #[derive(PartialEq)]
@@ -217,6 +224,31 @@ enum LoopKind {
 struct LoopCtx {
     kind: LoopKind,
     break_ty: Option<Ty>,
+    break_flow: Option<Flow>,
+    set_before: HashSet<Span>,
+}
+
+#[derive(Clone, Default)]
+struct Flow {
+    maybe_unset: HashSet<Span>,
+    maybe_set: HashSet<Span>,
+    dead: bool,
+}
+
+impl Flow {
+    fn join(self, other: Flow) -> Flow {
+        if self.dead {
+            return other;
+        }
+        if other.dead {
+            return self;
+        }
+        Flow {
+            maybe_unset: &self.maybe_unset | &other.maybe_unset,
+            maybe_set: &self.maybe_set | &other.maybe_set,
+            dead: false,
+        }
+    }
 }
 
 pub struct Checker<'s> {
@@ -228,6 +260,13 @@ pub struct Checker<'s> {
     funcs: HashMap<String, FuncEntry>,
     fns: Vec<FnCtx>,
     loops: Vec<LoopCtx>,
+    flow: Flow,
+    body_writes: HashSet<String>,
+    in_try: bool,
+    try_points: usize,
+    without_value: HashMap<Span, usize>,
+    map_writes: HashSet<NodeId>,
+    let_sets: HashMap<Span, Span>,
     /// The lambdas being checked, innermost last: each one's first scope (variables below it are
     /// captured) and what it has captured so far.
     lambdas: Vec<(usize, BTreeSet<String>)>,
@@ -299,6 +338,13 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         funcs: HashMap::new(),
         fns: Vec::new(),
         loops: Vec::new(),
+        flow: Flow::default(),
+        body_writes: HashSet::new(),
+        in_try: false,
+        try_points: 0,
+        without_value: HashMap::new(),
+        map_writes: HashSet::new(),
+        let_sets: HashMap::new(),
         lambdas: Vec::new(),
         narrowed: Vec::new(),
         ref_callees: HashSet::new(),
@@ -785,6 +831,7 @@ impl Checker<'_> {
             state: FuncState::Unchecked,
             this,
             changes_this: false,
+            writes_globals: HashSet::new(),
             owner: owner.map(str::to_string),
             library: self.in_library,
             bounds,
@@ -1050,6 +1097,8 @@ impl Checker<'_> {
         );
         let saved_scopes = self.scopes.split_off(1);
         let saved_loops = std::mem::take(&mut self.loops);
+        let saved_flow = std::mem::take(&mut self.flow);
+        let saved_try = std::mem::take(&mut self.in_try);
         let saved_lambdas = std::mem::take(&mut self.lambdas);
         let saved_narrowed = std::mem::take(&mut self.narrowed);
         let mut scope = HashMap::new();
@@ -1099,11 +1148,15 @@ impl Checker<'_> {
         self.scopes.truncate(1);
         self.scopes.extend(saved_scopes);
         self.loops = saved_loops;
+        self.flow = saved_flow;
+        self.in_try = saved_try;
         self.lambdas = saved_lambdas;
         self.narrowed = saved_narrowed;
+        let writes = std::mem::take(&mut self.body_writes);
         let entry = self.funcs.get_mut(name)?;
         entry.sig.ret = Some(ret);
         entry.bounds = bounds;
+        entry.writes_globals = writes;
         entry.state = FuncState::Done;
         Some(entry.sig.clone())
     }
@@ -1114,9 +1167,11 @@ impl Checker<'_> {
             declared: declared.clone(),
             fails: None,
             returns: Vec::new(),
+            writes_globals: HashSet::new(),
         });
         let body_ty = self.expr(body, declared.as_ref());
-        let ctx = self.fns.pop().expect("function context");
+        let mut ctx = self.fns.pop().expect("function context");
+        self.body_writes = std::mem::take(&mut ctx.writes_globals);
         let ret = match declared {
             Some(t) => t,
             None => {
@@ -1502,6 +1557,12 @@ impl Checker<'_> {
                 self.add_coercion(id, true, 0);
                 true
             }
+            (Ty::Maybe(x), Ty::Maybe(y))
+                if self.subst.shallow(x) == Ty::Int && self.subst.shallow(y) == Ty::Float =>
+            {
+                self.info.coercions.entry(id).or_default().maybe_to_float = true;
+                true
+            }
             (Ty::Maybe(_), Ty::Maybe(_)) => self.conforms(&a, &e),
             (_, Ty::Maybe(inner)) => {
                 let inner = (**inner).clone();
@@ -1521,6 +1582,9 @@ impl Checker<'_> {
             return;
         }
         let a = self.subst.shallow(actual);
+        if self.in_try && self.try_unwrap(expr, &a, expected) {
+            return;
+        }
         if let Ty::Named(n, args) = &a
             && n == SHARED
             && self.subst.unify(&args[0], expected)
@@ -1528,11 +1592,12 @@ impl Checker<'_> {
             self.ref_value_hint(expr, false);
             return;
         }
-        let code = if matches!(a, Ty::Maybe(_)) {
-            Code::unhandled_maybe
-        } else {
-            self.mismatch(&a, expected, Code::type_mismatch)
-        };
+        let code =
+            if matches!(a, Ty::Maybe(_)) && !matches!(self.subst.shallow(expected), Ty::Maybe(_)) {
+                Code::unhandled_maybe
+            } else {
+                self.mismatch(&a, expected, Code::type_mismatch)
+            };
         self.error(code, expr.span);
     }
 
@@ -1683,6 +1748,25 @@ impl Checker<'_> {
                     self.var_keywords.insert(span.start, *keyword);
                 }
                 let declared = ty.as_ref().map(|t| self.type_from(t));
+                let Some(value) = value else {
+                    if self.fns.is_empty() && self.scopes.len() == 1 {
+                        self.error(Code::top_level_without_value, *span);
+                    }
+                    let ty = declared.unwrap_or_else(|| self.subst.fresh());
+                    self.flow.maybe_unset.insert(*span);
+                    self.flow.maybe_set.remove(span);
+                    self.without_value.insert(*span, self.loops.len());
+                    let var = Var {
+                        ty,
+                        mutable: *is_var,
+                        kind: VarKind::Local,
+                        span: *span,
+                        reassigned: false,
+                        list_len: None,
+                    };
+                    self.declare(name, *span, var);
+                    return Ty::Void;
+                };
                 if let (ExprKind::Record(args), Some(Ty::Named(class, _))) =
                     (&value.kind, &declared)
                     && self.class(class).is_some()
@@ -1711,7 +1795,13 @@ impl Checker<'_> {
                         self.expect(value, &actual, &d);
                         d
                     }
-                    None => actual,
+                    None => match self.subst.shallow(&actual) {
+                        Ty::Named(n, mut args) if *is_shared && n == SHARED => {
+                            self.info.shared_from_box.insert(value.id);
+                            args.remove(0)
+                        }
+                        _ => actual,
+                    },
                 };
                 let list_len = match &value.kind {
                     ExprKind::List(items) if !is_var => Some(items.len()),
@@ -1853,6 +1943,9 @@ impl Checker<'_> {
                 return (self.const_type(&key), Some(Code::assign_to_let));
             }
         }
+        if self.is_unset(name) {
+            return (self.error(Code::unset_read, span), None);
+        }
         let captured = self.is_captured(name);
         // A write into a `Shared` or `shared class` it captured goes through the captured copy.
         self.capture(name);
@@ -1893,6 +1986,13 @@ impl Checker<'_> {
         (ty, captured.then_some(Code::assign_to_captured))
     }
 
+    fn is_unset(&self, name: &str) -> bool {
+        !self.flow.dead
+            && self
+                .lookup(name)
+                .is_some_and(|v| self.flow.maybe_unset.contains(&v.span))
+    }
+
     /// Whether `name` comes from outside the lambda being checked.
     fn is_captured(&self, name: &str) -> bool {
         self.lambdas.last().is_some_and(|&(base, _)| {
@@ -1924,11 +2024,62 @@ impl Checker<'_> {
                 self.mark_changes_this(key);
             }
         }
+        if let Some(root) = &root {
+            self.note_global_write(root);
+        }
         // A change through a `Shared` or `shared class` leaves the variable itself as it was.
         if !through && let Some(var) = root.and_then(|n| self.lookup_mut(&n)) {
             var.reassigned = true;
         }
         (ty, err)
+    }
+
+    fn let_set_again_by_the_loop(&mut self) {
+        let Some(ctx) = self.loops.last() else {
+            return;
+        };
+        if self.flow.dead {
+            return;
+        }
+        let depth = self.loops.len() - 1;
+        let repeated: Vec<Span> = (self.flow.maybe_set.iter())
+            .filter(|decl| !ctx.set_before.contains(decl))
+            .filter(|decl| self.without_value.get(decl).is_some_and(|&d| d <= depth))
+            .filter_map(|decl| self.let_sets.get(decl).copied())
+            .collect();
+        for span in repeated {
+            if !self
+                .diags
+                .iter()
+                .any(|d| d.code == Code::let_set_twice && d.span == span)
+            {
+                self.error(Code::let_set_twice, span);
+            }
+        }
+    }
+
+    fn note_global_write(&mut self, name: &str) {
+        if self.scope_of(name) == Some(0)
+            && let Some(f) = self.fns.last_mut()
+        {
+            f.writes_globals.insert(name.to_string());
+        }
+    }
+
+    fn ref_to_global_the_callee_writes(&mut self, callee: &str, args: &[Arg]) {
+        let writes = self.funcs[callee].writes_globals.clone();
+        for arg in args {
+            if self.info.ref_args.contains_key(&arg.value.id)
+                && let Some((root, _)) = ref_path(&arg.value)
+                && writes.contains(root)
+                && self.scope_of(root) == Some(0)
+            {
+                self.error(Code::ref_global_written, arg.value.span);
+            }
+        }
+        if let Some(f) = self.fns.last_mut() {
+            f.writes_globals.extend(writes);
+        }
     }
 
     /// `shared x`: the box behind a shared local, parameter or field.
@@ -2071,6 +2222,7 @@ impl Checker<'_> {
                 let it = self.expr(index, Some(&key));
                 self.expect(index, &it, &key);
                 if let Some(value) = value {
+                    self.map_writes.insert(target.id);
                     return (value, base_err);
                 }
                 match self.subst.shallow(&lt) {
@@ -2243,6 +2395,7 @@ impl Checker<'_> {
                 None => false,
             },
             Ty::Record(_, fields) => fields.iter().all(|f| self.is_key(f, seen)),
+            Ty::Maybe(inner) => self.is_key(inner, seen),
             Ty::Named(name, _) if name == MAP || name == SET || name == SHARED => false,
             Ty::Named(..) if self.is_interface(&ty) || self.is_shared_class(&ty) => false,
             Ty::Named(name, _)
@@ -2352,9 +2505,39 @@ impl Checker<'_> {
     }
 
     fn assign(&mut self, target: &Expr, op: Option<BinOp>, value: &Expr, span: Span) {
+        if op.is_none()
+            && let ExprKind::Name(n) = &target.kind
+            && let Some(var) = self.lookup(n)
+            && (self.flow.maybe_unset.contains(&var.span)
+                || self.flow.maybe_set.contains(&var.span))
+            && !self.is_captured(n)
+        {
+            let (decl, ty, is_var) = (var.span, var.ty.clone(), var.mutable);
+            let again = self.flow.maybe_set.contains(&decl)
+                || (self.without_value.get(&decl)).is_some_and(|&d| self.loops.len() > d);
+            if !is_var {
+                if self.flow.maybe_set.contains(&decl) {
+                    self.error(Code::let_set_twice, target.span);
+                }
+                self.let_sets.insert(decl, target.span);
+            } else if again && let Some(var) = self.lookup_mut(n) {
+                var.reassigned = true;
+            }
+            let actual = self.expr(value, Some(&ty));
+            self.expect(value, &actual, &ty);
+            self.flow.maybe_unset.remove(&decl);
+            self.flow.maybe_set.insert(decl);
+            return;
+        }
         let (ty, err) = self.place(target);
         if let Some(code) = err {
             self.error(code, target.span);
+        }
+        if op.is_some()
+            && let ExprKind::Index(list, index) = &target.kind
+            && !self.index_narrowed(list, index)
+        {
+            self.compound_on_missing_index(target, &ty, value);
         }
         let actual = match op {
             None => self.expr(value, Some(&ty)),
@@ -2391,11 +2574,15 @@ impl Checker<'_> {
                     }
                 }
             };
-            if self.subst.shallow(&last) == Ty::Never && !is_last {
-                last = Ty::Void;
+            if self.subst.shallow(&last) == Ty::Never {
+                self.flow.dead = true;
+                if !is_last {
+                    last = Ty::Void;
+                }
             }
         }
         self.changed_copies(stmts);
+        self.set_in_branches(stmts);
         self.finish_scope();
         last
     }
@@ -2407,16 +2594,23 @@ impl Checker<'_> {
                 self.scopes.push(HashMap::new());
                 for (i, stmt) in stmts.iter().enumerate() {
                     self.ref_binding(stmt, &stmts[i + 1..]);
-                    self.stmt(stmt);
+                    let t = self.stmt(stmt);
+                    if self.subst.shallow(&t) == Ty::Never {
+                        self.flow.dead = true;
+                    }
                 }
                 self.changed_copies(stmts);
+                self.set_in_branches(stmts);
                 self.finish_scope();
             }
             ExprKind::If(cond, then, otherwise) => {
+                let before = self.flow.clone();
                 self.then_branch(cond, then, |c| c.unused(then));
+                let after_then = std::mem::replace(&mut self.flow, before);
                 if let Some(other) = otherwise {
                     self.unused(other);
                 }
+                self.flow = after_then.join(std::mem::take(&mut self.flow));
             }
             ExprKind::Match(scrutinee, arms) => {
                 self.match_expr(expr, scrutinee, arms, None, false);
@@ -2483,12 +2677,21 @@ impl Checker<'_> {
                     Some(Ty::Maybe(inner)) => Some(self.subst.shallow(&inner)),
                     e => e,
                 };
-                let (elem, declared) = match expected {
+                let (mut elem, declared) = match expected {
                     Some(Ty::List(e)) => (*e, true),
                     _ => (self.subst.fresh(), false),
                 };
+                let mut typed = Vec::new();
                 for item in items {
                     let t = self.expr(item, Some(&elem));
+                    if !declared && matches!(self.subst.shallow(&elem), Ty::Var(_)) {
+                        self.subst.unify(&elem, &t);
+                    } else if !declared && let Some(widened) = self.widen_to_maybe(&elem, &t) {
+                        elem = widened;
+                    }
+                    typed.push((item, t));
+                }
+                for (item, t) in typed {
                     let different_types = !declared
                         && matches!(
                             (self.subst.shallow(&t), self.subst.shallow(&elem)),
@@ -2528,7 +2731,7 @@ impl Checker<'_> {
                 self.expr(inner, None);
                 self.error(Code::wrong_arguments, expr.span)
             }
-            ExprKind::Unary(op, operand) => self.unary(*op, operand, expr.span),
+            ExprKind::Unary(op, operand) => self.unary(expr.id, *op, operand, expr.span),
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expr.span),
             ExprKind::Call(callee, args) => {
                 let ty = self.call(expr.id, callee, args, expr.span, expected);
@@ -2564,9 +2767,16 @@ impl Checker<'_> {
                 self.loops.push(LoopCtx {
                     kind: LoopKind::Loop,
                     break_ty: None,
+                    break_flow: None,
+                    set_before: self.flow.maybe_set.clone(),
                 });
                 self.unused(body);
+                self.let_set_again_by_the_loop();
                 let ctx = self.loops.pop().expect("loop context");
+                self.flow = ctx.break_flow.clone().unwrap_or(Flow {
+                    dead: true,
+                    ..Flow::default()
+                });
                 ctx.break_ty.unwrap_or(Ty::Never)
             }
             ExprKind::Break(value) => {
@@ -2574,9 +2784,21 @@ impl Checker<'_> {
                     Some(v) => self.expr(v, None),
                     None => Ty::Void,
                 };
-                let Some(ctx) = self.loops.last() else {
+                let flow = std::mem::replace(
+                    &mut self.flow,
+                    Flow {
+                        dead: true,
+                        ..Flow::default()
+                    },
+                );
+                let Some(ctx) = self.loops.last_mut() else {
                     return self.error(Code::break_outside_loop, expr.span);
                 };
+                ctx.break_flow = Some(match ctx.break_flow.take() {
+                    Some(b) => b.join(flow),
+                    None => flow,
+                });
+                let ctx = self.loops.last().expect("loop");
                 match ctx.break_ty.clone() {
                     None => self.loops.last_mut().expect("loop").break_ty = Some(ty),
                     Some(prev) => {
@@ -2592,6 +2814,8 @@ impl Checker<'_> {
                 Ty::Never
             }
             ExprKind::Continue => {
+                self.let_set_again_by_the_loop();
+                self.flow.dead = true;
                 if self.loops.is_empty() {
                     return self.error(Code::break_outside_loop, expr.span);
                 }
@@ -2611,6 +2835,7 @@ impl Checker<'_> {
                     .expect("fn")
                     .returns
                     .push((id, span, ty));
+                self.flow.dead = true;
                 Ty::Never
             }
         }
@@ -2814,6 +3039,7 @@ impl Checker<'_> {
             return self.error(Code::unknown_field, span);
         }
         let bt = self.expr(base, None);
+        let bt = self.try_operand(base, bt);
         let bt = match self.subst.shallow(&bt) {
             Ty::Named(n, mut a) if n == SHARED && name == "value" => return a.remove(0),
             Ty::Named(n, mut a) if n == SHARED => a.remove(0),
@@ -2846,6 +3072,9 @@ impl Checker<'_> {
     }
 
     fn name(&mut self, id: NodeId, name: &str, span: Span, expected: Option<&Ty>) -> Ty {
+        if self.is_unset(name) {
+            self.error(Code::unset_read, span);
+        }
         if let Some(var) = self.lookup(name) {
             let ty = var.ty.clone();
             self.capture(name);
@@ -2895,9 +3124,31 @@ impl Checker<'_> {
         self.error(code, span)
     }
 
-    fn unary(&mut self, op: UnOp, operand: &Expr, span: Span) -> Ty {
-        let t = self.expr(operand, None);
+    fn unary(&mut self, id: NodeId, op: UnOp, operand: &Expr, span: Span) -> Ty {
+        let points = self.try_points;
+        let diags_before = self.diags.len();
+        let t = if op == UnOp::Try {
+            if self.in_try {
+                let fix = vec![Edit {
+                    span: Span::new(span.start, operand.span.start),
+                    text: String::new(),
+                }];
+                self.diags
+                    .push(Diagnostic::warning(Code::nested_try, span).with_fix(fix));
+            }
+            let outer = std::mem::replace(&mut self.in_try, true);
+            let t = self.expr(operand, None);
+            self.in_try = outer;
+            t
+        } else {
+            let t = self.expr(operand, None);
+            self.try_operand(operand, t)
+        };
         let t = self.subst.shallow(&t);
+        let inner_fails = self.try_points > points;
+        if op == UnOp::Try {
+            self.try_points += 1;
+        }
         match (op, &t) {
             (_, Ty::Error) => Ty::Error,
             (UnOp::Neg, Ty::Int | Ty::Float) => t,
@@ -2919,8 +3170,52 @@ impl Checker<'_> {
                     Ty::Error
                 }
             }
+            (UnOp::Try, _) if inner_fails => {
+                self.info.plain_tries.insert(id);
+                t
+            }
+            (UnOp::Try, _)
+                if self.diags[diags_before..]
+                    .iter()
+                    .any(|d| d.severity == Severity::Error) =>
+            {
+                Ty::Error
+            }
             (_, Ty::Var(_)) => self.error(Code::type_needed, operand.span),
             _ => self.error(Code::invalid_operand_types, span),
+        }
+    }
+
+    fn try_unwrap(&mut self, expr: &Expr, actual: &Ty, expected: &Ty) -> bool {
+        let e = self.subst.shallow(expected);
+        let failable =
+            |t: &Ty| matches!(t, Ty::Maybe(_)) || matches!(t, Ty::Named(n, _) if n == RESULT);
+        if matches!(e, Ty::Var(_)) || failable(&e) {
+            return false;
+        }
+        let Some((inner, fails)) = failure_of(actual) else {
+            return false;
+        };
+        if !self.subsume(expr.id, &inner, &e) {
+            return false;
+        }
+        self.record_unwrap(expr, fails);
+        true
+    }
+
+    fn try_operand(&mut self, expr: &Expr, ty: Ty) -> Ty {
+        let Some((inner, fails)) = failure_of(&self.subst.shallow(&ty)).filter(|_| self.in_try)
+        else {
+            return ty;
+        };
+        self.record_unwrap(expr, fails);
+        inner
+    }
+
+    fn record_unwrap(&mut self, expr: &Expr, fails: Fails) {
+        if self.try_fails(fails, expr, expr.span) {
+            self.info.try_unwraps.insert(expr.id, expr.span);
+            self.try_points += 1;
         }
     }
 
@@ -2957,7 +3252,8 @@ impl Checker<'_> {
             (Fails::Maybe, Some(Fails::Result(_))) => (Code::try_maybe_in_result, "orErr(...)"),
         };
         let mut d = Diagnostic::error(code, span);
-        d.detail = Some(format!("try {}.{fix}", self.operand_text(operand)));
+        let prefix = if span == operand.span { "" } else { "try " };
+        d.detail = Some(format!("{prefix}{}.{fix}", self.operand_text(operand)));
         self.diags.push(d);
         false
     }
@@ -2966,6 +3262,7 @@ impl Checker<'_> {
         match op {
             BinOp::And | BinOp::Or => {
                 let lt = self.expr(lhs, Some(&Ty::Bool));
+                let lt = self.try_operand(lhs, lt);
                 if !self.subst.unify(&lt, &Ty::Bool) {
                     self.error(Code::invalid_operand_types, lhs.span);
                 }
@@ -2976,6 +3273,7 @@ impl Checker<'_> {
                 };
                 self.push_bindings(binds);
                 let rt = self.expr(rhs, Some(&Ty::Bool));
+                let rt = self.try_operand(rhs, rt);
                 self.scopes.pop();
                 if !self.subst.unify(&rt, &Ty::Bool) {
                     self.error(Code::invalid_operand_types, rhs.span);
@@ -2992,6 +3290,13 @@ impl Checker<'_> {
                     _ => return self.error(Code::type_mismatch, lhs.span),
                 };
                 let rt = self.expr(rhs, Some(&inner));
+                let maybe = Ty::maybe(inner.clone());
+                if matches!(self.subst.shallow(&rt), Ty::Maybe(_))
+                    && self.subsume(rhs.id, &rt, &maybe)
+                {
+                    self.info.coalesce_to_maybe.insert(lhs.id);
+                    return maybe;
+                }
                 self.expect(rhs, &rt, &inner);
                 inner
             }
@@ -3004,11 +3309,14 @@ impl Checker<'_> {
                     let rt = self.expr(rhs, Some(&lt));
                     (lt, rt)
                 };
+                let (lt, rt) = self.compare_maybe_with_value(lhs, lt, rhs, rt);
                 self.binary_type(op, lhs, &lt, rhs, &rt, span)
             }
             _ => {
                 let lt = self.expr(lhs, None);
+                let lt = self.try_operand(lhs, lt);
                 let rt = self.expr(rhs, None);
+                let rt = self.try_operand(rhs, rt);
                 if op == BinOp::Pow
                     && self.subst.shallow(&lt) == Ty::Int
                     && let ExprKind::Unary(UnOp::Neg, inner) = &rhs.kind
@@ -3018,6 +3326,27 @@ impl Checker<'_> {
                 }
                 self.binary_type(op, lhs, &lt, rhs, &rt, span)
             }
+        }
+    }
+
+    fn compare_maybe_with_value(&mut self, lhs: &Expr, lt: Ty, rhs: &Expr, rt: Ty) -> (Ty, Ty) {
+        let (a, b) = (self.subst.shallow(&lt), self.subst.shallow(&rt));
+        let plain = |t: &Ty| !matches!(t, Ty::Maybe(_) | Ty::Var(_));
+        match (&a, &b) {
+            (Ty::Maybe(_), b) if plain(b) && self.subsume(rhs.id, &rt, &lt) => (lt.clone(), lt),
+            (a, Ty::Maybe(_)) if plain(a) && self.subsume(lhs.id, &lt, &rt) => (rt.clone(), rt),
+            _ => (lt, rt),
+        }
+    }
+
+    fn widen_to_maybe(&mut self, elem: &Ty, item: &Ty) -> Option<Ty> {
+        match (self.subst.shallow(elem), self.subst.shallow(item)) {
+            (e, Ty::Maybe(x))
+                if !matches!(e, Ty::Maybe(_) | Ty::Var(_)) && self.subst.unify(&e, &x) =>
+            {
+                Some(Ty::Maybe(x))
+            }
+            _ => None,
         }
     }
 
@@ -3387,6 +3716,7 @@ impl Checker<'_> {
             })
             .collect();
         self.match_args(&params, args, span);
+        self.ref_to_global_the_callee_writes(name, args);
         match sig {
             Some(sig) => sig.ret.unwrap_or(Ty::Void).substitute(&map),
             None => Ty::Error,
@@ -3516,13 +3846,21 @@ impl Checker<'_> {
             // Typed as a write path (`grid[i]` is a list, not a maybe), but only a collection's
             // method changes it.
             let (t, _) = self.place_path(recv);
-            (self.through_shared, self.place_root) = (false, None);
+            if let Some(root) = self.place_root.take() {
+                self.note_global_write(&root);
+            }
+            self.through_shared = false;
             if self.is_collection(&t) {
                 self.changed_receiver(recv, Code::change_let_collection);
             }
             t
         } else {
             self.expr(recv, None)
+        };
+        let recv_ty = if matches!(name, "orPanic" | "orErr" | "ok" | "flatten") {
+            recv_ty
+        } else {
+            self.try_operand(recv, recv_ty)
         };
         let boxed = matches!(self.subst.shallow(&recv_ty), Ty::Named(n, _) if n == SHARED);
         let mut recv_ty = self.unref(&recv_ty);
@@ -3760,30 +4098,55 @@ impl Checker<'_> {
             Ty::Var(_) => return self.error(Code::type_needed, list.span),
             _ => return self.error(Code::invalid_operand_types, span),
         };
-        if let ExprKind::Name(list_name) = &list.kind {
-            if let ExprKind::Int(k) = index.kind
-                && self
-                    .lookup(list_name)
-                    .and_then(|v| v.list_len)
-                    .is_some_and(|n| k >= 0 && (k as usize) < n)
-            {
-                self.info.unwrapped_index.insert(id);
-                return elem;
-            }
-            if let ExprKind::Name(index_name) = &index.kind
-                && self.narrowed.iter().any(|(l, i, depth)| {
-                    l == list_name
-                        && i == index_name
-                        && [l, i]
-                            .iter()
-                            .all(|n| self.scope_of(n).is_some_and(|s| s <= *depth))
-                })
-            {
-                self.info.unwrapped_index.insert(id);
-                return elem;
-            }
+        if self.index_narrowed(list, index) {
+            self.info.unwrapped_index.insert(id);
+            return elem;
         }
         Ty::maybe(elem)
+    }
+
+    fn index_narrowed(&self, list: &Expr, index: &Expr) -> bool {
+        let ExprKind::Name(list_name) = &list.kind else {
+            return false;
+        };
+        let known_length = |k: i64| {
+            self.lookup(list_name)
+                .and_then(|v| v.list_len)
+                .is_some_and(|n| k >= 0 && (k as usize) < n)
+        };
+        match &index.kind {
+            ExprKind::Int(k) => known_length(*k),
+            ExprKind::Name(index_name) => self.narrowed.iter().any(|(l, i, depth)| {
+                l == list_name
+                    && i == index_name
+                    && [l, i]
+                        .iter()
+                        .all(|n| self.scope_of(n).is_some_and(|s| s <= *depth))
+            }),
+            _ => false,
+        }
+    }
+
+    fn compound_on_missing_index(&mut self, target: &Expr, ty: &Ty, value: &Expr) {
+        let mut d = Diagnostic::error(Code::compound_on_missing_index, target.span);
+        let zero = match self.subst.shallow(ty) {
+            Ty::Int => Some("0"),
+            Ty::Float => Some("0.0"),
+            _ => None,
+        };
+        if let Some(zero) = zero.filter(|_| self.map_writes.contains(&target.id)) {
+            let place = self.sources.text(target.span);
+            let op = self
+                .sources
+                .text(Span::new(target.span.end, value.span.start));
+            let op = op.trim().trim_end_matches('=');
+            let value_text = self.sources.text(value.span);
+            d = d.with_quick_fix(vec![Edit {
+                span: Span::new(target.span.start, value.span.end),
+                text: format!("{place} = ({place} ?? {zero}) {op} {value_text}"),
+            }]);
+        }
+        self.diags.push(d);
     }
 
     fn lambda(
@@ -3819,13 +4182,22 @@ impl Checker<'_> {
                 },
             );
         }
-        let declared = ret.map(|t| self.type_from(t));
+        let expected_maybe = match expected.map(|e| self.subst.shallow(e)) {
+            Some(Ty::Func(_, r)) if matches!(self.subst.shallow(&r), Ty::Maybe(_)) => Some(*r),
+            _ => None,
+        };
+        let declared = ret.map(|t| self.type_from(t)).or(expected_maybe);
         let saved_loops = std::mem::take(&mut self.loops);
+        let saved_flow = self.flow.clone();
+        let saved_try = std::mem::take(&mut self.in_try);
+        self.flow.dead = false;
         self.lambdas.push((self.scopes.len(), BTreeSet::new()));
         self.scopes.push(scope);
         let ret = self.function_body(body, declared);
         self.finish_scope();
         self.loops = saved_loops;
+        self.flow = saved_flow;
+        self.in_try = saved_try;
         let (_, captures) = self.lambdas.pop().expect("lambda");
         self.info
             .captures
@@ -3843,16 +4215,17 @@ impl Checker<'_> {
         otherwise: Option<&Expr>,
         expected: Option<&Ty>,
     ) -> Ty {
+        let before = self.flow.clone();
         let tt = self.then_branch(cond, then, |c| c.expr(then, expected));
-        match otherwise {
-            Some(other) => {
-                let ot = self.expr(other, expected);
-                match self.join((then, tt), (other, ot)) {
-                    Some(t) => t,
-                    None => self.error(Code::branch_type_mismatch, expr.span),
-                }
-            }
-            None => self.optional_value(expr, tt),
+        let after_then = std::mem::replace(&mut self.flow, before);
+        let ot = otherwise.map(|other| self.expr(other, expected));
+        self.flow = after_then.join(std::mem::take(&mut self.flow));
+        match (otherwise, ot) {
+            (Some(other), Some(ot)) => match self.join((then, tt), (other, ot)) {
+                Some(t) => t,
+                None => self.error(Code::branch_type_mismatch, expr.span),
+            },
+            _ => self.optional_value(expr, tt),
         }
     }
 
@@ -3906,7 +4279,10 @@ impl Checker<'_> {
     ) -> Ty {
         let st = self.expr(scrutinee, None);
         let mut bodies = Vec::new();
+        let before = self.flow.clone();
+        let mut after: Option<Flow> = None;
         for arm in arms {
+            self.flow = before.clone();
             let mut binds = Vec::new();
             self.pattern(&arm.pattern, &st, &mut binds);
             self.push_bindings(binds);
@@ -3920,8 +4296,14 @@ impl Checker<'_> {
                 self.unused(&arm.body)
             };
             self.finish_scope();
+            let flow = std::mem::take(&mut self.flow);
+            after = Some(match after {
+                Some(a) => a.join(flow),
+                None => flow,
+            });
             bodies.push((&arm.body, t));
         }
+        self.flow = after.unwrap_or(before);
         let rows = arms
             .iter()
             .filter(|a| a.guard.is_none())
@@ -4434,9 +4816,18 @@ impl Checker<'_> {
         self.loops.push(LoopCtx {
             kind: LoopKind::Valued,
             break_ty: None,
+            break_flow: None,
+            set_before: self.flow.maybe_set.clone(),
         });
+        let before = self.flow.clone();
         self.unused(body);
+        self.let_set_again_by_the_loop();
         let ctx = self.loops.pop().expect("loop context");
+        let after = std::mem::take(&mut self.flow).join(before);
+        self.flow = match ctx.break_flow.clone() {
+            Some(b) => after.join(b),
+            None => after,
+        };
         debug_assert!(ctx.kind == LoopKind::Valued);
         match ctx.break_ty.map(|t| self.subst.shallow(&t)) {
             None | Some(Ty::Void) | Some(Ty::Error) => Ty::Void,
@@ -4473,6 +4864,39 @@ impl Checker<'_> {
     /// Warns about a `var` copied from a field, index or map lookup whose last change is never
     /// read. Reads in a loop or branch with the change count as after it, and a var a lambda
     /// captures never warns.
+    fn set_in_branches(&mut self, stmts: &[Stmt]) {
+        for pair in stmts.windows(2) {
+            let [
+                Stmt::Let {
+                    name,
+                    span,
+                    ty,
+                    value: None,
+                    ..
+                },
+                Stmt::Expr(e),
+            ] = pair
+            else {
+                continue;
+            };
+            let mut sets = Vec::new();
+            if !branch_sets(e, name, &mut sets) {
+                continue;
+            }
+            let decl_end = ty.as_ref().map_or(span.end, |t| type_span(t).end);
+            let mut fix = vec![Edit {
+                span: Span::new(decl_end, e.span.start),
+                text: " = ".to_string(),
+            }];
+            fix.extend(sets.into_iter().map(|span| Edit {
+                span,
+                text: String::new(),
+            }));
+            self.diags
+                .push(Diagnostic::warning(Code::set_in_every_branch, *span).with_fix(fix));
+        }
+    }
+
     fn changed_copies(&mut self, stmts: &[Stmt]) {
         for (i, stmt) in stmts.iter().enumerate() {
             let Stmt::Let {
@@ -4481,7 +4905,7 @@ impl Checker<'_> {
                 is_var: true,
                 is_shared: false,
                 ty,
-                value,
+                value: Some(value),
                 ..
             } = stmt
             else {
@@ -4783,7 +5207,8 @@ fn find_expr<'a>(e: &'a Expr, hit: &mut dyn FnMut(&Expr, bool) -> bool) -> Optio
                         kids.push(target);
                         kids.push(value);
                     }
-                    Stmt::Let { value, .. } | Stmt::LetPattern { value, .. } => kids.push(value),
+                    Stmt::Let { value, .. } => kids.extend(value),
+                    Stmt::LetPattern { value, .. } => kids.push(value),
                     Stmt::RefLet { target, .. } => kids.push(target),
                     Stmt::Expr(x) => kids.push(x),
                     _ => {}
@@ -4915,6 +5340,60 @@ fn copied_path(e: &Expr) -> Option<&Expr> {
     }
 }
 
+fn failure_of(t: &Ty) -> Option<(Ty, Fails)> {
+    match t {
+        Ty::Maybe(inner) => Some(((**inner).clone(), Fails::Maybe)),
+        Ty::Named(n, args) if n == RESULT => {
+            Some((args[0].clone(), Fails::Result(args[1].clone())))
+        }
+        _ => None,
+    }
+}
+
+fn mentions(e: &Expr, name: &str) -> bool {
+    find_expr(e, &mut |x, _| is_name(x, name)).is_some()
+}
+
+fn branch_sets(e: &Expr, name: &str, sets: &mut Vec<Span>) -> bool {
+    match &e.kind {
+        ExprKind::If(cond, then, Some(other)) => {
+            !mentions(cond, name)
+                && block_sets(then, name, sets)
+                && (branch_sets(other, name, sets) || block_sets(other, name, sets))
+        }
+        ExprKind::Match(subject, arms) => {
+            !mentions(subject, name)
+                && arms.iter().all(|a| {
+                    a.guard.as_ref().is_none_or(|g| !mentions(g, name))
+                        && block_sets(&a.body, name, sets)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn block_sets(body: &Expr, name: &str, sets: &mut Vec<Span>) -> bool {
+    let ExprKind::Block(stmts) = &body.kind else {
+        return false;
+    };
+    let [
+        Stmt::Assign {
+            target,
+            op: None,
+            value,
+            ..
+        },
+    ] = stmts.as_slice()
+    else {
+        return false;
+    };
+    let clean = is_name(target, name) && !mentions(value, name);
+    if clean {
+        sets.push(Span::new(target.span.start, value.span.start));
+    }
+    clean
+}
+
 fn is_name(e: &Expr, name: &str) -> bool {
     matches!(&e.kind, ExprKind::Name(n) if n == name)
 }
@@ -4938,7 +5417,7 @@ fn steps_root<'a>(e: &'a Expr, name: &str) -> Option<&'a Expr> {
 fn stmt_exprs(s: &Stmt) -> Vec<&Expr> {
     match s {
         Stmt::Assign { target, value, .. } => vec![target, value],
-        Stmt::Let { value, .. } => vec![value],
+        Stmt::Let { value, .. } => value.iter().collect(),
         Stmt::LetPattern {
             value, otherwise, ..
         } => std::iter::once(value).chain(otherwise).collect(),
