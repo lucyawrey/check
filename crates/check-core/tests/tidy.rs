@@ -252,3 +252,19 @@ fn never_applies_a_quick_fix_only_fix() {
     let src = "shared n = 1\nprint(n.value)";
     assert_eq!(tidied(src), src);
 }
+
+#[test]
+fn a_variable_only_set_in_every_branch_takes_the_branches_as_its_value() {
+    let src = "func f(n: Int) -> String {\n  let g: String\n  if n > 1 { g = \"a\" } else if n > 0 { g = \"b\" } else { g = \"c\" }\n  g\n}\nfunc s(n: Int) -> Int {\n  let s\n  match n {\n    0 { s = 0 }\n    _ { s = 1 }\n  }\n  s\n}\nprint(\"{f(1)} {s(0)}\")";
+    let after = "func f(n: Int) -> String {\n  let g: String = if n > 1 { \"a\" } else if n > 0 { \"b\" } else { \"c\" }\n  g\n}\nfunc s(n: Int) -> Int {\n  let s = match n {\n    0 { 0 }\n    _ { 1 }\n  }\n  s\n}\nprint(\"{f(1)} {s(0)}\")";
+    assert_eq!(tidied(src), after);
+    let kept = "func f(n: Int) -> Int {\n  let g\n  if n > 0 {\n    print(n)\n    g = n\n  } else { g = n + 1 }\n  g\n}\nprint(f(1))";
+    assert_eq!(tidied(kept), kept);
+}
+
+#[test]
+fn removes_a_this_that_isnt_needed() {
+    let src = "shared class P {\n  var x = 0\n  func f(y: Int) -> Int { this.x + this.g(y) }\n  func g(x: Int) -> Int { this.x + x }\n}\nprint(P().f(1))";
+    let after = "shared class P {\n  var x = 0\n  func f(y: Int) -> Int { x + g(y) }\n  func g(x: Int) -> Int { this.x + x }\n}\nprint(P().f(1))";
+    assert_eq!(tidied(src), after);
+}

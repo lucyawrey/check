@@ -382,7 +382,10 @@ impl Parser<'_> {
         }
         if (self.is_kw("let") || self.is_kw("var"))
             && !(matches!(self.peek_at(1), Tok::Ident(_))
-                && matches!(self.peek_at(2), Tok::Sym("=" | ":")))
+                && matches!(
+                    self.peek_at(2),
+                    Tok::Sym("=" | ":" | ";" | "}") | Tok::Newline | Tok::Eof
+                ))
         {
             return self.let_pattern();
         }
@@ -437,8 +440,12 @@ impl Parser<'_> {
         } else {
             None
         };
-        self.expect_sym("=")?;
-        let value = self.expr()?;
+        let value = if is_shared || self.is_sym("=") {
+            self.expect_sym("=")?;
+            Some(self.expr()?)
+        } else {
+            None
+        };
         Ok(Stmt::Let {
             id: self.id(),
             keyword,
@@ -1238,6 +1245,15 @@ impl Parser<'_> {
         }
     }
 
+    fn type_ends_after_next(&self) -> bool {
+        matches!(
+            self.peek_at(1),
+            Tok::Sym("=" | "," | ")" | ">" | ">>" | "]" | "{" | "}" | "->" | ";")
+                | Tok::Newline
+                | Tok::Eof
+        )
+    }
+
     fn type_expr(&mut self) -> PResult<TypeExpr> {
         let start = self.span();
         let mut ty = if self.eat_kw("func") {
@@ -1294,6 +1310,9 @@ impl Parser<'_> {
         loop {
             if self.eat_sym("?") {
                 ty = TypeExpr::Maybe(Box::new(ty));
+            } else if self.is_sym("??") && self.type_ends_after_next() {
+                self.advance();
+                ty = TypeExpr::Maybe(Box::new(TypeExpr::Maybe(Box::new(ty))));
             } else if self.is_sym("[") && matches!(self.peek_at(1), Tok::Sym("]")) {
                 self.advance();
                 self.advance();
@@ -1536,7 +1555,11 @@ impl Parser<'_> {
             let end = self.advance().span;
             return Ok(self.expr_node(start.to(end), ExprKind::Int(i64::MIN)));
         }
-        let operand = self.unary()?;
+        let operand = if op == UnOp::Try {
+            self.expr()?
+        } else {
+            self.unary()?
+        };
         Ok(self.expr_node(
             start.to(operand.span),
             ExprKind::Unary(op, Box::new(operand)),

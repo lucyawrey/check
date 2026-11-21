@@ -157,8 +157,8 @@ impl Server {
         }
     }
 
-    /// A hint before the body of each method that changes `this`, and before each argument a
-    /// call can change.
+    /// A hint before the body of each method that changes `this`, before each argument a call
+    /// can change, and before each value a `try` unwraps inside its operand.
     fn inlay_hints(&self, path: &str) -> Vec<InlayHint> {
         let (_, checked) = self.check(path);
         let sources = &checked.sources;
@@ -170,7 +170,9 @@ impl Server {
         let args = (info.ref_args.values())
             .chain(info.shared_args.values())
             .map(|span| (span, "[changed by the call]"));
+        let returns = (info.try_unwraps.values()).map(|span| (span, "[returns here on a failure]"));
         this.chain(args)
+            .chain(returns)
             .filter(|(span, _)| sources.file(span.start).path == path)
             .map(|(span, label)| InlayHint {
                 position: range_of(*span, sources).start,

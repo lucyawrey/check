@@ -244,6 +244,12 @@ fn coerce(info: &Info, id: NodeId, mut value: Value) -> Value {
         {
             value = Value::Float(n as f64);
         }
+        if c.maybe_to_float
+            && let Value::Some(v) = &value
+            && let Value::Int(n) = **v
+        {
+            value = Value::Some(Rc::new(Value::Float(n as f64)));
+        }
         for _ in 0..c.wraps {
             value = Value::Some(Rc::new(value));
         }
@@ -331,6 +337,22 @@ fn uncell(v: Value) -> Value {
     match v {
         Value::Cell(v) => v.borrow().clone(),
         v => v,
+    }
+}
+
+fn untouched(before: &Value, now: &Value) -> bool {
+    match (before, now) {
+        (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+        (Value::List(a), Value::List(b)) if Rc::ptr_eq(a, b) => true,
+        (Value::Map(a), Value::Map(b)) if Rc::ptr_eq(a, b) => true,
+        (Value::Object(a), Value::Object(b))
+        | (Value::Variant(a), Value::Variant(b))
+        | (Value::Record(a), Value::Record(b))
+            if Rc::ptr_eq(a, b) =>
+        {
+            true
+        }
+        _ => before == now,
     }
 }
 
@@ -890,8 +912,19 @@ impl Interpreter<'_> {
                 is_shared,
                 ..
             } => {
-                let v = self.scoped(|i| i.expr(value))?;
-                self.define(name, if *is_shared { share_new(v) } else { v });
+                let (v, from_box) = match value {
+                    Some(value) => (
+                        self.scoped(|i| i.expr(value))?,
+                        self.info.shared_from_box.contains(&value.id),
+                    ),
+                    None => (Value::Void, false),
+                };
+                let v = match (is_shared, from_box) {
+                    (true, true) => share(v),
+                    (true, false) => share_new(v),
+                    _ => v,
+                };
+                self.define(name, v);
                 Ok(Value::Void)
             }
             Stmt::Assign {
@@ -1031,8 +1064,25 @@ impl Interpreter<'_> {
     }
 
     fn expr(&mut self, expr: &Expr) -> Eval {
-        let value = grow(|| self.raw(expr))?;
+        let mut value = grow(|| self.raw(expr))?;
+        if self.info.try_unwraps.contains_key(&expr.id) {
+            value = self.unwrap_or_return(value, expr.span)?;
+        }
         Ok(self.coerce(expr.id, value))
+    }
+
+    fn unwrap_or_return(&mut self, value: Value, span: Span) -> Eval {
+        match value {
+            Value::Some(v) => Ok((*v).clone()),
+            Value::Variant(r) if &*r.name == "Ok" => Ok(r.fields[0].clone()),
+            Value::Variant(r) if self.frames.len() == 1 => {
+                let text = self.text(&r.fields[0], false, span)?;
+                Err(Flow::Stop(span, Some(text)))
+            }
+            v @ Value::Variant(_) => Err(Flow::Return(v)),
+            _ if self.frames.len() == 1 => Err(Flow::Stop(span, None)),
+            _ => Err(Flow::Return(Value::None)),
+        }
     }
 
     fn raw(&mut self, expr: &Expr) -> Eval {
@@ -1151,15 +1201,8 @@ impl Interpreter<'_> {
                     (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
                     (UnOp::BitNot, Value::Int(n)) => Ok(Value::Int(!n)),
                     (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-                    (UnOp::Try, Value::Some(v)) => Ok((*v).clone()),
-                    (UnOp::Try, Value::Variant(r)) if &*r.name == "Ok" => Ok(r.fields[0].clone()),
-                    (UnOp::Try, Value::Variant(r)) if self.frames.len() == 1 => {
-                        let text = self.text(&r.fields[0], false, expr.span)?;
-                        Err(Flow::Stop(expr.span, Some(text)))
-                    }
-                    (UnOp::Try, v @ Value::Variant(_)) => Err(Flow::Return(v)),
-                    (UnOp::Try, _) if self.frames.len() == 1 => Err(Flow::Stop(expr.span, None)),
-                    (UnOp::Try, _) => Err(Flow::Return(Value::None)),
+                    (UnOp::Try, v) if self.info.plain_tries.contains(&expr.id) => Ok(v),
+                    (UnOp::Try, v) => self.unwrap_or_return(v, expr.span),
                     (_, v) => Ok(v),
                 }
             }
@@ -1383,6 +1426,7 @@ impl Interpreter<'_> {
                 self.expr(rhs)
             }
             BinOp::Coalesce => match self.expr(lhs)? {
+                v @ Value::Some(_) if self.info.coalesce_to_maybe.contains(&lhs.id) => Ok(v),
                 Value::Some(v) => Ok((*v).clone()),
                 Value::Variant(r) if &*r.name == "Ok" => Ok(r.fields[0].clone()),
                 _ => self.expr(rhs),
@@ -1503,8 +1547,9 @@ impl Interpreter<'_> {
     ) -> Eval {
         let (values, places) = self.bind_args(&decl.params, args)?;
         let names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+        let passed = values.clone();
         let (result, kept) = self.run_decl(decl, values, this, span, &names)?;
-        self.write_back(places, kept)?;
+        self.write_back(places, passed, kept, span)?;
         Ok(result)
     }
 
@@ -1520,20 +1565,36 @@ impl Interpreter<'_> {
         let (values, places) = self.bind_args(&decl.params, args)?;
         let mut names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
         names.push("this".to_string());
+        let passed = values.clone();
+        let passed_this = this.clone();
         let (result, mut kept) = self.run_decl(decl, values, Some(this), span, &names)?;
         let this = kept.pop().expect("this is kept last");
-        self.write_back(places, kept)?;
+        self.write_back(places, passed, kept, span)?;
         self.write_steps(&mut root, &steps, &mut |slot| {
-            through_ref(slot, |slot| *slot = this.clone());
-            Ok(())
+            through_ref(slot, |slot| {
+                if !untouched(&passed_this, slot) {
+                    return panic(Code::ref_changed_elsewhere, span);
+                }
+                *slot = this.clone();
+                Ok(())
+            })
         })?;
         Ok(result)
     }
 
-    fn write_back(&mut self, places: Vec<Option<Place>>, kept: Vec<Value>) -> Result<(), Flow> {
-        for (place, value) in places.into_iter().zip(kept) {
+    fn write_back(
+        &mut self,
+        places: Vec<Option<Place>>,
+        passed: Vec<Value>,
+        kept: Vec<Value>,
+        span: Span,
+    ) -> Result<(), Flow> {
+        for ((place, before), value) in places.into_iter().zip(passed).zip(kept) {
             if let Some((mut root, steps)) = place {
                 self.write_steps(&mut root, &steps, &mut |slot| {
+                    if !untouched(&before, slot) {
+                        return panic(Code::ref_changed_elsewhere, span);
+                    }
                     *slot = value.clone();
                     Ok(())
                 })?;
