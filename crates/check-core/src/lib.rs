@@ -1,4 +1,4 @@
-pub use check_syntax::{ast, diag, lexer, parser};
+pub use check_syntax::{ast, copy, diag, lexer, parser};
 
 pub mod checker;
 pub mod host;
@@ -12,6 +12,7 @@ pub mod value;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 
+use copy::Text;
 use diag::{Code, Diagnostic, Severity, Sources};
 use modules::{Loaded, MemFiles};
 
@@ -185,7 +186,10 @@ fn panic_text(p: &interp::Panic, sources: &Sources) -> String {
         if p.stack.len() > shown * 2 && i >= shown && i < p.stack.len() - shown {
             if i == shown {
                 let left_out = p.stack.len() - shown * 2;
-                text.push_str(&format!("    [{left_out} calls left out]\n"));
+                let line = Text::calls_left_out
+                    .get()
+                    .replace("{count}", &left_out.to_string());
+                text.push_str(&format!("    {line}\n"));
             }
             continue;
         }

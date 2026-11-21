@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ast::*;
+use crate::copy::Text;
 use crate::diag::{Code, Diagnostic, Edit, Severity, Sources, Span};
 use crate::types::{Show, Subst, Ty};
 
@@ -1617,7 +1618,8 @@ impl Checker<'_> {
             && self.lookup(n).is_some_and(|v| v.kind == VarKind::Local)
             && !self.is_captured(n)
         {
-            detail.push_str(" [or declare it with shared]");
+            detail.push(' ');
+            detail.push_str(Text::detail_or_shared.get());
         }
         d.detail = Some(detail);
         self.diags.push(d);
@@ -2653,7 +2655,7 @@ impl Checker<'_> {
                 let missing = (self.diags[before..].iter_mut())
                     .find(|d| d.code == Code::unknown_field && d.span == expr.span);
                 if let Some(d) = missing.filter(|_| shared_name) {
-                    d.detail = Some("[it's shared: it already reads as its value]".to_string());
+                    d.detail = Some(Text::detail_already_shared.get().to_string());
                     d.fix = vec![Edit {
                         span: Span::new(base.span.end, expr.span.end),
                         text: String::new(),

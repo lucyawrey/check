@@ -4,6 +4,7 @@ use std::io::{self, BufReader, Cursor, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use check_core::copy::Text;
 use check_core::diag::Severity;
 use check_core::modules::entry_of;
 use check_core::{Files, Outcome, Report, check_program, run_program};
@@ -180,14 +181,15 @@ fn tidy(path: &str, levels: &[Severity], dry_run: bool) -> ExitCode {
         }
     }
     if !tidied.changes.is_empty() {
+        let fixes: usize = (tidied.changes.iter())
+            .map(|c| c.rule.split(", ").count())
+            .sum();
         println!(
-            "[how many fixes tidy made, and in how many files: {} fixes, {} files]",
-            tidied
-                .changes
-                .iter()
-                .map(|c| c.rule.split(", ").count())
-                .sum::<usize>(),
-            tidied.files.len()
+            "{}",
+            Text::tidy_summary
+                .get()
+                .replace("{fixes}", &fixes.to_string())
+                .replace("{files}", &tidied.files.len().to_string())
         );
     }
     if !dry_run && !tidied.capped {
@@ -203,13 +205,13 @@ fn tidy(path: &str, levels: &[Severity], dry_run: bool) -> ExitCode {
         eprint!("{}", d.render(&tidied.checked.sources, color));
     }
     if tidied.style_blocked {
-        eprintln!("[style fixes skipped because errors remain that tidy can't fix]");
+        eprintln!("{}", Text::tidy_errors_remain.get());
     }
     if tidied.capped {
-        eprintln!("[tidy stopped after 10 passes with fixes still left, and wrote nothing]");
+        eprintln!("{}", Text::tidy_too_many_passes.get());
     }
     if dry_run && !tidied.changes.is_empty() {
-        eprintln!("[--dry-run found fixes to make and left the files unchanged]");
+        eprintln!("{}", Text::tidy_dry_run.get());
     }
     let errors = tidied
         .checked
