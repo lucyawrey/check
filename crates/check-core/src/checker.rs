@@ -5210,8 +5210,6 @@ fn narrowing_list(iter: &Expr) -> Option<String> {
     }
 }
 
-/// Runs before `expr` is checked, so calls are matched by name only: any argument to a function
-/// or method with a `ref` parameter counts as changed.
 struct Narrowing {
     collection: String,
     index: String,
@@ -5232,6 +5230,8 @@ fn receiver_error(place_error: Code, otherwise: Code) -> Code {
     }
 }
 
+/// Runs before `expr` is checked, so calls are matched by name only: any argument to a function
+/// or method with a `ref` parameter counts as changed.
 fn mutates(expr: &Expr, list: &str, ref_callees: &HashSet<String>) -> bool {
     let changed = |call: &Expr, arg: Option<&Expr>| match (arg, &call.kind) {
         (Some(_), ExprKind::Method(_, m, _)) => ref_callees.contains(m),
