@@ -17,13 +17,15 @@ type PResult<T> = Result<T, ()>;
 
 pub fn parse_data(
     tokens: Vec<Token>,
+    src: &str,
+    base: usize,
     next_id: &mut NodeId,
     diags: &mut Vec<Diagnostic>,
 ) -> DataFile {
     let mut parser = Parser {
         tokens,
-        src: "",
-        base: 0,
+        src,
+        base,
         pos: 0,
         next_id,
         diags,
@@ -615,7 +617,19 @@ impl Parser<'_> {
             token.span.start += 1;
             return Ok(());
         }
-        self.expect_sym(">").map(|_| ())
+        let close = self.expect_sym(">")?;
+        let next = self.tokens[self.pos].clone();
+        if next.tok != Tok::Newline
+            && next.tok != Tok::Eof
+            && self.text_between(close.end, next.span.start).contains('\n')
+        {
+            let line_break = Token {
+                tok: Tok::Newline,
+                span: Span::new(close.end, close.end),
+            };
+            self.tokens.insert(self.pos, line_break);
+        }
+        Ok(())
     }
 
     /// `optional_body` lets a method end after its signature, as in an interface.

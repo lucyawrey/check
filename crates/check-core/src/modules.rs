@@ -103,7 +103,7 @@ pub fn entry_of(folder: &str, files: &dyn Files) -> Result<String, Code> {
         .ok_or(Code::missing_manifest)?;
     let mut ignored = Vec::new();
     let tokens = lexer::lex(&text, 0, true, &mut ignored);
-    let data = parser::parse_data(tokens, &mut 0, &mut ignored);
+    let data = parser::parse_data(tokens, &text, 0, &mut 0, &mut ignored);
     let entry = Manifest::read(&data).entry.ok_or(Code::no_entry)?.0;
     let path = normalize(&format!("{folder}{entry}"));
     files.read(&path).ok_or(Code::missing_entry)?;
@@ -321,7 +321,7 @@ impl<'a> Loader<'a> {
     fn parse_data(&mut self, path: &str, text: &str) -> DataFile {
         let base = self.sources.add(path, text);
         let tokens = lexer::lex(text, base, path.ends_with(".con"), &mut self.diags);
-        parser::parse_data(tokens, &mut self.next_id, &mut self.diags)
+        parser::parse_data(tokens, text, base, &mut self.next_id, &mut self.diags)
     }
 
     fn push(&mut self, unit: usize, namespace: String, stmts: Vec<Stmt>) {

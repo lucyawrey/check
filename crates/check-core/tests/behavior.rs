@@ -3211,9 +3211,9 @@ fn a_lambda_cant_change_what_it_captured() {
 }
 
 #[test]
-fn a_narrowed_index_that_is_gone_panics() {
+fn a_function_that_empties_a_narrowed_list_is_caught_before_it_runs() {
     let src = "var xs = [1, 2, 3]\nfunc clear() { xs = [] }\nfor i in xs.indices() {\n  clear()\n  print(xs[i] * 2)\n}";
-    panics_with(src, "index_out_of_range");
+    assert_eq!(first_error(src), "unhandled_maybe");
 }
 
 #[test]
@@ -3455,4 +3455,89 @@ fn a_ref_place_changed_another_way_during_the_call_panics() {
     let nan =
         "func add(ref x: Float, d: Float) { x += d }\nvar a = 0.0 / 0.0\nadd(a, 1.0)\nprint(a)";
     assert_eq!(output(nan), "NaN");
+}
+
+const CYCLE: &str = "class P {\n  var n = 0\n  func a(k: Int) -> Void {\n    if k > 0 { this.b(k - 1) }\n    this.n += 1\n  }\n  func b(k: Int) -> Void {\n    RECEIVER\n    this.a(k)\n  }\n}\nvar p = P()\np.a(2)\nprint(p.n)";
+
+#[test]
+fn a_call_in_a_cycle_on_a_let_is_an_error_once_the_method_changes_this() {
+    let on_let = CYCLE.replace("RECEIVER", "let q = P()\n    q.a(0)");
+    assert_eq!(first_error(&on_let), "changes_let");
+    let through_shared = CYCLE.replace("RECEIVER", "let q = Shared(P())\n    q.value.a(0)");
+    assert_eq!(output(&through_shared), "3");
+}
+
+#[test]
+fn a_generic_type_at_a_line_end_ends_the_line() {
+    let src = "interface I {\n  func a() -> List<Int>\n  func b() -> List<List<Int>>\n  func c() -> Int\n}\nclass C: I {\n  let xs: List<Int>\n  let y: Int\n  func a() -> List<Int> { this.xs }\n  func b() -> List<List<Int>> { [this.xs] }\n  func c() -> Int { this.y }\n}\nlet big = 3 >\n  2\nlet c = C([1], 4)\nprint(c.b())\nprint(c.c())\nprint(big)";
+    assert_eq!(output(src), "[[1]]\n4\ntrue");
+}
+
+#[test]
+fn a_class_pattern_outside_its_type_cant_name_a_private_field() {
+    let counter = "class Counter {\n  var count = 0\n  private let step = 1\n  func tick() { this.count += this.step }\n}\nlet c = Counter()\n";
+    assert_eq!(
+        first_error(&format!(
+            "{counter}match c {{\n  Counter(count, step) => print(step)\n}}"
+        )),
+        "private_member"
+    );
+    assert_eq!(
+        output(&format!(
+            "{counter}match c {{\n  Counter(count, _) => print(count)\n}}"
+        )),
+        "0"
+    );
+}
+
+#[test]
+fn a_shared_class_const_keeps_its_object_and_its_var_fields_can_change() {
+    let types = (
+        "game/story.check",
+        "shared class Story(lines: List<String>, var position = 0)",
+    );
+    let story = ("game/story.con", "Story(lines = [\"a\"])");
+    let main = |code: &str| ("main.check", format!("import \"game/\"\n{code}"));
+    let changes = main(
+        "func show() { print(story.position) }\nstory.position += 1\nshow()\nlet again = story\nagain.position += 1\nshow()",
+    );
+    assert_eq!(
+        files_output(&[(changes.0, &changes.1), types, story]),
+        "1\n2"
+    );
+    let replaced = main("story = Story(lines = [])");
+    assert_eq!(
+        files_error(&[(replaced.0, &replaced.1), types, story]),
+        "assign_to_let"
+    );
+    let shadowed = main("var story = 1\nstory += 1\nprint(story)");
+    assert_eq!(
+        files_output(&[(shadowed.0, &shadowed.1), types, story]),
+        "2"
+    );
+}
+
+#[test]
+fn a_call_that_changes_a_narrowed_global_undoes_the_narrowing() {
+    let map = "var m = [\"a\" = 1]\nfunc clear() { m.remove(\"a\") }\nfunc look() -> Int { m.length() }\nlet k = \"a\"\n";
+    assert_eq!(
+        first_error(&format!(
+            "{map}if m.contains(k) {{\n  clear()\n  print(m[k] + 1)\n}}"
+        )),
+        "unhandled_maybe"
+    );
+    assert_eq!(
+        first_error(&format!(
+            "{map}if m.contains(k) {{\n  m[k] += 1\n  clear()\n}}"
+        )),
+        "compound_on_missing_index"
+    );
+    assert_eq!(
+        output(&format!(
+            "{map}if m.contains(k) {{\n  print(look())\n  print(m[k] + 1)\n}}"
+        )),
+        "1\n2"
+    );
+    let list = "var xs = [1, 2]\nclass Box {\n  func drop() { xs.pop() }\n}\nlet b = Box()\nfor i in xs.indices() {\n  print(xs[i] + 1)\n  b.drop()\n}";
+    assert_eq!(first_error(list), "unhandled_maybe");
 }

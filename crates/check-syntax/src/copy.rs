@@ -52,8 +52,9 @@ pub(crate) fn text(key: &str) -> &'static str {
 
 fn load() -> HashMap<String, String> {
     let mut diags = Vec::new();
-    let tokens = lexer::lex(include_str!("../copy.con"), 0, true, &mut diags);
-    let file = parser::parse_data(tokens, &mut 0, &mut diags);
+    let text = include_str!("../copy.con");
+    let tokens = lexer::lex(text, 0, true, &mut diags);
+    let file = parser::parse_data(tokens, text, 0, &mut 0, &mut diags);
     // Rendering a diagnostic needs its message, which is in the copy being loaded.
     if let Some(d) = diags.iter().find(|d| d.severity == Severity::Error) {
         panic!(

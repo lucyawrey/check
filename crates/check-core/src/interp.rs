@@ -439,6 +439,10 @@ impl Interpreter<'_> {
                 steps.push(Step::Index(key, e.span));
                 Ok(root)
             }
+            ExprKind::Name(name) if self.slot(name).is_none() && self.consts.contains_key(name) => {
+                let value = self.resolved(&Resolved::Const(name.clone()), &[], e.span)?;
+                Ok(Root::Value(value))
+            }
             ExprKind::Name(name) => Ok(self.root(name)),
             ExprKind::This => Ok(self.root("this")),
             _ => Ok(Root::Value(self.expr(e)?)),

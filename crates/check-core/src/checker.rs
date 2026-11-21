@@ -273,7 +273,7 @@ pub struct Checker<'s> {
     lambdas: Vec<(usize, BTreeSet<String>)>,
     /// Collection and key names whose index can't miss, and the innermost scope they
     /// may come from, so a shadowing name isn't narrowed.
-    narrowed: Vec<(String, String, usize)>,
+    narrowed: Vec<Narrowing>,
     /// Names of functions and methods with a `ref` parameter, for checks that run before calls
     /// are resolved.
     ref_callees: HashSet<String>,
@@ -310,6 +310,7 @@ pub struct Checker<'s> {
     /// Calls on `this` to a method still being checked, as (caller, callee): the caller changes
     /// `this` as soon as the callee does.
     pending_changes: Vec<(String, String)>,
+    calls_awaiting_changes: Vec<(String, Code, Span)>,
     /// Set while checking a write path: whether it went into a `Shared` or `shared class`.
     through_shared: bool,
     /// Set while checking a write path: its variable, when that is a `var`.
@@ -370,6 +371,7 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         renamed: HashMap::new(),
         current_method: None,
         pending_changes: Vec::new(),
+        calls_awaiting_changes: Vec::new(),
         through_shared: false,
         place_root: None,
     };
@@ -1500,6 +1502,11 @@ impl Checker<'_> {
     /// Methods that change `this` through a call to one still being checked, and the rule that
     /// interface methods never change it (generic calls on a `let` rely on it).
     fn report_changes(&mut self, interface_methods: Vec<String>) {
+        for (key, code, span) in std::mem::take(&mut self.calls_awaiting_changes) {
+            if self.funcs[&key].changes_this {
+                self.error(code, span);
+            }
+        }
         for key in interface_methods {
             if self.funcs[&key].changes_this {
                 self.error(Code::interface_changes_this, self.funcs[&key].decl.span);
@@ -1942,6 +1949,9 @@ impl Checker<'_> {
                 return (self.const_type(&key), Some(Code::assign_to_let));
             }
         }
+        if self.lookup(name).is_none() && self.consts.get(name).is_some_and(|c| c.owner.is_none()) {
+            return (self.const_type(name), Some(Code::assign_to_let));
+        }
         if self.is_unset(name) {
             return (self.error(Code::unset_read, span), None);
         }
@@ -2067,6 +2077,12 @@ impl Checker<'_> {
 
     fn ref_to_global_the_callee_writes(&mut self, callee: &str, args: &[Arg]) {
         let writes = self.funcs[callee].writes_globals.clone();
+        for i in 0..self.narrowed.len() {
+            let collection = &self.narrowed[i].collection;
+            if writes.contains(collection) && self.scope_of(collection) == Some(0) {
+                self.narrowed[i].written_by_a_call = true;
+            }
+        }
         for arg in args {
             if self.info.ref_args.contains_key(&arg.value.id)
                 && let Some((root, _)) = ref_path(&arg.value)
@@ -2135,11 +2151,7 @@ impl Checker<'_> {
         let (_, err) = self.place(recv);
         self.diags.truncate(before);
         if let Some(err) = err {
-            let code = match err {
-                Code::readonly_field | Code::assign_to_captured => err,
-                _ => code,
-            };
-            self.error(code, recv.span);
+            self.error(receiver_error(err, code), recv.span);
         }
     }
 
@@ -2534,9 +2546,13 @@ impl Checker<'_> {
         }
         if op.is_some()
             && let ExprKind::Index(list, index) = &target.kind
-            && !self.index_narrowed(list, index)
         {
-            self.compound_on_missing_index(target, &ty, value);
+            let d = self.compound_on_missing_index(target, &ty, value);
+            if self.index_narrowed(list, index) {
+                self.note_narrowed_read(list, index, NarrowedRead::Compound(d));
+            } else {
+                self.diags.push(d);
+            }
         }
         let actual = match op {
             None => self.expr(value, Some(&ty)),
@@ -3890,15 +3906,19 @@ impl Checker<'_> {
                     if !boxed {
                         self.changed_receiver(recv, Code::changes_let);
                     }
-                } else if f.state == FuncState::InProgress
-                    && !boxed
-                    && let Some(caller) = self.current_method.clone()
-                {
+                } else if f.state == FuncState::InProgress && !boxed {
                     let before = self.diags.len();
-                    let (_, _, through, _) = self.place_parts(recv);
+                    let (_, err, through, _) = self.place_parts(recv);
                     self.diags.truncate(before);
-                    if !through && ref_path(recv).is_some_and(|(root, _)| root == "this") {
-                        self.pending_changes.push((caller, key));
+                    let on_this = ref_path(recv).is_some_and(|(root, _)| root == "this");
+                    if through {
+                    } else if on_this {
+                        if let Some(caller) = self.current_method.clone() {
+                            self.pending_changes.push((caller, key));
+                        }
+                    } else if let Some(err) = err {
+                        let code = receiver_error(err, Code::changes_let);
+                        self.calls_awaiting_changes.push((key, code, recv.span));
                     }
                 }
                 return ret;
@@ -4099,9 +4119,54 @@ impl Checker<'_> {
         };
         if self.index_narrowed(list, index) {
             self.info.unwrapped_index.insert(id);
+            self.note_narrowed_read(list, index, NarrowedRead::Value(id, span));
             return elem;
         }
         Ty::maybe(elem)
+    }
+
+    fn narrowing_of(&self, collection: &str, index: &str) -> Option<usize> {
+        self.narrowed.iter().rposition(|n| {
+            n.collection == collection
+                && n.index == index
+                && [collection, index]
+                    .iter()
+                    .all(|name| self.scope_of(name).is_some_and(|s| s <= n.scope))
+        })
+    }
+
+    fn note_narrowed_read(&mut self, list: &Expr, index: &Expr, read: NarrowedRead) {
+        if let (ExprKind::Name(l), ExprKind::Name(i)) = (&list.kind, &index.kind)
+            && let Some(at) = self.narrowing_of(l, i)
+        {
+            self.narrowed[at].reads_relying_on_it.push(read);
+        }
+    }
+
+    fn push_narrowing(&mut self, (collection, index, scope): (String, String, usize)) {
+        self.narrowed.push(Narrowing {
+            collection,
+            index,
+            scope,
+            reads_relying_on_it: Vec::new(),
+            written_by_a_call: false,
+        });
+    }
+
+    fn pop_narrowing(&mut self) {
+        let n = self.narrowed.pop().expect("a narrowing");
+        if !n.written_by_a_call {
+            return;
+        }
+        for read in n.reads_relying_on_it {
+            match read {
+                NarrowedRead::Value(id, span) => {
+                    self.info.unwrapped_index.remove(&id);
+                    self.error(Code::unhandled_maybe, span);
+                }
+                NarrowedRead::Compound(d) => self.diags.push(d),
+            }
+        }
     }
 
     fn index_narrowed(&self, list: &Expr, index: &Expr) -> bool {
@@ -4115,18 +4180,12 @@ impl Checker<'_> {
         };
         match &index.kind {
             ExprKind::Int(k) => known_length(*k),
-            ExprKind::Name(index_name) => self.narrowed.iter().any(|(l, i, depth)| {
-                l == list_name
-                    && i == index_name
-                    && [l, i]
-                        .iter()
-                        .all(|n| self.scope_of(n).is_some_and(|s| s <= *depth))
-            }),
+            ExprKind::Name(index_name) => self.narrowing_of(list_name, index_name).is_some(),
             _ => false,
         }
     }
 
-    fn compound_on_missing_index(&mut self, target: &Expr, ty: &Ty, value: &Expr) {
+    fn compound_on_missing_index(&self, target: &Expr, ty: &Ty, value: &Expr) -> Diagnostic {
         let mut d = Diagnostic::error(Code::compound_on_missing_index, target.span);
         let zero = match self.subst.shallow(ty) {
             Ty::Int => Some("0"),
@@ -4145,7 +4204,7 @@ impl Checker<'_> {
                 text: format!("{place} = ({place} ?? {zero}) {op} {value_text}"),
             }]);
         }
-        self.diags.push(d);
+        d
     }
 
     fn lambda(
@@ -4235,12 +4294,12 @@ impl Checker<'_> {
         self.expect(cond, &c, &Ty::Bool);
         self.push_bindings(self.exports(cond));
         let narrowed = self.contains_check(cond, then);
-        if let Some(n) = &narrowed {
-            self.narrowed.push(n.clone());
+        if let Some(n) = narrowed.clone() {
+            self.push_narrowing(n);
         }
         let t = f(self);
         if narrowed.is_some() {
-            self.narrowed.pop();
+            self.pop_narrowing();
         }
         self.finish_scope();
         t
@@ -4496,10 +4555,17 @@ impl Checker<'_> {
         span: Span,
         binds: &mut Vec<Binding>,
     ) {
-        let fields = self
+        let (fields, private) = self
             .class(class)
-            .map(|c| c.fields.clone())
+            .map(|c| (c.fields.clone(), c.private.clone()))
             .unwrap_or_default();
+        if !self.inside(class) {
+            for (item, _) in (items.iter().zip(&private)).filter(|(_, p)| **p) {
+                if !matches!(item.kind, PatternKind::Wildcard) {
+                    self.error(Code::private_member, item.span);
+                }
+            }
+        }
         let map = self.args_map(class, args);
         let tys: Vec<Ty> = fields.iter().map(|f| f.ty.substitute(&map)).collect();
         match fields.iter().position(|f| f.is_rest) {
@@ -5102,14 +5168,14 @@ impl Checker<'_> {
                 .map(|list| (list, name.clone(), self.scopes.len())),
             _ => None,
         };
-        if let Some(narrowed) = &narrowed_list {
-            self.narrowed.push(narrowed.clone());
+        if let Some(narrowed) = narrowed_list.clone() {
+            self.push_narrowing(narrowed);
         }
         self.push_bindings(binds);
         let ty = self.valued_loop(id, body);
         self.finish_scope();
         if narrowed_list.is_some() {
-            self.narrowed.pop();
+            self.pop_narrowing();
         }
         ty
     }
@@ -5146,6 +5212,26 @@ fn narrowing_list(iter: &Expr) -> Option<String> {
 
 /// Runs before `expr` is checked, so calls are matched by name only: any argument to a function
 /// or method with a `ref` parameter counts as changed.
+struct Narrowing {
+    collection: String,
+    index: String,
+    scope: usize,
+    reads_relying_on_it: Vec<NarrowedRead>,
+    written_by_a_call: bool,
+}
+
+enum NarrowedRead {
+    Value(NodeId, Span),
+    Compound(Diagnostic),
+}
+
+fn receiver_error(place_error: Code, otherwise: Code) -> Code {
+    match place_error {
+        Code::readonly_field | Code::assign_to_captured => place_error,
+        _ => otherwise,
+    }
+}
+
 fn mutates(expr: &Expr, list: &str, ref_callees: &HashSet<String>) -> bool {
     let changed = |call: &Expr, arg: Option<&Expr>| match (arg, &call.kind) {
         (Some(_), ExprKind::Method(_, m, _)) => ref_callees.contains(m),
