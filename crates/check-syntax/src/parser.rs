@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
 use crate::ast::*;
-use crate::diag::{Code, Diagnostic, Edit, Span};
+use crate::diag::{Code, Diagnostic, Edit, Severity, Span};
 use crate::lexer::{StrPart, Tok, Token};
 
 pub struct Parser<'a> {
     tokens: Vec<Token>,
+    src: &'a str,
+    base: usize,
     pos: usize,
     next_id: &'a mut NodeId,
     diags: &'a mut Vec<Diagnostic>,
@@ -20,6 +22,8 @@ pub fn parse_data(
 ) -> DataFile {
     let mut parser = Parser {
         tokens,
+        src: "",
+        base: 0,
         pos: 0,
         next_id,
         diags,
@@ -29,11 +33,15 @@ pub fn parse_data(
 
 pub fn parse_program(
     tokens: Vec<Token>,
+    src: &str,
+    base: usize,
     next_id: &mut NodeId,
     diags: &mut Vec<Diagnostic>,
 ) -> File {
     let mut parser = Parser {
         tokens,
+        src,
+        base,
         pos: 0,
         next_id,
         diags,
@@ -675,7 +683,7 @@ impl Parser<'_> {
             self.advance();
         }
         self.advance();
-        let (name, _) = self.ident()?;
+        let (name, name_span) = self.ident()?;
         let type_params = self.type_params()?;
         let mut fields = Vec::new();
         let mut init = None;
@@ -687,6 +695,8 @@ impl Parser<'_> {
         } else {
             interfaces = self.interface_list()?;
             let owner = name.clone();
+            let open = self.pos;
+            let errors_before = self.error_count();
             self.body(|p| {
                 if p.member(&mut members, &owner, false)? {
                     return Ok(());
@@ -709,6 +719,21 @@ impl Parser<'_> {
                 fields.push(p.body_field()?);
                 Ok(())
             })?;
+            let fields_only = !fields.is_empty()
+                && init.is_none()
+                && interfaces.is_empty()
+                && members.methods.is_empty()
+                && members.statics.is_empty()
+                && members.consts.is_empty();
+            let names_a_header_reads_as_keywords = fields
+                .iter()
+                .any(|f| matches!(f.name.as_str(), "let" | "var"));
+            if fields_only
+                && !names_a_header_reads_as_keywords
+                && self.error_count() == errors_before
+            {
+                self.warn_fields_only_body(name_span, open, self.pos - 1);
+            }
         }
         Ok(ClassDecl {
             is_private: false,
@@ -723,9 +748,96 @@ impl Parser<'_> {
         })
     }
 
+    fn error_count(&self) -> usize {
+        self.diags
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count()
+    }
+
+    fn text_between(&self, start: usize, end: usize) -> &str {
+        &self.src[start - self.base..end - self.base]
+    }
+
+    fn line_indent(&self, at: usize) -> &str {
+        let before = &self.src[..at - self.base];
+        let line = &before[before.rfind('\n').map_or(0, |i| i + 1)..];
+        &line[..line.len() - line.trim_start().len()]
+    }
+
+    fn warn_fields_only_body(&mut self, name: Span, open: usize, close: usize) {
+        let before_brace = self.tokens[open - 1].span.end;
+        let brace = self.tokens[open].span;
+        let first = self.tokens[open + 1].span.start;
+        let last = (self.tokens[..close].iter().rev())
+            .find(|t| t.tok != Tok::Newline)
+            .map_or(brace.end, |t| t.span.end);
+        let close_brace = self.tokens[close].span;
+        let (open_edit, close_edit) = if !self
+            .text_between(brace.end, close_brace.start)
+            .contains('\n')
+        {
+            (
+                Edit {
+                    span: Span::new(before_brace, first),
+                    text: "(".to_string(),
+                },
+                Edit {
+                    span: Span::new(last, close_brace.end),
+                    text: ")".to_string(),
+                },
+            )
+        } else {
+            let indent = self.line_indent(name.start);
+            let open_edit = if self.text_between(brace.end, first).contains('\n') {
+                Edit {
+                    span: Span::new(before_brace, brace.end),
+                    text: "(".to_string(),
+                }
+            } else {
+                Edit {
+                    span: Span::new(before_brace, first),
+                    text: format!("(\n{indent}  "),
+                }
+            };
+            let close_edit = if self.text_between(last, close_brace.start).contains('\n') {
+                Edit {
+                    span: close_brace,
+                    text: ")".to_string(),
+                }
+            } else {
+                Edit {
+                    span: Span::new(last, close_brace.end),
+                    text: format!("\n{indent})"),
+                }
+            };
+            (open_edit, close_edit)
+        };
+        let mut fix = vec![open_edit];
+        let mut depth = 0;
+        for i in open + 1..close {
+            match &self.tokens[i].tok {
+                Tok::Sym("(" | "[" | "{") => depth += 1,
+                Tok::Sym(")" | "]" | "}") => depth -= 1,
+                Tok::Kw("let") if depth == 0 => fix.push(Edit {
+                    span: Span::new(self.tokens[i].span.start, self.tokens[i + 1].span.start),
+                    text: String::new(),
+                }),
+                Tok::Sym(";") if depth == 0 => fix.push(Edit {
+                    span: Span::new(self.tokens[i].span.start, self.tokens[i + 1].span.start),
+                    text: ", ".to_string(),
+                }),
+                _ => {}
+            }
+        }
+        fix.push(close_edit);
+        self.diags
+            .push(Diagnostic::warning(Code::fields_only_body, name).with_fix(fix));
+    }
+
     /// A `let`, `var` or `shared` field in a class or interface body.
     fn body_field(&mut self) -> PResult<Param> {
-        let (is_private, is_readonly) = self.field_modifiers()?;
+        let (is_private, is_readonly) = self.field_modifiers(false)?;
         let is_shared = self.soft_before_name("shared");
         let is_var = self.is_kw("var");
         if !is_shared {
@@ -1169,18 +1281,18 @@ impl Parser<'_> {
         let mut params = Vec::new();
         self.list_items(")", |p| {
             let (is_private, is_readonly) = if fields {
-                p.field_modifiers()?
+                p.field_modifiers(true)?
             } else {
                 (false, false)
             };
-            if fields && !is_private && !is_readonly && p.is_kw("let") {
+            if fields && !is_readonly && p.is_kw("let") {
                 p.remove_token(Code::let_in_class_header);
             }
             let is_ref = allow_ref && p.soft_before_name("ref");
             let is_shared = (allow_ref || fields) && !is_ref && p.soft_before_name("shared");
             let is_var = p.eat_kw("var");
             let is_rest = p.eat_sym("...");
-            let (name, span) = p.ident()?;
+            let (name, span) = if fields { p.field_name()? } else { p.ident()? };
             let ty = if p.eat_sym(":") {
                 Some(p.type_expr()?)
             } else {
@@ -1208,10 +1320,17 @@ impl Parser<'_> {
         Ok(params)
     }
 
-    /// Eats `private` or `readonly` in front of `let` or `var`.
-    fn field_modifiers(&mut self) -> PResult<(bool, bool)> {
+    /// Eats `private` or `readonly` in front of `let` or `var`, and in a `header` also
+    /// `private` in front of a field's name.
+    fn field_modifiers(&mut self, header: bool) -> PResult<(bool, bool)> {
         let modifies = matches!(self.peek_at(1), Tok::Kw("let" | "var"));
-        let is_private = modifies && self.is_soft("private");
+        let before_name = header
+            && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Kw(_))
+            && matches!(
+                self.peek_at(2),
+                Tok::Sym(":" | "=" | "," | ")") | Tok::Newline
+            );
+        let is_private = (modifies || before_name) && self.is_soft("private");
         let is_readonly = modifies && self.is_soft("readonly");
         if is_readonly && matches!(self.peek_at(1), Tok::Kw("let")) {
             self.remove_token(Code::readonly_let);
@@ -1822,6 +1941,8 @@ impl Parser<'_> {
                     }
                     let mut sub = Parser {
                         tokens,
+                        src: self.src,
+                        base: self.base,
                         pos: 0,
                         next_id: self.next_id,
                         diags: self.diags,

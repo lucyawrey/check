@@ -757,6 +757,45 @@ fn warnings(src: &str) -> Vec<String> {
     diagnostics(src, Severity::Warning)
 }
 
+#[test]
+fn only_a_class_with_fields_and_nothing_else_needs_the_header_form() {
+    assert_eq!(warnings("class P { let x: Int }"), ["fields_only_body"]);
+    for src in [
+        "class Empty {}",
+        "class P(x: Int)",
+        "class P {\n  let x: Int\n  func get() -> Int { this.x }\n}",
+        "class P {\n  let x: Int\n  static func make() -> P { P(1) }\n}",
+        "class P {\n  let x: Int\n  const k = 1\n}",
+        "class P {\n  var x = 0\n  init { this.x = 1 }\n}",
+        "interface I { let x: Int }\nclass P: I { let x: Int }",
+        "class P { let let: Int }",
+        "class P {\n  var var = 1\n  let y: Int\n}",
+        "enum E { One, Two }",
+    ] {
+        assert_eq!(warnings(src), Vec::<String>::new(), "{src}");
+    }
+    assert_eq!(
+        warnings("class P {\n  let x: Int\n  let = 1\n}"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_class_header_takes_private_let_fields_and_keyword_names() {
+    assert_eq!(
+        output("class P(private x: Int = 1, type: Int)\nprint(P(type = 2).type)"),
+        "2"
+    );
+    assert_eq!(
+        first_error("class P(private x: Int = 1)\nprint(P().x)"),
+        "private_member"
+    );
+    assert_eq!(
+        first_error("class P(private shared x: Int = 1)"),
+        "unexpected_token"
+    );
+}
+
 const POINT: &str = "class Point(x: Int, y: Int = 0)\n";
 
 #[test]

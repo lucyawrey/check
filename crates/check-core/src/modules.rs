@@ -315,7 +315,7 @@ impl<'a> Loader<'a> {
     fn parse_into(&mut self, path: &str, text: &str, diags: &mut Vec<Diagnostic>) -> File {
         let base = self.sources.add(path, text);
         let tokens = lexer::lex(text, base, false, diags);
-        parser::parse_program(tokens, &mut self.next_id, diags)
+        parser::parse_program(tokens, text, base, &mut self.next_id, diags)
     }
 
     fn parse_data(&mut self, path: &str, text: &str) -> DataFile {
@@ -635,7 +635,13 @@ fn is_name(stem: &str) -> bool {
 pub fn is_entry_source(text: &str) -> bool {
     let mut ignored = Vec::new();
     let tokens = lexer::lex(text, 0, false, &mut ignored);
-    is_entry(&parser::parse_program(tokens, &mut 0, &mut ignored))
+    is_entry(&parser::parse_program(
+        tokens,
+        text,
+        0,
+        &mut 0,
+        &mut ignored,
+    ))
 }
 
 /// An entry file has imports or top-level statements; it's never part of a folder's unit.
