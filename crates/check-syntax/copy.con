@@ -157,6 +157,7 @@ compound_on_missing_index = "[This index might not exist, so it can't be changed
 ref_changed_elsewhere = "[Something else changed this `ref` argument's place during the call]"
 ref_global_written = "[This function also changes this global, so it can't be passed as `ref`]"
 record_beside_class = "[The class is already written beside this record: leave it out]"
+fields_only_body = "[A class with only fields is written with its fields in `()`]"
 
 // Command line
 tidy_summary = "[Made {fixes} fixes in {files} files]"

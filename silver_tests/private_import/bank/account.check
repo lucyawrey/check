@@ -1,6 +1,6 @@
-shared class Account {
+shared class Account(
   readonly var balance: Int = 0
-}
+)
 
 implement Account {
   func deposit(amount: Int) { this.balance += fee(amount) }

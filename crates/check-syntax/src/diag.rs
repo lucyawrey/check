@@ -192,6 +192,7 @@ codes! {
     ref_changed_elsewhere,
     ref_global_written,
     record_beside_class,
+    fields_only_body,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

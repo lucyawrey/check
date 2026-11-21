@@ -93,8 +93,8 @@ fn fixes_each_rule_in_one_file() {
             "class P(x: Int)\nprint(\"{P(1).x}\")",
         ),
         (
-            "class Q {\n  readonly let z: Int = 1\n}",
-            "class Q {\n  let z: Int = 1\n}",
+            "class Q {\n  readonly let z: Int = 1\n  func get() -> Int { this.z }\n}",
+            "class Q {\n  let z: Int = 1\n  func get() -> Int { this.z }\n}",
         ),
         (
             "func a() -> Int => 1\nprint(\"{a()}\")",
@@ -124,6 +124,25 @@ fn fixes_each_rule_in_one_file() {
     ];
     for (before, after) in cases {
         assert_eq!(tidied(before), after, "{before}");
+    }
+}
+
+#[test]
+fn rewrites_a_class_with_only_fields_in_the_header_form() {
+    let cases = [
+        (
+            "class A { let x: Int; var y = 2 }\nprint(A(1).x)",
+            "class A(x: Int, var y = 2)\nprint(A(1).x)",
+        ),
+        (
+            "class B<T> {\n  // the value\n  let value: T\n  private let secret = 0 // hidden\n  readonly var count: Int = 0\n  shared total: Int\n  let type: String = if true { let q = \"a\"; q } else { \"b\" }\n}\nprint(B(1, total = 2).type)",
+            "class B<T>(\n  // the value\n  value: T\n  private secret = 0 // hidden\n  readonly var count: Int = 0\n  shared total: Int\n  type: String = if true { let q = \"a\"; q } else { \"b\" }\n)\nprint(B(1, total = 2).type)",
+        ),
+    ];
+    for (before, after) in cases {
+        assert_eq!(tidied(before), after, "{before}");
+        let rechecked = check_program("main.check", &mem(&[("main.check", after)]), false);
+        assert!(rechecked.diagnostics.is_empty(), "{after}");
     }
 }
 

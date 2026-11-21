@@ -118,7 +118,7 @@ class Temp {
   func isBoiling() -> Bool { this.c >= Temp.boiling }
   static func kettle() -> Temp { Temp(Temp.boiling) }
 }
-shared class Counter { var n = 0 }
+shared class Counter(var n = 0)
 
 var b = Point(1, 2)
 let a = b
