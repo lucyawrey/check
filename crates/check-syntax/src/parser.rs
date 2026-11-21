@@ -1170,7 +1170,7 @@ impl Parser<'_> {
                 p.remove_token(Code::let_in_class_header);
             }
             let is_ref = allow_ref && p.soft_before_name("ref");
-            let is_shared = !is_ref && p.soft_before_name("shared");
+            let is_shared = (allow_ref || fields) && !is_ref && p.soft_before_name("shared");
             let is_var = p.eat_kw("var");
             let is_rest = p.eat_sym("...");
             let (name, span) = p.ident()?;

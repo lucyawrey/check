@@ -267,7 +267,8 @@ pub struct Checker<'s> {
     /// Parameter names an `implement` uses for its type's own (`U` for `T`).
     renamed: HashMap<String, String>,
     current_method: Option<String>,
-    /// Calls on `this` to a method still being checked, as (caller, callee), settled at the end.
+    /// Calls on `this` to a method still being checked, as (caller, callee): the caller changes
+    /// `this` as soon as the callee does.
     pending_changes: Vec<(String, String)>,
     /// Set while checking a write path: whether it went into a `Shared` or `shared class`.
     through_shared: bool,
@@ -422,7 +423,7 @@ impl Checker<'_> {
         for name in names {
             self.ensure_checked(&name, Span::default());
         }
-        self.settle_changes(interface_methods);
+        self.report_changes(interface_methods);
         self.changed_copies(program);
         let consts: Vec<String> = self.consts.keys().cloned().collect();
         for key in consts {
@@ -1442,18 +1443,7 @@ impl Checker<'_> {
 
     /// Methods that change `this` through a call to one still being checked, and the rule that
     /// interface methods never change it (generic calls on a `let` rely on it).
-    fn settle_changes(&mut self, interface_methods: Vec<String>) {
-        let edges = std::mem::take(&mut self.pending_changes);
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for (caller, callee) in &edges {
-                if self.funcs[callee].changes_this && !self.funcs[caller].changes_this {
-                    self.funcs.get_mut(caller).expect("caller").changes_this = true;
-                    changed = true;
-                }
-            }
-        }
+    fn report_changes(&mut self, interface_methods: Vec<String>) {
         for key in interface_methods {
             if self.funcs[&key].changes_this {
                 self.error(Code::interface_changes_this, self.funcs[&key].decl.span);
@@ -1913,22 +1903,25 @@ impl Checker<'_> {
         })
     }
 
-    fn place(&mut self, target: &Expr) -> (Ty, Option<Code>) {
+    /// A place's type and error, whether it goes through a `Shared` or `shared class`, and its
+    /// root variable, without marking anything changed.
+    fn place_parts(&mut self, target: &Expr) -> (Ty, Option<Code>, bool, Option<String>) {
         let saved = (
             std::mem::take(&mut self.through_shared),
             self.place_root.take(),
         );
-        let (ty, mut err) = self.place_path(target);
+        let (ty, err) = self.place_path(target);
         let through = std::mem::replace(&mut self.through_shared, saved.0);
         let root = std::mem::replace(&mut self.place_root, saved.1);
+        (ty, err, through, root)
+    }
+
+    fn place(&mut self, target: &Expr) -> (Ty, Option<Code>) {
+        let (ty, mut err, through, root) = self.place_parts(target);
         if err == Some(Code::changes_let) {
             err = None;
-            if let Some(f) = self
-                .current_method
-                .as_ref()
-                .and_then(|k| self.funcs.get_mut(k))
-            {
-                f.changes_this = true;
+            if let Some(key) = self.current_method.clone() {
+                self.mark_changes_this(key);
             }
         }
         // A change through a `Shared` or `shared class` leaves the variable itself as it was.
@@ -1956,6 +1949,22 @@ impl Checker<'_> {
             ExprKind::Name(n) => self.lookup(n).is_some_and(|v| v.kind == VarKind::Shared),
             ExprKind::Field(..) => self.boxed_fields.contains(&x.id),
             _ => false,
+        }
+    }
+
+    /// Marked as soon as it's known, so calls checked later in the same cycle of methods see it.
+    fn mark_changes_this(&mut self, key: String) {
+        let mut work = vec![key];
+        while let Some(key) = work.pop() {
+            let Some(f) = self.funcs.get_mut(&key).filter(|f| !f.changes_this) else {
+                continue;
+            };
+            f.changes_this = true;
+            work.extend(
+                (self.pending_changes.iter())
+                    .filter(|(_, callee)| *callee == key)
+                    .map(|(caller, _)| caller.clone()),
+            );
         }
     }
 
@@ -2443,21 +2452,22 @@ impl Checker<'_> {
                 }
                 None => self.error(Code::this_outside_method, expr.span),
             },
-            ExprKind::Field(base, name)
-                if name == "value"
-                    && matches!(&base.kind, ExprKind::Name(n)
-                        if self.lookup(n).is_some_and(|v| v.kind == VarKind::Shared)) =>
-            {
-                let ty = self.expr(base, None);
-                let mut d = Diagnostic::error(Code::unknown_field, expr.span);
-                d.detail = Some("[it's shared: it already reads as its value]".to_string());
-                self.diags.push(d.with_quick_fix(vec![Edit {
-                    span: Span::new(base.span.end, expr.span.end),
-                    text: String::new(),
-                }]));
+            ExprKind::Field(base, name) => {
+                let before = self.diags.len();
+                let ty = self.field_expr(expr.id, base, name, expr.span);
+                let shared_name = name == "value" && self.is_boxed(base);
+                let missing = (self.diags[before..].iter_mut())
+                    .find(|d| d.code == Code::unknown_field && d.span == expr.span);
+                if let Some(d) = missing.filter(|_| shared_name) {
+                    d.detail = Some("[it's shared: it already reads as its value]".to_string());
+                    d.fix = vec![Edit {
+                        span: Span::new(base.span.end, expr.span.end),
+                        text: String::new(),
+                    }];
+                    d.quick_fix_only = true;
+                }
                 ty
             }
-            ExprKind::Field(base, name) => self.field_expr(expr.id, base, name, expr.span),
             ExprKind::Match(scrutinee, arms) => {
                 self.match_expr(expr, scrutinee, arms, expected, true)
             }
@@ -2845,7 +2855,7 @@ impl Checker<'_> {
             let Some(sig) = self.ensure_checked(name, span) else {
                 return Ty::Error;
             };
-            if sig.params.iter().any(|p| p.is_ref) {
+            if (sig.params.iter()).any(|p| p.is_ref || p.sharing != Sharing::No) {
                 return self.error(Code::ref_func_as_value, span);
             }
             let map = self.instantiate(name, span);
@@ -4504,7 +4514,13 @@ impl Checker<'_> {
                 continue;
             };
             let mut d = Diagnostic::warning(Code::changed_copy, change);
-            if ty.is_none() && std::ptr::eq(copied, value) {
+            let before = self.diags.len();
+            let (_, err, _, _) = self.place_parts(copied);
+            self.diags.truncate(before);
+            // In a method, a `ref` binding to a path through `this` is fine: the method then
+            // changes `this`.
+            let bindable = matches!(err, None | Some(Code::changes_let));
+            if bindable && ty.is_none() && std::ptr::eq(copied, value) {
                 d = d.with_quick_fix(vec![Edit {
                     span: *keyword,
                     text: "ref".to_string(),
@@ -4616,19 +4632,26 @@ impl Checker<'_> {
         let PatternKind::Name(name) = &pattern.kind else {
             return self.error(Code::unexpected_token, pattern.span);
         };
-        if let Some(path) = ref_path(iter)
-            && let Some(hit) = changes(body, &self.ref_callees, &|e| {
-                ref_path(e).is_some_and(|p| overlaps(&p, &path))
-            })
-        {
-            self.error(Code::changed_in_for_ref, hit.span);
-        }
         self.push_bindings(vec![(name.clone(), pattern.span, elem, true)]);
         if let Some(var) = self.scopes.last_mut().and_then(|s| s.get_mut(name)) {
             var.reassigned = true;
         }
         let ty = self.valued_loop(id, body);
         self.finish_scope();
+        // After the body, so its calls are resolved.
+        let changed = |call: &Expr, arg: Option<&Expr>| match (arg, &call.kind) {
+            (Some(a), _) => self.info.ref_args.contains_key(&a.id),
+            (None, ExprKind::Method(_, m, _)) => self.changes_receiver(call.id, m),
+            (None, _) => false,
+        };
+        let hit = ref_path(iter).and_then(|path| {
+            changes(body, &changed, &|e| {
+                ref_path(e).is_some_and(|p| overlaps(&p, &path))
+            })
+        });
+        if let Some(hit) = hit {
+            self.error(Code::changed_in_for_ref, hit.span);
+        }
         ty
     }
 
@@ -4693,34 +4716,41 @@ fn narrowing_list(iter: &Expr) -> Option<String> {
     }
 }
 
+/// Runs before `expr` is checked, so calls are matched by name only: any argument to a function
+/// or method with a `ref` parameter counts as changed.
 fn mutates(expr: &Expr, list: &str, ref_callees: &HashSet<String>) -> bool {
+    let changed = |call: &Expr, arg: Option<&Expr>| match (arg, &call.kind) {
+        (Some(_), ExprKind::Method(_, m, _)) => ref_callees.contains(m),
+        (Some(_), ExprKind::Call(f, _)) => {
+            matches!(&f.kind, ExprKind::Name(n) if ref_callees.contains(n))
+        }
+        (None, ExprKind::Method(_, m, _)) => MUTATING.contains(&m.as_str()),
+        _ => false,
+    };
     changes(
         expr,
-        ref_callees,
+        &changed,
         &|e| matches!(&e.kind, ExprKind::Name(n) if n == list),
     )
     .is_some()
 }
 
-/// Calls are matched by name only, before they're resolved, so any argument to a function or
-/// method with a `ref` parameter counts as changed.
+/// `changed(call, Some(arg))` says whether a call changes that argument, and
+/// `changed(call, None)` whether it changes its receiver.
 fn changes<'a>(
     expr: &'a Expr,
-    ref_callees: &HashSet<String>,
+    changed: &dyn Fn(&Expr, Option<&Expr>) -> bool,
     is_target: &dyn Fn(&Expr) -> bool,
 ) -> Option<&'a Expr> {
-    let passes = |name: &str, args: &[Arg]| {
-        ref_callees.contains(name) && args.iter().any(|a| is_target(&a.value))
-    };
     find_expr(expr, &mut |e, assigned| {
+        let passes =
+            |args: &[Arg]| (args.iter()).any(|a| is_target(&a.value) && changed(e, Some(&a.value)));
         (assigned && is_target(e))
             || match &e.kind {
-                ExprKind::Method(recv, m, args) => {
-                    (is_target(recv) && MUTATING.contains(&m.as_str())) || passes(m, args)
+                ExprKind::Method(recv, _, args) => {
+                    (is_target(recv) && changed(e, None)) || passes(args)
                 }
-                ExprKind::Call(callee, args) => {
-                    matches!(&callee.kind, ExprKind::Name(n) if passes(n, args))
-                }
+                ExprKind::Call(_, args) => passes(args),
                 ExprKind::For(_, iter, _, true) => is_target(iter),
                 _ => false,
             }

@@ -53,7 +53,7 @@
 - `assign_to_captured` assigning to or changing a variable from outside a lambda inside it, top-level `var`s included, since a lambda keeps a copy of what it captures
 - `overlapping_ref` a `ref` argument that overlaps another argument of the same call (`swap(a, a)`)
 - `ref_default` a `ref` parameter with a default (a `ref` rest parameter doesn't parse)
-- `ref_func_as_value` a function with `ref` parameters used as a value, which would drop the write-back
+- `ref_func_as_value` a function with `ref` or `shared` parameters used as a value, which would drop the write-back or the sharing
 - `shared_where_value_expected` a `Shared<T>` where a `T` is expected (suggests `r.value`)
 - `changed_in_for_ref` changing the list a `for ref` loop goes through, inside the loop
 - `assign_to_parameter` assigning to a parameter not written `var`
@@ -132,7 +132,7 @@
 - `stack_overflow` more than 10,000 nested calls
 - `index_out_of_range` writing to a list index that doesn't exist (`list[9] = x`), or a narrowed read whose index is gone
 - `for_ref_element_gone` a `for ref` element whose index is gone when it's written back
-- `missing_key` a map key that isn't there, on a write path (`m[k] += 1`, `m[k].push(x)`, `ref m[k]`) or in a narrowed read
+- `missing_key` a map key that isn't there, on a write path (`m[k] += 1`, `m[k].push(x)`, `m[k]` passed to a `ref` parameter) or in a narrowed read
 - `internal_error` a case the checker should have ruled out reached the interpreter (a bug in Check, not the program); the reason names the case
 - `out_of_steps` a const or `.conx` value that ran past the step budget (10 million loop passes, calls and built-in steps) while being built
 - `data_try_failed` a `try` that failed in a `.conx` value while a host loads it (`check run` stops with the error instead, as for a top-level `try`)

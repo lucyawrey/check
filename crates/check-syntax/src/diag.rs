@@ -91,7 +91,7 @@ codes! {
     assign_to_captured => "[changing a variable a lambda captured]",
     overlapping_ref => "[a ref argument that overlaps another argument of the same call]",
     ref_default => "[a ref parameter with a default]",
-    ref_func_as_value => "[a function with ref parameters used as a value]",
+    ref_func_as_value => "[a function with ref or shared parameters used as a value]",
     shared_where_value_expected => "[a Shared where its value is expected]",
     changed_in_for_ref => "[changing the list a for ref loop goes through]",
     assign_to_parameter => "[assigning to a parameter not written var]",

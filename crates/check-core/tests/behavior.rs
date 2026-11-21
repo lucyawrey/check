@@ -2657,6 +2657,10 @@ fn a_function_with_ref_parameters_cant_be_a_value() {
         first_error(&format!("{SET_NINE}let f = setNine")),
         "ref_func_as_value"
     );
+    assert_eq!(
+        first_error("func track(shared t: Int) { t += 1 }\nlet f = track"),
+        "ref_func_as_value"
+    );
 }
 
 const COUNTER_VALUE: &str = "class Counter {
@@ -2721,6 +2725,23 @@ let k = Walk()
             "{call}"
         );
     }
+}
+
+#[test]
+fn a_method_that_changes_this_after_a_call_back_into_its_caller_is_inferred() {
+    let src = "class C {
+  var n: Int = 0
+  func a(k: Int) -> Void { if k > 0 { this.b(k - 1) } }
+  func b(k: Int) -> Void {
+    this.a(k)
+    this.n += 1
+  }
+}
+var k = C()
+k.b(2)
+let j = C()
+j.a(2)";
+    assert_eq!(first_error(src), "changes_let");
 }
 
 #[test]
@@ -2900,6 +2921,10 @@ fn a_changed_copy_of_a_plain_path_offers_a_ref_binding() {
     };
     assert_eq!(warned("var c = box.p\nc.n += 1"), ["ref"]);
     assert_eq!(
+        warned("let fixed = Box(P(1))\nvar c = fixed.p\nc.n += 1"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
         warned("var c = ps[0] ?? P(0)\nc.n += 1"),
         Vec::<String>::new()
     );
@@ -2947,6 +2972,20 @@ fn a_class_with_a_shared_field_cant_be_a_key() {
 #[test]
 fn value_on_a_shared_name_offers_to_drop_it() {
     assert_eq!(first_error_fix("shared n = 0\nprint(n.value)"), [""]);
+    assert_eq!(
+        output(
+            "class Wrapper(var value: Int)\nshared w = Wrapper(1)\nshared b = Shared(2)\nprint(\"{w.value} {b.value}\")"
+        ),
+        "1 2"
+    );
+}
+
+#[test]
+fn a_lambda_parameter_cant_be_shared() {
+    assert_eq!(
+        first_error("let f = func(shared t: Int) { t += 1 }"),
+        "unexpected_token"
+    );
 }
 
 #[test]
@@ -2980,12 +3019,20 @@ fn for_ref_keeps_the_changes_made_before_a_break() {
 }
 
 #[test]
-fn for_ref_cant_pass_its_list_to_a_ref_parameter() {
+fn for_ref_can_pass_its_list_to_a_plain_parameter_but_not_a_ref_one() {
     let clear = "func clear(ref a: List<Int>) { a = [] }\nclass C {\n  func clear(ref a: List<Int>) { a = [] }\n}\nlet c = C()\nvar xs = [1]\n";
     for call in ["clear(xs)", "c.clear(xs)"] {
         let src = format!("{clear}for ref x in xs {{ {call} }}");
         assert_eq!(first_error(&src), "changed_in_for_ref", "{call}");
     }
+    let src = "func addLen(ref total: Int, items: Int[]) { total += items.length() }\nvar xs = [1, 2]\nvar sum = 0\nfor ref x in xs {\n  addLen(sum, xs)\n  x += 1\n}\nprint(\"{xs} {sum}\")";
+    assert_eq!(output(src), "[2, 3] 4");
+}
+
+#[test]
+fn for_ref_cant_call_a_method_that_changes_its_lists_owner() {
+    let src = "class P(var x: Int)\nclass G {\n  var ps: P[] = [P(1)]\n  func clear() { this.ps = [] }\n}\nvar g = G()\nfor ref p in g.ps {\n  g.clear()\n  p.x = 5\n}";
+    assert_eq!(first_error(src), "changed_in_for_ref");
 }
 
 #[test]
