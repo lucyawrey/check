@@ -185,6 +185,7 @@ codes! {
     shadows_field => "[a parameter or local with the name of a field or method of this]",
     assigns_itself => "[assigning a name to itself while it hides a field of that name]",
     needless_this => "[this. before a field or method that needs no this.]",
+    nested_try => "[a try inside another try, which already covers it]",
     record_beside_class => "[a record literal with its class written right beside it]",
 }
 

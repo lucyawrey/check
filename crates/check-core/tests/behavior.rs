@@ -3320,3 +3320,38 @@ fn a_name_that_hides_a_field_is_flagged() {
     let value = "class P {\n  var x: Int = 0\n  func inc() { x += 1 }\n}\nlet q = P()\nq.inc()";
     assert_eq!(first_error(value), "changes_let");
 }
+
+#[test]
+fn one_try_covers_every_failure_in_its_expression() {
+    let src = "func add(a: Int, b: Int) -> Int { a + b }\nfunc sum(a: String, b: String) -> Result<Int, String> {\n  print(\"start {a}\")\n  Ok(try add(parse(a), parse(b) * 2))\n}\nfunc first(a: String) -> Int? { try add(Int.parse(a), 1) }\nprint(\"{sum(\"1\", \"2\")} {first(\"4\")} {first(\"x\")}\")\nprint(sum(\"1\", \"x\"))";
+    assert_eq!(
+        with_parse(src),
+        "start 1\nOk(5) Some(5) None\nstart 1\nErr(\"bad x\")"
+    );
+    let passes_through = "func f(xs: List<Int?>) -> List<Int?> { xs }\nfunc g() -> Int? { try f([Int.parse(\"1\")])[0] }\nprint(g())";
+    assert_eq!(output(passes_through), "Some(1)");
+    let operands = "func ops(a: String) -> Int? { try (Int.parse(a) * 2 + Int.parse(a)) }\nfunc size(m: Map<String, List<Int>>) -> Int? { try m[\"a\"].length() }\nprint(\"{ops(\"2\")} {ops(\"x\")} {size([\"a\" = [1, 2]])} {size([=])}\")";
+    assert_eq!(output(operands), "Some(6) None Some(2) None");
+    assert_eq!(
+        error_and_fix("func at(i: Int) -> Int { i }\nfunc f() -> Int? { try at(parse(\"1\")) }"),
+        (
+            "try_result_in_maybe".into(),
+            Some("parse(\"1\").ok()".into())
+        )
+    );
+    assert_eq!(
+        first_error("func f() -> Int { (func() -> Int { try Int.parse(\"1\") })() }"),
+        "try_outside_failable"
+    );
+}
+
+#[test]
+fn a_try_inside_another_is_flagged() {
+    assert_eq!(
+        diagnostics(
+            "func f(m: Map<String, String>) -> Int? { try Int.parse(try m[\"a\"]) }",
+            Severity::Warning
+        ),
+        ["nested_try"]
+    );
+}

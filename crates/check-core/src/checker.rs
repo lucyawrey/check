@@ -26,6 +26,10 @@ pub enum Resolved {
 #[derive(Default)]
 pub struct Info {
     pub coercions: HashMap<NodeId, Coercion>,
+    /// Values inside a `try` that it unwraps, returning early on a failure, with their spans.
+    pub try_unwraps: HashMap<NodeId, Span>,
+    /// Each `try` whose own operand can't fail, only values inside it.
+    pub plain_tries: HashSet<NodeId>,
     pub wrapping: HashSet<NodeId>,
     pub signatures: HashMap<NodeId, String>,
     /// Each lambda's captured variables: what its body, or a lambda inside it, reads from outside.
@@ -254,6 +258,10 @@ pub struct Checker<'s> {
     fns: Vec<FnCtx>,
     loops: Vec<LoopCtx>,
     flow: Flow,
+    /// Checking a `try`'s operand, outside any lambda in it.
+    in_try: bool,
+    /// How many points that can return early on a failure `try`s have found so far.
+    try_points: usize,
     /// Each `let` declared without a value, by declaration, and how many loops it's inside.
     pending_lets: HashMap<Span, usize>,
     /// The lambdas being checked, innermost last: each one's first scope (variables below it are
@@ -328,6 +336,8 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         fns: Vec::new(),
         loops: Vec::new(),
         flow: Flow::default(),
+        in_try: false,
+        try_points: 0,
         pending_lets: HashMap::new(),
         lambdas: Vec::new(),
         narrowed: Vec::new(),
@@ -1081,6 +1091,7 @@ impl Checker<'_> {
         let saved_scopes = self.scopes.split_off(1);
         let saved_loops = std::mem::take(&mut self.loops);
         let saved_flow = std::mem::take(&mut self.flow);
+        let saved_try = std::mem::take(&mut self.in_try);
         let saved_lambdas = std::mem::take(&mut self.lambdas);
         let saved_narrowed = std::mem::take(&mut self.narrowed);
         let mut scope = HashMap::new();
@@ -1131,6 +1142,7 @@ impl Checker<'_> {
         self.scopes.extend(saved_scopes);
         self.loops = saved_loops;
         self.flow = saved_flow;
+        self.in_try = saved_try;
         self.lambdas = saved_lambdas;
         self.narrowed = saved_narrowed;
         let entry = self.funcs.get_mut(name)?;
@@ -1553,6 +1565,9 @@ impl Checker<'_> {
             return;
         }
         let a = self.subst.shallow(actual);
+        if self.in_try && self.try_unwrap(expr, &a, expected) {
+            return;
+        }
         if let Ty::Named(n, args) = &a
             && n == SHARED
             && self.subst.unify(&args[0], expected)
@@ -2625,7 +2640,7 @@ impl Checker<'_> {
                 self.expr(inner, None);
                 self.error(Code::wrong_arguments, expr.span)
             }
-            ExprKind::Unary(op, operand) => self.unary(*op, operand, expr.span),
+            ExprKind::Unary(op, operand) => self.unary(expr.id, *op, operand, expr.span),
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expr.span),
             ExprKind::Call(callee, args) => {
                 let ty = self.call(expr.id, callee, args, expr.span, expected);
@@ -2930,6 +2945,7 @@ impl Checker<'_> {
             return self.error(Code::unknown_field, span);
         }
         let bt = self.expr(base, None);
+        let bt = self.try_operand(base, bt);
         let bt = match self.subst.shallow(&bt) {
             Ty::Named(n, mut a) if n == SHARED && name == "value" => return a.remove(0),
             Ty::Named(n, mut a) if n == SHARED => a.remove(0),
@@ -3014,9 +3030,30 @@ impl Checker<'_> {
         self.error(code, span)
     }
 
-    fn unary(&mut self, op: UnOp, operand: &Expr, span: Span) -> Ty {
-        let t = self.expr(operand, None);
+    fn unary(&mut self, id: NodeId, op: UnOp, operand: &Expr, span: Span) -> Ty {
+        let points = self.try_points;
+        let t = if op == UnOp::Try {
+            if self.in_try {
+                let fix = vec![Edit {
+                    span: Span::new(span.start, operand.span.start),
+                    text: String::new(),
+                }];
+                self.diags
+                    .push(Diagnostic::warning(Code::nested_try, span).with_fix(fix));
+            }
+            let outer = std::mem::replace(&mut self.in_try, true);
+            let t = self.expr(operand, None);
+            self.in_try = outer;
+            t
+        } else {
+            let t = self.expr(operand, None);
+            self.try_operand(operand, t)
+        };
         let t = self.subst.shallow(&t);
+        let inner_fails = self.try_points > points;
+        if op == UnOp::Try {
+            self.try_points += 1;
+        }
         match (op, &t) {
             (_, Ty::Error) => Ty::Error,
             (UnOp::Neg, Ty::Int | Ty::Float) => t,
@@ -3038,8 +3075,47 @@ impl Checker<'_> {
                     Ty::Error
                 }
             }
+            (UnOp::Try, _) if inner_fails => {
+                self.info.plain_tries.insert(id);
+                t
+            }
             (_, Ty::Var(_)) => self.error(Code::type_needed, operand.span),
             _ => self.error(Code::invalid_operand_types, span),
+        }
+    }
+
+    /// Inside a `try`, a `Maybe` or `Result` where its inner type is expected unwraps.
+    fn try_unwrap(&mut self, expr: &Expr, actual: &Ty, expected: &Ty) -> bool {
+        let e = self.subst.shallow(expected);
+        let failable =
+            |t: &Ty| matches!(t, Ty::Maybe(_)) || matches!(t, Ty::Named(n, _) if n == RESULT);
+        if matches!(e, Ty::Var(_)) || failable(&e) {
+            return false;
+        }
+        let Some((inner, fails)) = failure_of(actual) else {
+            return false;
+        };
+        if !self.subsume(expr.id, &inner, &e) {
+            return false;
+        }
+        self.record_unwrap(expr, fails);
+        true
+    }
+
+    /// Inside a `try`, an operand, receiver or field base that can fail unwraps to its inner type.
+    fn try_operand(&mut self, expr: &Expr, ty: Ty) -> Ty {
+        let Some((inner, fails)) = failure_of(&self.subst.shallow(&ty)).filter(|_| self.in_try)
+        else {
+            return ty;
+        };
+        self.record_unwrap(expr, fails);
+        inner
+    }
+
+    fn record_unwrap(&mut self, expr: &Expr, fails: Fails) {
+        if self.try_fails(fails, expr, expr.span) {
+            self.info.try_unwraps.insert(expr.id, expr.span);
+            self.try_points += 1;
         }
     }
 
@@ -3076,7 +3152,9 @@ impl Checker<'_> {
             (Fails::Maybe, Some(Fails::Result(_))) => (Code::try_maybe_in_result, "orErr(...)"),
         };
         let mut d = Diagnostic::error(code, span);
-        d.detail = Some(format!("try {}.{fix}", self.operand_text(operand)));
+        // A value a `try` unwraps inside its operand is already covered by that `try`.
+        let prefix = if span == operand.span { "" } else { "try " };
+        d.detail = Some(format!("{prefix}{}.{fix}", self.operand_text(operand)));
         self.diags.push(d);
         false
     }
@@ -3085,6 +3163,7 @@ impl Checker<'_> {
         match op {
             BinOp::And | BinOp::Or => {
                 let lt = self.expr(lhs, Some(&Ty::Bool));
+                let lt = self.try_operand(lhs, lt);
                 if !self.subst.unify(&lt, &Ty::Bool) {
                     self.error(Code::invalid_operand_types, lhs.span);
                 }
@@ -3095,6 +3174,7 @@ impl Checker<'_> {
                 };
                 self.push_bindings(binds);
                 let rt = self.expr(rhs, Some(&Ty::Bool));
+                let rt = self.try_operand(rhs, rt);
                 self.scopes.pop();
                 if !self.subst.unify(&rt, &Ty::Bool) {
                     self.error(Code::invalid_operand_types, rhs.span);
@@ -3127,7 +3207,9 @@ impl Checker<'_> {
             }
             _ => {
                 let lt = self.expr(lhs, None);
+                let lt = self.try_operand(lhs, lt);
                 let rt = self.expr(rhs, None);
+                let rt = self.try_operand(rhs, rt);
                 if op == BinOp::Pow
                     && self.subst.shallow(&lt) == Ty::Int
                     && let ExprKind::Unary(UnOp::Neg, inner) = &rhs.kind
@@ -3643,6 +3725,11 @@ impl Checker<'_> {
         } else {
             self.expr(recv, None)
         };
+        let recv_ty = if matches!(name, "orPanic" | "orErr" | "ok" | "flatten") {
+            recv_ty
+        } else {
+            self.try_operand(recv, recv_ty)
+        };
         let boxed = matches!(self.subst.shallow(&recv_ty), Ty::Named(n, _) if n == SHARED);
         let mut recv_ty = self.unref(&recv_ty);
         // A method that changes an element is a write through the index, as `xs[i].n = 1` is.
@@ -3941,6 +4028,7 @@ impl Checker<'_> {
         let declared = ret.map(|t| self.type_from(t));
         let saved_loops = std::mem::take(&mut self.loops);
         let saved_flow = self.flow.clone();
+        let saved_try = std::mem::take(&mut self.in_try);
         self.flow.dead = false;
         self.lambdas.push((self.scopes.len(), BTreeSet::new()));
         self.scopes.push(scope);
@@ -3948,6 +4036,7 @@ impl Checker<'_> {
         self.finish_scope();
         self.loops = saved_loops;
         self.flow = saved_flow;
+        self.in_try = saved_try;
         let (_, captures) = self.lambdas.pop().expect("lambda");
         self.info
             .captures
@@ -5085,6 +5174,17 @@ fn copied_path(e: &Expr) -> Option<&Expr> {
         ExprKind::Field(..) | ExprKind::Index(..) if ref_path(e).is_some() => Some(e),
         ExprKind::Binary(BinOp::Coalesce, x, _) | ExprKind::Unary(UnOp::Try, x) => copied_path(x),
         ExprKind::Method(x, m, _) if m == "orPanic" => copied_path(x),
+        _ => None,
+    }
+}
+
+/// A `Maybe` or `Result` type's inner type, and what a `try` on it passes up.
+fn failure_of(t: &Ty) -> Option<(Ty, Fails)> {
+    match t {
+        Ty::Maybe(inner) => Some(((**inner).clone(), Fails::Maybe)),
+        Ty::Named(n, args) if n == RESULT => {
+            Some((args[0].clone(), Fails::Result(args[1].clone())))
+        }
         _ => None,
     }
 }

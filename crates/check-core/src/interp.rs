@@ -1034,8 +1034,26 @@ impl Interpreter<'_> {
     }
 
     fn expr(&mut self, expr: &Expr) -> Eval {
-        let value = grow(|| self.raw(expr))?;
+        let mut value = grow(|| self.raw(expr))?;
+        if self.info.try_unwraps.contains_key(&expr.id) {
+            value = self.unwrap_or_return(value, expr.span)?;
+        }
         Ok(self.coerce(expr.id, value))
+    }
+
+    /// What `try` does with a value: the `Some` or `Ok` inside, or else returning the failure.
+    fn unwrap_or_return(&mut self, value: Value, span: Span) -> Eval {
+        match value {
+            Value::Some(v) => Ok((*v).clone()),
+            Value::Variant(r) if &*r.name == "Ok" => Ok(r.fields[0].clone()),
+            Value::Variant(r) if self.frames.len() == 1 => {
+                let text = self.text(&r.fields[0], false, span)?;
+                Err(Flow::Stop(span, Some(text)))
+            }
+            v @ Value::Variant(_) => Err(Flow::Return(v)),
+            _ if self.frames.len() == 1 => Err(Flow::Stop(span, None)),
+            _ => Err(Flow::Return(Value::None)),
+        }
     }
 
     fn raw(&mut self, expr: &Expr) -> Eval {
@@ -1154,15 +1172,8 @@ impl Interpreter<'_> {
                     (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
                     (UnOp::BitNot, Value::Int(n)) => Ok(Value::Int(!n)),
                     (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
-                    (UnOp::Try, Value::Some(v)) => Ok((*v).clone()),
-                    (UnOp::Try, Value::Variant(r)) if &*r.name == "Ok" => Ok(r.fields[0].clone()),
-                    (UnOp::Try, Value::Variant(r)) if self.frames.len() == 1 => {
-                        let text = self.text(&r.fields[0], false, expr.span)?;
-                        Err(Flow::Stop(expr.span, Some(text)))
-                    }
-                    (UnOp::Try, v @ Value::Variant(_)) => Err(Flow::Return(v)),
-                    (UnOp::Try, _) if self.frames.len() == 1 => Err(Flow::Stop(expr.span, None)),
-                    (UnOp::Try, _) => Err(Flow::Return(Value::None)),
+                    (UnOp::Try, v) if self.info.plain_tries.contains(&expr.id) => Ok(v),
+                    (UnOp::Try, v) => self.unwrap_or_return(v, expr.span),
                     (_, v) => Ok(v),
                 }
             }
