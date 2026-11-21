@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ast::*;
-use crate::diag::{Code, Diagnostic, Edit, Sources, Span};
+use crate::diag::{Code, Diagnostic, Edit, Severity, Sources, Span};
 use crate::types::{Show, Subst, Ty};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -225,6 +225,7 @@ struct LoopCtx {
     kind: LoopKind,
     break_ty: Option<Ty>,
     break_flow: Option<Flow>,
+    set_before: HashSet<Span>,
 }
 
 #[derive(Clone, Default)]
@@ -264,6 +265,7 @@ pub struct Checker<'s> {
     in_try: bool,
     try_points: usize,
     lets_without_value: HashMap<Span, usize>,
+    let_sets: HashMap<Span, Span>,
     /// The lambdas being checked, innermost last: each one's first scope (variables below it are
     /// captured) and what it has captured so far.
     lambdas: Vec<(usize, BTreeSet<String>)>,
@@ -340,6 +342,7 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         in_try: false,
         try_points: 0,
         lets_without_value: HashMap::new(),
+        let_sets: HashMap::new(),
         lambdas: Vec::new(),
         narrowed: Vec::new(),
         ref_callees: HashSet::new(),
@@ -2031,6 +2034,34 @@ impl Checker<'_> {
         (ty, err)
     }
 
+    fn let_set_again_by_the_loop(&mut self) {
+        let Some(ctx) = self.loops.last() else {
+            return;
+        };
+        if self.flow.dead {
+            return;
+        }
+        let depth = self.loops.len() - 1;
+        let repeated: Vec<Span> = (self.flow.maybe_set.iter())
+            .filter(|decl| !ctx.set_before.contains(decl))
+            .filter(|decl| {
+                self.lets_without_value
+                    .get(decl)
+                    .is_some_and(|&d| d <= depth)
+            })
+            .filter_map(|decl| self.let_sets.get(decl).copied())
+            .collect();
+        for span in repeated {
+            if !self
+                .diags
+                .iter()
+                .any(|d| d.code == Code::let_set_twice && d.span == span)
+            {
+                self.error(Code::let_set_twice, span);
+            }
+        }
+    }
+
     fn note_global_write(&mut self, name: &str) {
         if self.scope_of(name) == Some(0)
             && let Some(f) = self.fns.last_mut()
@@ -2490,8 +2521,11 @@ impl Checker<'_> {
                     .lets_without_value
                     .get(&decl)
                     .is_some_and(|&d| self.loops.len() > d);
-            if again && self.lets_without_value.contains_key(&decl) {
-                self.error(Code::let_set_twice, target.span);
+            if self.lets_without_value.contains_key(&decl) {
+                if self.flow.maybe_set.contains(&decl) {
+                    self.error(Code::let_set_twice, target.span);
+                }
+                self.let_sets.insert(decl, target.span);
             } else if again && let Some(var) = self.lookup_mut(n) {
                 var.reassigned = true;
             }
@@ -2740,8 +2774,10 @@ impl Checker<'_> {
                     kind: LoopKind::Loop,
                     break_ty: None,
                     break_flow: None,
+                    set_before: self.flow.maybe_set.clone(),
                 });
                 self.unused(body);
+                self.let_set_again_by_the_loop();
                 let ctx = self.loops.pop().expect("loop context");
                 self.flow = ctx.break_flow.clone().unwrap_or(Flow {
                     dead: true,
@@ -2784,6 +2820,7 @@ impl Checker<'_> {
                 Ty::Never
             }
             ExprKind::Continue => {
+                self.let_set_again_by_the_loop();
                 self.flow.dead = true;
                 if self.loops.is_empty() {
                     return self.error(Code::break_outside_loop, expr.span);
@@ -3095,6 +3132,7 @@ impl Checker<'_> {
 
     fn unary(&mut self, id: NodeId, op: UnOp, operand: &Expr, span: Span) -> Ty {
         let points = self.try_points;
+        let diags_before = self.diags.len();
         let t = if op == UnOp::Try {
             if self.in_try {
                 let fix = vec![Edit {
@@ -3141,6 +3179,13 @@ impl Checker<'_> {
             (UnOp::Try, _) if inner_fails => {
                 self.info.plain_tries.insert(id);
                 t
+            }
+            (UnOp::Try, _)
+                if self.diags[diags_before..]
+                    .iter()
+                    .any(|d| d.severity == Severity::Error) =>
+            {
+                Ty::Error
             }
             (_, Ty::Var(_)) => self.error(Code::type_needed, operand.span),
             _ => self.error(Code::invalid_operand_types, span),
@@ -3270,6 +3315,7 @@ impl Checker<'_> {
                     let rt = self.expr(rhs, Some(&lt));
                     (lt, rt)
                 };
+                let (lt, rt) = self.unwrap_compared(lhs, lt, rhs, rt);
                 let (lt, rt) = self.compare_maybe_with_value(lhs, lt, rhs, rt);
                 self.binary_type(op, lhs, &lt, rhs, &rt, span)
             }
@@ -3288,6 +3334,13 @@ impl Checker<'_> {
                 self.binary_type(op, lhs, &lt, rhs, &rt, span)
             }
         }
+    }
+
+    fn unwrap_compared(&mut self, lhs: &Expr, lt: Ty, rhs: &Expr, rt: Ty) -> (Ty, Ty) {
+        if is_name(lhs, "None") || is_name(rhs, "None") {
+            return (lt, rt);
+        }
+        (self.try_operand(lhs, lt), self.try_operand(rhs, rt))
     }
 
     fn compare_maybe_with_value(&mut self, lhs: &Expr, lt: Ty, rhs: &Expr, rt: Ty) -> (Ty, Ty) {
@@ -4778,9 +4831,11 @@ impl Checker<'_> {
             kind: LoopKind::Valued,
             break_ty: None,
             break_flow: None,
+            set_before: self.flow.maybe_set.clone(),
         });
         let before = self.flow.clone();
         self.unused(body);
+        self.let_set_again_by_the_loop();
         let ctx = self.loops.pop().expect("loop context");
         let after = std::mem::take(&mut self.flow).join(before);
         self.flow = match ctx.break_flow.clone() {

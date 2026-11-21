@@ -340,6 +340,22 @@ fn uncell(v: Value) -> Value {
     }
 }
 
+fn untouched(before: &Value, now: &Value) -> bool {
+    match (before, now) {
+        (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+        (Value::List(a), Value::List(b)) if Rc::ptr_eq(a, b) => true,
+        (Value::Map(a), Value::Map(b)) if Rc::ptr_eq(a, b) => true,
+        (Value::Object(a), Value::Object(b))
+        | (Value::Variant(a), Value::Variant(b))
+        | (Value::Record(a), Value::Record(b))
+            if Rc::ptr_eq(a, b) =>
+        {
+            true
+        }
+        _ => before == now,
+    }
+}
+
 fn share_new(v: Value) -> Value {
     Value::Cell(Rc::new(RefCell::new(v)))
 }
@@ -1556,7 +1572,7 @@ impl Interpreter<'_> {
         self.write_back(places, passed, kept, span)?;
         self.write_steps(&mut root, &steps, &mut |slot| {
             through_ref(slot, |slot| {
-                if *slot != passed_this {
+                if !untouched(&passed_this, slot) {
                     return panic(Code::ref_changed_elsewhere, span);
                 }
                 *slot = this.clone();
@@ -1576,7 +1592,7 @@ impl Interpreter<'_> {
         for ((place, before), value) in places.into_iter().zip(passed).zip(kept) {
             if let Some((mut root, steps)) = place {
                 self.write_steps(&mut root, &steps, &mut |slot| {
-                    if *slot != before {
+                    if !untouched(&before, slot) {
                         return panic(Code::ref_changed_elsewhere, span);
                     }
                     *slot = value.clone();

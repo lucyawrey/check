@@ -3287,6 +3287,14 @@ fn reading_a_variable_that_might_not_be_set_is_an_error() {
     assert_eq!(wrap("let x: Int\nif c { x = 1 }\nx = 2"), "let_set_twice");
     assert_eq!(wrap("let x: Int\nfor i in 0..3 { x = i }"), "let_set_twice");
     assert_eq!(
+        wrap("let x: Int\nfor i in 0..3 {\n  if c {\n    x = i\n    continue\n  }\n}"),
+        "let_set_twice"
+    );
+    assert_eq!(
+        wrap("let x: Int\nloop {\n  x = 1\n  break\n}\nprint(x)"),
+        ""
+    );
+    assert_eq!(
         wrap("let x\nif c { x = 1 } else { x = \"a\" }"),
         "type_mismatch"
     );
@@ -3339,6 +3347,15 @@ fn one_try_covers_every_failure_in_its_expression() {
     assert_eq!(output(passes_through), "Some(1)");
     let operands = "func ops(a: String) -> Int? { try Int.parse(a) * 2 + Int.parse(a) }\nfunc size(m: Map<String, List<Int>>) -> Int? { try m[\"a\"].length() }\nprint(\"{ops(\"2\")} {ops(\"x\")} {size([\"a\" = [1, 2]])} {size([=])}\")";
     assert_eq!(output(operands), "Some(6) None Some(2) None");
+    let compared = "func a() -> Int? { 1 }\nfunc b() -> Int? { None }\nfunc f() -> Bool? { try a() == 1 }\nfunc g() -> Bool? { try a() != b() }\nprint(\"{f()} {g()}\")";
+    assert_eq!(output(compared), "Some(true) None");
+    assert_eq!(
+        diagnostics(
+            "func a() -> Int? { 1 }\nfunc f() -> Result<Int, String> { Ok(try a() + 1) }",
+            Severity::Error
+        ),
+        ["try_maybe_in_result"]
+    );
     assert_eq!(
         error_and_fix("func at(i: Int) -> Int { i }\nfunc f() -> Int? { try at(parse(\"1\")) }"),
         (
@@ -3413,4 +3430,7 @@ fn a_ref_place_changed_another_way_during_the_call_panics() {
     panics_with(callback, "ref_changed_elsewhere");
     let field = "shared class Count(var n: Int)\nclass Holder(shared c: Count)\nfunc g(ref a: Int, h: Holder) {\n  a += 1\n  h.c.n += 10\n}\nlet c = Count(1)\nlet x = Holder(c)\nlet y = Holder(c)\ng(x.c.n, y)";
     panics_with(field, "ref_changed_elsewhere");
+    let nan =
+        "func add(ref x: Float, d: Float) { x += d }\nvar a = 0.0 / 0.0\nadd(a, 1.0)\nprint(a)";
+    assert_eq!(output(nan), "NaN");
 }
