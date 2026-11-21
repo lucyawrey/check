@@ -2977,9 +2977,13 @@ fn value_on_a_shared_name_offers_to_drop_it() {
     assert_eq!(first_error_fix("shared n = 0\nprint(n.value)"), [""]);
     assert_eq!(
         output(
-            "class Wrapper(var value: Int)\nshared w = Wrapper(1)\nshared b = Shared(2)\nprint(\"{w.value} {b.value}\")"
+            "class Wrapper(var value: Int)\nshared w = Wrapper(1)\nshared b = Shared(2)\nprint(\"{w.value} {b}\")"
         ),
         "1 2"
+    );
+    assert_eq!(
+        first_error_fix("shared b = Shared(2)\nprint(b.value)"),
+        [""]
     );
 }
 
