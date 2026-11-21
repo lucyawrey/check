@@ -3291,3 +3291,32 @@ fn a_maybe_of_a_maybe_is_written_with_two_question_marks() {
     let src = "let m: Map<String, Int?> = [\"a\" = None]\nlet x: Int?? = m[\"a\"]\nlet y: List<Int??> = [x]\nfunc f(v: Int??) -> Int?? { v }\nprint(\"{x} {y} {f(None)}\")";
     assert_eq!(output(src), "Some(None) [Some(None)] None");
 }
+
+#[test]
+fn a_method_reaches_its_fields_and_methods_without_this() {
+    let src = "func bump() -> Int { 100 }\ninterface Named {\n  let name: String\n  func greet() -> String { \"hi {name}\" }\n}\nshared class Counter: Named {\n  let name = \"c\"\n  var count = 0\n  var step = 1\n  func bump() { count += step }\n  func later() -> func() { func() { bump() } }\n  func show(step: Int) -> String {\n    let before = count\n    let count = 9\n    \"{before} {count} {step} {this.step}\"\n  }\n}\nimplement Counter {\n  func twice() {\n    bump()\n    later()()\n  }\n}\nlet c = Counter()\nc.twice()\nprint(\"{c.show(5)} {bump()} {c.greet()}\")";
+    assert_eq!(output(src), "2 9 5 1 100 hi c");
+}
+
+#[test]
+fn a_name_that_hides_a_field_is_flagged() {
+    let class = |method: &str| format!("shared class P {{\n  var x = 0\n  {method}\n}}");
+    assert_eq!(
+        warnings(&class("func f(x: Int) -> Int { x + this.x }")),
+        ["shadows_field"]
+    );
+    assert_eq!(
+        warnings(&class("func f() -> Int { this.x }")),
+        ["needless_this"]
+    );
+    assert_eq!(
+        first_error(&class("func f(var x: Int) { x = x }")),
+        "assigns_itself"
+    );
+    assert_eq!(
+        first_error("class P {\n  let x = 0\n  static func f() -> Int { x }\n}"),
+        "unknown_name"
+    );
+    let value = "class P {\n  var x: Int = 0\n  func inc() { x += 1 }\n}\nlet q = P()\nq.inc()";
+    assert_eq!(first_error(value), "changes_let");
+}

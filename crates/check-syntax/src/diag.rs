@@ -182,6 +182,9 @@ codes! {
     let_else_some => "[let Some(x) = e else, which ?? can replace]",
     repeated_namespace => "[a namespace line that only repeats its package's]",
     set_in_every_branch => "[a variable declared without a value, then set at the end of every branch]",
+    shadows_field => "[a parameter or local with the name of a field or method of this]",
+    assigns_itself => "[assigning a name to itself while it hides a field of that name]",
+    needless_this => "[this. before a field or method that needs no this.]",
     record_beside_class => "[a record literal with its class written right beside it]",
 }
 

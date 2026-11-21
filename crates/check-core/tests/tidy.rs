@@ -261,3 +261,10 @@ fn a_variable_only_set_in_every_branch_takes_the_branches_as_its_value() {
     let kept = "func f(n: Int) -> Int {\n  let g\n  if n > 0 {\n    print(n)\n    g = n\n  } else { g = n + 1 }\n  g\n}\nprint(f(1))";
     assert_eq!(tidied(kept), kept);
 }
+
+#[test]
+fn removes_a_this_that_isnt_needed() {
+    let src = "shared class P {\n  var x = 0\n  func f(y: Int) -> Int { this.x + this.g(y) }\n  func g(x: Int) -> Int { this.x + x }\n}\nprint(P().f(1))";
+    let after = "shared class P {\n  var x = 0\n  func f(y: Int) -> Int { x + g(y) }\n  func g(x: Int) -> Int { this.x + x }\n}\nprint(P().f(1))";
+    assert_eq!(tidied(src), after);
+}

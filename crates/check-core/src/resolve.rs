@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::ast::*;
 use crate::checker::BUILT_IN_TYPES;
-use crate::diag::{Code, Diagnostic, Span};
+use crate::diag::{Code, Diagnostic, Edit, Span};
 
 pub struct SourceFile {
     pub unit: usize,
@@ -29,7 +29,9 @@ pub fn resolve(
     access: &[Vec<(usize, bool, Option<usize>)>],
     labels: &[String],
     diags: &mut Vec<Diagnostic>,
+    next_id: &mut NodeId,
 ) {
+    let mut members: HashMap<String, ThisMembers> = HashMap::new();
     let mut decls: HashMap<String, Vec<Decl>> = HashMap::new();
     let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
     let mut namespaces = HashSet::new();
@@ -47,6 +49,16 @@ pub fn resolve(
             ns = ns.rsplit_once('.').map_or("", |(parent, _)| parent);
         }
         for stmt in &file.stmts {
+            let found = match stmt {
+                Stmt::Class(c) => Some((&c.name, &c.fields, &c.members)),
+                Stmt::Interface(i) => Some((&i.name, &i.fields, &i.members)),
+                Stmt::Enum(e) => Some((&e.name, &Vec::new(), &e.members)),
+                _ => None,
+            };
+            if let Some((name, fields, m)) = found {
+                let names = ThisMembers::of(fields, m);
+                members.insert(qualify(&file.namespace, name), names);
+            }
             let (name, is_private, is_type) = match stmt {
                 Stmt::Func(d) => (&d.name, d.is_private, false),
                 Stmt::Class(d) => (&d.name, d.is_private, true),
@@ -110,6 +122,9 @@ pub fn resolve(
             scopes: vec![top_level_names(&file.stmts)],
             type_params: HashSet::new(),
             diags,
+            members: &members,
+            this: None,
+            next_id,
         };
         for stmt in &mut file.stmts {
             r.declaration(stmt);
@@ -210,6 +225,34 @@ struct Resolver<'a> {
     /// Type parameters in scope, which hide types of the same name.
     type_params: HashSet<String>,
     diags: &'a mut Vec<Diagnostic>,
+    /// Each type's fields and methods, by its key.
+    members: &'a HashMap<String, ThisMembers>,
+    /// In a method or `init`: what bare names can reach on `this`, and the first scope that
+    /// belongs to the method, so names bound from there on hide them.
+    this: Option<(ThisMembers, usize)>,
+    next_id: &'a mut NodeId,
+}
+
+#[derive(Clone, Default)]
+struct ThisMembers {
+    fields: HashSet<String>,
+    methods: HashSet<String>,
+}
+
+impl ThisMembers {
+    fn of(fields: &[Param], members: &Members) -> ThisMembers {
+        ThisMembers {
+            fields: fields.iter().map(|f| f.name.clone()).collect(),
+            methods: (members.methods.iter())
+                .map(|f| f.name.rsplit('.').next().unwrap_or(&f.name).to_string())
+                .collect(),
+        }
+    }
+
+    fn extend(&mut self, other: &ThisMembers) {
+        self.fields.extend(other.fields.iter().cloned());
+        self.methods.extend(other.methods.iter().cloned());
+    }
 }
 
 impl Resolver<'_> {
@@ -223,6 +266,39 @@ impl Resolver<'_> {
         self.scopes.iter().any(|s| s.contains(name))
     }
 
+    /// Whether a bare `name` reaches a member of `this`, and if so whether it's a method.
+    fn this_member(&self, name: &str) -> Option<bool> {
+        let (m, base) = self.this.as_ref()?;
+        if self.scopes[*base..].iter().any(|s| s.contains(name)) {
+            return None;
+        }
+        if m.methods.contains(name) {
+            Some(true)
+        } else {
+            m.fields.contains(name).then_some(false)
+        }
+    }
+
+    fn this_expr(&mut self, span: Span) -> Expr {
+        *self.next_id += 1;
+        Expr {
+            id: *self.next_id,
+            span,
+            kind: ExprKind::This,
+        }
+    }
+
+    fn needless_this(&mut self, base: &Expr, member: &str) {
+        if matches!(base.kind, ExprKind::This) && self.this_member(member).is_some() {
+            let fix = vec![Edit {
+                span: Span::new(base.span.start, base.span.end + 1),
+                text: String::new(),
+            }];
+            self.diags
+                .push(Diagnostic::warning(Code::needless_this, base.span).with_fix(fix));
+        }
+    }
+
     fn bind(&mut self, name: &str, span: Span) {
         let shadows = self
             .lookup(name, false, None)
@@ -230,6 +306,11 @@ impl Resolver<'_> {
         if shadows || self.user_roots.contains(name) {
             self.diags
                 .push(Diagnostic::warning(Code::shadowed_name, span));
+        } else if let Some((m, _)) = &self.this
+            && (m.fields.contains(name) || m.methods.contains(name))
+        {
+            self.diags
+                .push(Diagnostic::warning(Code::shadows_field, span));
         }
         self.scopes
             .last_mut()
@@ -369,11 +450,21 @@ impl Resolver<'_> {
                 for field in &mut c.fields {
                     self.param(field);
                 }
+                let mut this = self.members.get(&key).cloned().unwrap_or_default();
+                for iface in &c.interfaces {
+                    if let TypeExpr::Name(n, _) | TypeExpr::Generic(n, _, _) = iface
+                        && let Some(m) = self.members.get(n)
+                    {
+                        this.extend(m);
+                    }
+                }
                 if let Some(init) = &mut c.init {
                     init.name = format!("{key}.init");
+                    self.this = Some((this.clone(), self.scopes.len()));
                     self.func(init, &HashSet::new());
+                    self.this = None;
                 }
-                self.members(&c.name, &key, &mut c.members);
+                self.members(&c.name, &key, &mut c.members, this);
                 self.scopes.pop();
                 self.type_params = saved;
                 c.name = key;
@@ -385,7 +476,8 @@ impl Resolver<'_> {
                 for field in &mut i.fields {
                     self.param(field);
                 }
-                self.members(&i.name, &key, &mut i.members);
+                let this = self.members.get(&key).cloned().unwrap_or_default();
+                self.members(&i.name, &key, &mut i.members, this);
                 self.type_params = saved;
                 i.name = key;
             }
@@ -400,7 +492,8 @@ impl Resolver<'_> {
                 }
                 let consts = e.members.consts.iter().map(|k| k.name.clone()).collect();
                 self.scopes.push(consts);
-                self.members(&e.name, &key, &mut e.members);
+                let this = self.members.get(&key).cloned().unwrap_or_default();
+                self.members(&e.name, &key, &mut e.members, this);
                 self.scopes.pop();
                 self.type_params = saved;
                 e.name = key;
@@ -445,7 +538,9 @@ impl Resolver<'_> {
                 };
                 let consts = i.members.consts.iter().map(|k| k.name.clone()).collect();
                 self.scopes.push(consts);
-                self.members(&i.target.clone(), &owner, &mut i.members);
+                let mut this = self.members.get(&key).cloned().unwrap_or_default();
+                this.extend(&ThisMembers::of(&[], &i.members));
+                self.members(&i.target.clone(), &owner, &mut i.members, this);
                 self.scopes.pop();
                 self.type_params = saved;
                 i.target = key;
@@ -454,14 +549,22 @@ impl Resolver<'_> {
         }
     }
 
-    fn members(&mut self, owner: &str, key: &str, members: &mut Members) {
-        for f in members.methods.iter_mut().chain(&mut members.statics) {
+    fn members(&mut self, owner: &str, key: &str, members: &mut Members, this: ThisMembers) {
+        let statics = members.methods.len();
+        for (i, f) in members
+            .methods
+            .iter_mut()
+            .chain(&mut members.statics)
+            .enumerate()
+        {
             if let Some(rest) = f.name.strip_prefix(owner) {
                 f.name = format!("{key}{rest}");
             }
-            let this = HashSet::from(["this".to_string()]);
-            self.func(f, &this);
+            self.this = (i < statics).then(|| (this.clone(), self.scopes.len()));
+            let names = HashSet::from(["this".to_string()]);
+            self.func(f, &names);
         }
+        self.this = None;
         for c in &mut members.consts {
             if let Some(t) = &mut c.ty {
                 self.type_expr(t);
@@ -614,6 +717,16 @@ impl Resolver<'_> {
                 self.bind_pattern(pattern);
             }
             Stmt::Assign { target, value, .. } => {
+                if let (ExprKind::Name(a), ExprKind::Name(b)) = (&target.kind, &value.kind)
+                    && a == b
+                    && self.this_member(a).is_none()
+                    && self
+                        .this
+                        .as_ref()
+                        .is_some_and(|(m, _)| m.fields.contains(a))
+                {
+                    self.error(Code::assigns_itself, target.span, None);
+                }
                 self.expr(target);
                 self.expr(value);
             }
@@ -647,6 +760,11 @@ impl Resolver<'_> {
     fn expr(&mut self, e: &mut Expr) {
         let span = e.span;
         match &mut e.kind {
+            ExprKind::Name(n) if self.this_member(n).is_some() => {
+                let name = n.clone();
+                let this = self.this_expr(span);
+                e.kind = ExprKind::Field(Box::new(this), name);
+            }
             ExprKind::Name(n) => {
                 if !self.is_local(n) {
                     let n = n.clone();
@@ -657,6 +775,7 @@ impl Resolver<'_> {
             }
             ExprKind::Field(base, f) => {
                 let f = f.clone();
+                self.needless_this(base, &f);
                 match self.namespace_path(base, &f, span) {
                     Some(key) => e.kind = ExprKind::Name(key),
                     None => self.expr(base),
@@ -664,6 +783,7 @@ impl Resolver<'_> {
             }
             ExprKind::Method(base, m, args) => {
                 let m = m.clone();
+                self.needless_this(base, &m);
                 self.args(args);
                 if let Some(key) = self.namespace_path(base, &m, span) {
                     let callee = Expr {
@@ -697,6 +817,16 @@ impl Resolver<'_> {
             }
             ExprKind::Record(args) => self.args(args),
             ExprKind::Call(callee, args) => {
+                if let ExprKind::Name(n) = &callee.kind
+                    && self.this_member(n) == Some(true)
+                {
+                    let (name, this_span) = (n.clone(), callee.span);
+                    let mut args = std::mem::take(args);
+                    self.args(&mut args);
+                    let this = self.this_expr(this_span);
+                    e.kind = ExprKind::Method(Box::new(this), name, args);
+                    return;
+                }
                 self.expr(callee);
                 self.args(args);
             }
