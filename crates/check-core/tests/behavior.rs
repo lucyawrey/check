@@ -3376,9 +3376,10 @@ fn a_compound_assignment_to_an_index_needs_the_index_narrowed() {
         output("var r = [1, 2]\nfor i in r.indices() { r[i] += 1 }\nprint(r)"),
         "[2, 3]"
     );
+    assert!(first_error_fix("var r = [1, 2]\nlet i = 1\nr[i] += 1").is_empty());
     assert_eq!(
-        first_error_fix("var r = [1, 2]\nlet i = 1\nr[i] += 1"),
-        ["r[i] = (r[i] ?? 0) + 1"]
+        first_error_fix("var m = [\"a\" = 1]\nm[\"b\"] += 1"),
+        ["m[\"b\"] = (m[\"b\"] ?? 0) + 1"]
     );
 }
 

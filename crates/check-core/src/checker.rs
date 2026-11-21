@@ -265,6 +265,7 @@ pub struct Checker<'s> {
     in_try: bool,
     try_points: usize,
     without_value: HashMap<Span, usize>,
+    map_writes: HashSet<NodeId>,
     let_sets: HashMap<Span, Span>,
     /// The lambdas being checked, innermost last: each one's first scope (variables below it are
     /// captured) and what it has captured so far.
@@ -342,6 +343,7 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         in_try: false,
         try_points: 0,
         without_value: HashMap::new(),
+        map_writes: HashSet::new(),
         let_sets: HashMap::new(),
         lambdas: Vec::new(),
         narrowed: Vec::new(),
@@ -2220,6 +2222,7 @@ impl Checker<'_> {
                 let it = self.expr(index, Some(&key));
                 self.expect(index, &it, &key);
                 if let Some(value) = value {
+                    self.map_writes.insert(target.id);
                     return (value, base_err);
                 }
                 match self.subst.shallow(&lt) {
@@ -4131,7 +4134,7 @@ impl Checker<'_> {
             Ty::Float => Some("0.0"),
             _ => None,
         };
-        if let Some(zero) = zero {
+        if let Some(zero) = zero.filter(|_| self.map_writes.contains(&target.id)) {
             let place = self.sources.text(target.span);
             let op = self
                 .sources
