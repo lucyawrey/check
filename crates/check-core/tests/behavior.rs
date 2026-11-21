@@ -2640,6 +2640,15 @@ fn a_shared_where_its_value_is_expected_suggests_value() {
         );
         assert_eq!(error_and_fix(&src).1.as_deref(), Some(value), "{src}");
     }
+    for keyword in ["let", "var"] {
+        let src = format!("{SET_NINE}{keyword} b = Shared(1)\nsetNine(b)");
+        assert_eq!(
+            first_error(&src),
+            "shared_where_value_expected",
+            "{keyword}"
+        );
+        assert_eq!(first_error_fix(&src), ["b.value"], "{keyword}");
+    }
 }
 
 #[test]

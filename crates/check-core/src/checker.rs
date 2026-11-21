@@ -1548,8 +1548,15 @@ impl Checker<'_> {
 
     /// For an operator on a `Shared` local, the hint also suggests declaring it `shared`.
     fn ref_value_hint(&mut self, e: &Expr, operator: bool) {
-        let mut d = Diagnostic::error(Code::shared_where_value_expected, e.span);
-        let mut detail = format!("{}.value", self.operand_text(e));
+        let fixed = format!("{}.value", self.operand_text(e));
+        let mut d =
+            Diagnostic::error(Code::shared_where_value_expected, e.span).with_quick_fix(vec![
+                Edit {
+                    span: e.span,
+                    text: fixed.clone(),
+                },
+            ]);
+        let mut detail = fixed;
         if operator
             && let ExprKind::Name(n) = &e.kind
             && self.lookup(n).is_some_and(|v| v.kind == VarKind::Local)
@@ -3169,11 +3176,20 @@ impl Checker<'_> {
             ArgSource::Expr(e) if ref_param => {
                 self.info.ref_args.insert(e.id, e.span);
                 let (t, err) = self.place(e);
-                if let Some(code) = err {
-                    self.error(code, e.span);
-                } else if !self.subst.unify(&t, param) {
-                    let code = self.mismatch(&t, param, Code::type_mismatch);
-                    self.error(code, e.span);
+                let fits = self.subst.unify(&t, param);
+                let boxed = !fits
+                    && matches!(self.subst.shallow(&t), Ty::Named(n, a)
+                        if n == SHARED && self.subst.unify(&a[0], param));
+                match err {
+                    _ if boxed => self.ref_value_hint(e, false),
+                    Some(code) => {
+                        self.error(code, e.span);
+                    }
+                    None if !fits => {
+                        let code = self.mismatch(&t, param, Code::type_mismatch);
+                        self.error(code, e.span);
+                    }
+                    None => {}
                 }
             }
             ArgSource::Expr(e) => {
