@@ -1,5 +1,6 @@
 // Editor
-hint_changed_by_call = "[may change]"
+hint_ref_argument = "ref"
+hint_shared_argument = "shared"
 hint_try_returns = "[If this fails, `try` returns from the function here]"
 detail_or_shared = "[or declare it with `shared`]"
 detail_already_shared = "[It's declared `shared`, so it already reads as its value: leave out `.value`]"

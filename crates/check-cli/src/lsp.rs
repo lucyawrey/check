@@ -158,17 +158,18 @@ impl Server {
         }
     }
 
-    /// A hint before each argument a call can change.
+    /// A hint before each argument a call can change, naming its parameter's `ref` or `shared`.
     fn inlay_hints(&self, path: &str) -> Vec<InlayHint> {
         let (_, checked) = self.check(path);
         let sources = &checked.sources;
         let info = &checked.info;
-        (info.ref_args.values())
-            .chain(info.shared_args.values())
-            .filter(|span| sources.file(span.start).path == path)
-            .map(|span| InlayHint {
+        let refs = (info.ref_args.values()).map(|span| (span, Text::hint_ref_argument));
+        let shared = (info.shared_args.values()).map(|span| (span, Text::hint_shared_argument));
+        refs.chain(shared)
+            .filter(|(span, _)| sources.file(span.start).path == path)
+            .map(|(span, text)| InlayHint {
                 position: range_of(*span, sources).start,
-                label: InlayHintLabel::String(Text::hint_changed_by_call.get().to_string()),
+                label: InlayHintLabel::String(text.get().to_string()),
                 kind: None,
                 text_edits: None,
                 tooltip: None,

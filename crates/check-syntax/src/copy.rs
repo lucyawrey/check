@@ -27,7 +27,8 @@ macro_rules! texts {
 }
 
 texts! {
-    hint_changed_by_call,
+    hint_ref_argument,
+    hint_shared_argument,
     hint_try_returns,
     detail_or_shared,
     detail_already_shared,
