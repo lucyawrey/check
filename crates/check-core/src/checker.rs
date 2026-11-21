@@ -3554,10 +3554,15 @@ impl Checker<'_> {
                         self.changed_receiver(recv, Code::changes_let);
                     }
                 } else if f.state == FuncState::InProgress
-                    && let Some(caller) = &self.current_method
-                    && ref_path(recv).is_some_and(|(root, _)| root == "this")
+                    && !boxed
+                    && let Some(caller) = self.current_method.clone()
                 {
-                    self.pending_changes.push((caller.clone(), key));
+                    let before = self.diags.len();
+                    let (_, _, through, _) = self.place_parts(recv);
+                    self.diags.truncate(before);
+                    if !through && ref_path(recv).is_some_and(|(root, _)| root == "this") {
+                        self.pending_changes.push((caller, key));
+                    }
                 }
                 return ret;
             }
