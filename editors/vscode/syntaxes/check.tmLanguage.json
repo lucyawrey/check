@@ -77,9 +77,9 @@
 				{ "name": "keyword.operator.arrow.check", "match": "->" },
 				{ "name": "keyword.control.check", "match": "\\b(if|else|match|for|in|while|loop|break|continue|return|try|yield)\\b" },
 				{ "name": "keyword.operator.word.check", "match": "\\b(and|or|not|div|mod|as|is)\\b" },
-				{ "name": "storage.modifier.check", "match": "\\b(private|readonly|static|ref|effect|attribute|linear|init|external)\\b(?=(\\s+(private|readonly|static|ref|effect|attribute|linear|external))*\\s+(func|class|enum|interface|let|var|const|init)\\b)" },
+				{ "name": "storage.modifier.check", "match": "\\b(private|readonly|static|ref|shared|effect|attribute|linear|init|external)\\b(?=(\\s+(private|readonly|static|ref|shared|effect|attribute|linear|external))*\\s+(func|class|enum|interface|let|var|const|init)\\b)" },
 				{ "name": "storage.modifier.check", "match": "\\binit\\b(?=\\s*\\{)" },
-				{ "name": "storage.modifier.check", "match": "\\bref\\b(?=\\s+[a-z_][A-Za-z0-9_]*\\s*(:|in\\b))" },
+				{ "name": "storage.modifier.check", "match": "\\b(ref|shared)\\b(?=[ \\t]+(this\\b|[a-z_][A-Za-z0-9_]*\\s*(:|=(?!=)|in\\b|\\.|\\)|,|$)))" },
 				{ "name": "storage.type.check", "match": "\\b(func|let|var|const|enum|class|interface|implement|import|namespace)\\b" },
 				{ "name": "constant.language.check", "match": "\\b(true|false)\\b" },
 				{ "name": "variable.language.this.check", "match": "\\bthis\\b" }

@@ -484,11 +484,17 @@ fn a_copied_value_class_never_changes_the_original() {
 }
 
 #[test]
-fn a_ref_class_is_shared_even_inside_a_copied_value() {
-    let src = "ref class Counter { var n: Int = 0 }\nclass Holder(c: Counter)\n\
+fn a_shared_class_is_shared_even_inside_a_copied_value() {
+    let src = "shared class Counter { var n: Int = 0 }\nclass Holder(c: Counter)\n\
         let h = Holder(Counter())\nlet copy = h\ncopy.c.n = 3\nprint(h.c.n)\n\
         let c = h.c\nc.n += 1\nprint(h.c.n)\nprint(same(c, copy.c))";
     assert_eq!(output(src), "3\n4\ntrue");
+}
+
+#[test]
+fn ref_class_is_no_longer_a_class() {
+    assert_eq!(first_error("ref class P(x: Int)"), "unexpected_token");
+    assert_eq!(output("let shared = 1\nprint(shared)"), "1");
 }
 
 #[test]
@@ -502,7 +508,7 @@ fn fields_change_only_through_var() {
         "assign_to_let"
     );
     assert_eq!(
-        output("ref class Box(var x: Int)\nlet b = Box(1)\nb.x = 2\nprint(b.x)"),
+        output("shared class Box(var x: Int)\nlet b = Box(1)\nb.x = 2\nprint(b.x)"),
         "2"
     );
 }
@@ -570,9 +576,8 @@ fn a_variant_without_its_enum_needs_a_known_type() {
 }
 
 #[test]
-fn printing_a_ref_class_that_reaches_itself_stops() {
-    let src =
-        "ref class Node {\n  var next: Node? = None\n}\nlet a = Node()\na.next = Some(a)\nprint(a)";
+fn printing_a_shared_class_that_reaches_itself_stops() {
+    let src = "shared class Node {\n  var next: Node? = None\n}\nlet a = Node()\na.next = Some(a)\nprint(a)";
     assert_eq!(output(src), "Node(next = Some(...))");
 }
 
@@ -585,11 +590,11 @@ fn a_comparison_gives_a_bare_variant_the_other_sides_type() {
 }
 
 #[test]
-fn equality_never_compares_ref_classes_even_inside_other_values() {
+fn equality_never_compares_shared_classes_even_inside_other_values() {
     for src in ["[a] == [a]", "Some(a) == Some(a)", "W(a) == W(a)"] {
         assert_eq!(
             first_error(&format!(
-                "ref class R(x: Int)\nclass W(r: R)\nlet a = R(1)\nprint({src})"
+                "shared class R(x: Int)\nclass W(r: R)\nlet a = R(1)\nprint({src})"
             )),
             "invalid_operand_types",
             "{src}"
@@ -837,7 +842,7 @@ fn a_copy_changes_only_the_named_fields() {
         output(&format!("{temp}print((...Temp(5), c = 7).label)")),
         "7C"
     );
-    let shared = "ref class Box(var n: Int)\nlet a = Box(1)\nlet b = (...a, n = 2)\nprint(same(a, b))\nprint(a.n)";
+    let shared = "shared class Box(var n: Int)\nlet a = Box(1)\nlet b = (...a, n = 2)\nprint(same(a, b))\nprint(a.n)";
     assert_eq!(output(shared), "false\n1");
     for (src, code) in [
         ("(...p, z = 1)", "unknown_field"),
@@ -1190,7 +1195,7 @@ fn a_namespace_line_must_come_first() {
     );
 }
 
-const COUNTER: &str = "ref class Counter {\n  readonly var count: Int = 0\n  private var step: Int = 1\n  private let log: String[] = []\n}\nimplement Counter {\n  func tick() { this.count += this.step }\n  private func reset() { this.count = 0 }\n}\n";
+const COUNTER: &str = "shared class Counter {\n  readonly var count: Int = 0\n  private var step: Int = 1\n  private let log: String[] = []\n}\nimplement Counter {\n  func tick() { this.count += this.step }\n  private func reset() { this.count = 0 }\n}\n";
 
 #[test]
 fn a_private_field_or_method_is_only_usable_inside_its_type() {
@@ -1311,7 +1316,7 @@ fn field_modifiers_are_errors_elsewhere() {
 #[test]
 fn changing_a_readonly_list_from_outside_is_a_readonly_error() {
     let src =
-        "ref class Bag {\n  readonly var items: Int[] = []\n}\nlet b = Bag()\nb.items.push(1)";
+        "shared class Bag {\n  readonly var items: Int[] = []\n}\nlet b = Bag()\nb.items.push(1)";
     assert_eq!(first_error(src), "readonly_field");
 }
 
@@ -1957,8 +1962,8 @@ print(m)";
 }
 
 #[test]
-fn eq_lets_a_ref_class_or_a_t_use_double_equals() {
-    let src = "ref class Q: Eq { let x: Int }
+fn eq_lets_a_shared_class_or_a_t_use_double_equals() {
+    let src = "shared class Q: Eq { let x: Int }
 func same<T: Eq>(a: T, b: T) -> Bool { a == b }
 print(Q(1) == Q(1))
 print(Q(1) == Q(2))
@@ -1966,7 +1971,7 @@ print(same(Q(3), Q(3)))
 print(same(\"a\", \"b\"))";
     assert_eq!(output(src), "true\nfalse\ntrue\nfalse");
     assert_eq!(
-        first_error("ref class P { let x: Int }\nprint(P(1) == P(1))"),
+        first_error("shared class P { let x: Int }\nprint(P(1) == P(1))"),
         "invalid_operand_types"
     );
     assert_eq!(
@@ -1974,7 +1979,9 @@ print(same(\"a\", \"b\"))";
         "invalid_operand_types"
     );
     assert_eq!(
-        first_error("ref class P { let x: Int }\nfunc f<T: Eq>(a: T) -> Bool { a == a }\nf(P(1))"),
+        first_error(
+            "shared class P { let x: Int }\nfunc f<T: Eq>(a: T) -> Bool { a == a }\nf(P(1))"
+        ),
         "unmet_constraint"
     );
 }
@@ -2064,8 +2071,8 @@ print(Box(true).describe())";
 }
 
 #[test]
-fn double_equals_looks_through_nested_generics_for_ref_classes() {
-    let src = "ref class Node { let x: Int }\nclass Box<T>(v: T)\nlet n = Node(1)\n";
+fn double_equals_looks_through_nested_generics_for_shared_classes() {
+    let src = "shared class Node { let x: Int }\nclass Box<T>(v: T)\nlet n = Node(1)\n";
     assert_eq!(
         first_error(&format!("{src}print(Box(Box(n)) == Box(Box(n)))")),
         "invalid_operand_types"
@@ -2074,7 +2081,7 @@ fn double_equals_looks_through_nested_generics_for_ref_classes() {
 
 #[test]
 fn eq_objects_that_reach_themselves_compare_without_looping() {
-    let src = "ref class Node: Eq {
+    let src = "shared class Node: Eq {
   let id: Int
   var next: Node? = None
 }
@@ -2210,7 +2217,7 @@ fn map_keys_and_set_items_need_exact_equality() {
         "invalid_key_type"
     );
     assert_eq!(
-        first_error("ref class R { var n = 0 }\nlet s = Set([R()])"),
+        first_error("shared class R { var n = 0 }\nlet s = Set([R()])"),
         "invalid_key_type"
     );
     assert_eq!(
@@ -2264,7 +2271,7 @@ fn a_let_map_or_set_never_changes() {
         first_error("let m = [\"a\" = 1]\nm[\"b\"] = 2"),
         "assign_to_let"
     );
-    let own_add = "ref class Bag {\n    var n = 0\n    func add(x: Int) { this.n += x }\n}\nlet b = Bag()\nb.add(2)\nprint(b.n)";
+    let own_add = "shared class Bag {\n    var n = 0\n    func add(x: Int) { this.n += x }\n}\nlet b = Bag()\nb.add(2)\nprint(b.n)";
     assert_eq!(output(own_add), "2");
     assert_eq!(first_error("let m = [\"a\" = 1, 2]"), "unexpected_token");
 }
@@ -2482,89 +2489,92 @@ const SET_NINE: &str = "func setNine(ref a: Int) { a = 9 }\n";
 
 #[test]
 fn holders_of_one_ref_see_each_others_changes() {
-    let src = "class P(var x: Int)\nlet a = Ref([1])\nlet b = a\nb.push(2)\na[0] = 5\nlet p = Ref(P(1))\nlet q = p\nq.x = 3\nprint(\"{a} {p.x}\")";
-    assert_eq!(output(src), "Ref([5, 2]) 3");
+    let src = "class P(var x: Int)\nlet a = Shared([1])\nlet b = a\nb.push(2)\na[0] = 5\nlet p = Shared(P(1))\nlet q = p\nq.x = 3\nprint(\"{a} {p.x}\")";
+    assert_eq!(output(src), "Shared([5, 2]) 3");
 }
 
 #[test]
 fn a_refs_value_is_a_snapshot_and_assigning_it_reaches_every_holder() {
-    let src = "let a = Ref([1])\nlet b = a\nvar copy = a.value\ncopy.push(2)\nprint(\"{a}\")\nb.value = [9]\nprint(\"{a}\")";
-    assert_eq!(output(src), "Ref([1])\nRef([9])");
+    let src = "let a = Shared([1])\nlet b = a\nvar copy = a.value\ncopy.push(2)\nprint(\"{a}\")\nb.value = [9]\nprint(\"{a}\")";
+    assert_eq!(output(src), "Shared([1])\nShared([9])");
 }
 
 #[test]
 fn same_tells_one_ref_from_two_equal_ones() {
-    let src = "let a = Ref(1)\nlet b = a\nprint(same(a, b))\nprint(same(a, Ref(1)))";
+    let src = "let a = Shared(1)\nlet b = a\nprint(same(a, b))\nprint(same(a, Shared(1)))";
     assert_eq!(output(src), "true\nfalse");
     assert_eq!(
-        first_error("let a = Ref(1)\nprint(a == a)"),
+        first_error("let a = Shared(1)\nprint(a == a)"),
         "invalid_operand_types"
     );
     assert_eq!(
-        first_error("let m: Map<Ref<Int>, Int> = [=]"),
+        first_error("let m: Map<Shared<Int>, Int> = [=]"),
         "invalid_key_type"
     );
 }
 
 #[test]
 fn a_ref_prints_inside_a_list() {
-    assert_eq!(output("let xs = [Ref(1)]\nprint(\"{xs}\")"), "[Ref(1)]");
+    assert_eq!(
+        output("let xs = [Shared(1)]\nprint(\"{xs}\")"),
+        "[Shared(1)]"
+    );
 }
 
 #[test]
 fn a_ref_prints_its_value_through_to_string() {
-    let src = "class Boom: Printable {\n  func toString() -> String { \"boom\" }\n}\nprint(\"{Ref(Boom())}\")";
-    assert_eq!(output(src), "Ref(boom)");
+    let src = "class Boom: Printable {\n  func toString() -> String { \"boom\" }\n}\nprint(\"{Shared(Boom())}\")";
+    assert_eq!(output(src), "Shared(boom)");
 }
 
 #[test]
-fn a_ref_of_a_ref_class_is_a_warning() {
-    let src = "ref class P(var n: Int)\nlet r = Ref(P(1))";
-    assert_eq!(warnings(src), ["ref_of_ref_class"]);
+fn a_shared_of_a_shared_class_is_a_warning() {
+    let src = "shared class P(var n: Int)\nlet r = Shared(P(1))";
+    assert_eq!(warnings(src), ["shared_wraps_shared_class"]);
 }
 
 #[test]
 fn a_ref_parameter_changes_the_callers_variable_or_path() {
     let src = format!(
-        "{SET_NINE}class Game(var scores: List<Int>)\nvar x = 1\nvar g = Game([1])\nvar l = [[1], [2]]\nsetNine(ref x)\nsetNine(ref g.scores[0])\nsetNine(ref l[1][0])\nprint(\"{{x}} {{g}} {{l}}\")"
+        "{SET_NINE}class Game(var scores: List<Int>)\nvar x = 1\nvar g = Game([1])\nvar l = [[1], [2]]\nsetNine(x)\nsetNine(g.scores[0])\nsetNine(l[1][0])\nprint(\"{{x}} {{g}} {{l}}\")"
     );
     assert_eq!(output(&src), "9 Game(scores = [9]) [[1], [9]]");
 }
 
 #[test]
 fn a_ref_parameter_writes_back_through_return_and_further_refs() {
-    let src = "func inner(ref a: Int) { a += 1 }\nfunc outer(ref a: Int) {\n  inner(ref a)\n  if a > 0 { return }\n  a = 0\n}\nvar x = 1\nouter(ref x)\nprint(x)";
+    let src = "func inner(ref a: Int) { a += 1 }\nfunc outer(ref a: Int) {\n  inner(a)\n  if a > 0 { return }\n  a = 0\n}\nvar x = 1\nouter(x)\nprint(x)";
     assert_eq!(output(src), "2");
 }
 
 #[test]
 fn a_ref_path_is_resolved_once_and_can_go_through_a_let_ref() {
     let src = format!(
-        "{SET_NINE}class P(var x: Int)\nvar n = 0\nfunc next() -> Int {{\n  n += 1\n  0\n}}\nvar xs = [1]\nsetNine(ref xs[next()])\nlet r = Ref(P(1))\nsetNine(ref r.x)\nprint(\"{{xs}} {{n}} {{r.x}}\")"
+        "{SET_NINE}class P(var x: Int)\nvar n = 0\nfunc next() -> Int {{\n  n += 1\n  0\n}}\nvar xs = [1]\nsetNine(xs[next()])\nlet r = Shared(P(1))\nsetNine(r.x)\nprint(\"{{xs}} {{n}} {{r.x}}\")"
     );
     assert_eq!(output(&src), "[9] 1 9");
 }
 
 #[test]
 fn a_named_ref_argument_puts_ref_after_the_name() {
-    let src = "func f(n: Int, ref a: Int) { a = n }\nvar x = 1\nf(a = ref x, n = 3)\nprint(x)";
+    let src = "func f(n: Int, ref a: Int) { a = n }\nvar x = 1\nf(a = x, n = 3)\nprint(x)";
     assert_eq!(output(src), "3");
 }
 
 #[test]
 fn a_ref_argument_must_be_a_var_or_a_path_in_one() {
     assert_eq!(
-        first_error(&format!("{SET_NINE}let x = 1\nsetNine(ref x)")),
+        first_error(&format!("{SET_NINE}let x = 1\nsetNine(x)")),
         "assign_to_let"
     );
     assert_eq!(
         first_error(&format!(
-            "{SET_NINE}class P(x: Int)\nvar p = P(1)\nsetNine(ref p.x)"
+            "{SET_NINE}class P(x: Int)\nvar p = P(1)\nsetNine(p.x)"
         )),
         "assign_to_let"
     );
     assert_eq!(
-        first_error(&format!("{SET_NINE}var x = 1\nsetNine(ref x + 1)")),
+        first_error(&format!("{SET_NINE}var x = 1\nsetNine(x + 1)")),
         "assign_to_let"
     );
     assert_eq!(
@@ -2577,86 +2587,67 @@ fn a_ref_argument_must_be_a_var_or_a_path_in_one() {
 #[test]
 fn overlapping_arguments_are_an_error_but_distinct_fields_are_fine() {
     assert_eq!(
-        first_error(&format!("{SWAP}var x = 1\nswap(ref x, ref x)")),
+        first_error(&format!("{SWAP}var x = 1\nswap(x, x)")),
         "overlapping_ref"
     );
     assert_eq!(
-        first_error(&format!(
-            "{SWAP}var xs = [0, 0]\nvar i = 0\nswap(ref xs[i], ref i)"
-        )),
+        first_error(&format!("{SWAP}var xs = [0, 0]\nvar i = 0\nswap(xs[i], i)")),
         "overlapping_ref"
     );
     assert_eq!(
         first_error(
-            "func f(ref a: List<Int>, n: Int) { a.push(n) }\nvar xs = [1]\nf(ref xs, xs.length())"
+            "func f(ref a: List<Int>, n: Int) { a.push(n) }\nvar xs = [1]\nf(xs, xs.length())"
         ),
         "overlapping_ref"
     );
-    assert_eq!(
-        first_error("var xs = [1]\nxs.push(ref xs[0])"),
-        "overlapping_ref"
-    );
     let src = format!(
-        "{SWAP}class P(var x: Int, var y: Int)\nvar p = P(1, 2)\nswap(ref p.x, ref p.y)\nprint(\"{{p}}\")"
+        "{SWAP}class P(var x: Int, var y: Int)\nvar p = P(1, 2)\nswap(p.x, p.y)\nprint(\"{{p}}\")"
     );
     assert_eq!(output(&src), "P(x = 2, y = 1)");
-    let src = "func f(ref a: Int, b: Int) { a = b }\nclass P(var x: Int, var y: Int)\nvar p = P(1, 2)\nvar xs = [5]\nf(ref p.x, p.y)\nf(ref xs[p.x - 2], p.y)\nprint(\"{p} {xs}\")";
+    let src = "func f(ref a: Int, b: Int) { a = b }\nclass P(var x: Int, var y: Int)\nvar p = P(1, 2)\nvar xs = [5]\nf(p.x, p.y)\nf(xs[p.x - 2], p.y)\nprint(\"{p} {xs}\")";
     assert_eq!(output(src), "P(x = 2, y = 2) [2]");
 }
 
 #[test]
 fn a_ref_index_out_of_range_panics_at_the_call() {
     panics_with(
-        &format!("{SET_NINE}var xs = [1]\nsetNine(ref xs[5])"),
+        &format!("{SET_NINE}var xs = [1]\nsetNine(xs[5])"),
         "index_out_of_range",
     );
 }
 
 #[test]
-fn ref_must_match_the_parameter() {
-    assert_eq!(
-        first_error(&format!("{SET_NINE}var x = 1\nsetNine(x)")),
-        "missing_ref"
-    );
-    assert_eq!(
-        first_error_fix(&format!("{SET_NINE}var x = 1\nsetNine(x)")),
-        ["ref "]
-    );
-    assert!(first_error_fix(&format!("{SET_NINE}setNine(5)")).is_empty());
-    for call in [
-        "f(ref x)",
-        "print(ref x)",
-        "Ref(ref x)",
-        "let r = (a = ref x)",
-    ] {
-        let src = format!("func f(a: Int) => print(a)\nvar x = 1\n{call}");
-        assert_eq!(first_error(&src), "ref_not_allowed", "{call}");
-        assert!(first_error_fix(&src).is_empty(), "{call}");
-    }
-}
-
-#[test]
-fn a_ref_where_its_value_is_expected_suggests_value() {
-    let src = "func count(xs: List<Int>) -> Int { xs.length() }\nlet r = Ref([1])\ncount(r)";
+fn a_shared_where_its_value_is_expected_suggests_value() {
+    let src = "func count(xs: List<Int>) -> Int { xs.length() }\nlet r = Shared([1])\ncount(r)";
     assert_eq!(
         error_and_fix(src),
         (
-            "ref_where_value_expected".to_string(),
+            "shared_where_value_expected".to_string(),
             Some("r.value".to_string())
         )
     );
     for (src, value) in [
-        ("print(r + 1)", "r.value"),
-        ("print(1 < r)", "r.value"),
-        ("var v = r\nv += 1", "v.value"),
+        ("print(r + 1)", "r.value [or declare it with shared]"),
+        ("print(1 < r)", "r.value [or declare it with shared]"),
+        ("var v = r\nv += 1", "v.value [or declare it with shared]"),
+        ("func f(p: Shared<Int>) -> Int { p + 1 }", "p.value"),
     ] {
-        let src = format!("let r = Ref(1)\n{src}");
+        let src = format!("let r = Shared(1)\n{src}");
         assert_eq!(
             diagnostics(&src, Severity::Error),
-            ["ref_where_value_expected"],
+            ["shared_where_value_expected"],
             "{src}"
         );
         assert_eq!(error_and_fix(&src).1.as_deref(), Some(value), "{src}");
+    }
+    for keyword in ["let", "var"] {
+        let src = format!("{SET_NINE}{keyword} b = Shared(1)\nsetNine(b)");
+        assert_eq!(
+            first_error(&src),
+            "shared_where_value_expected",
+            "{keyword}"
+        );
+        assert_eq!(first_error_fix(&src), ["b.value"], "{keyword}");
     }
 }
 
@@ -2666,12 +2657,350 @@ fn a_function_with_ref_parameters_cant_be_a_value() {
         first_error(&format!("{SET_NINE}let f = setNine")),
         "ref_func_as_value"
     );
+    assert_eq!(
+        first_error("func track(shared t: Int) { t += 1 }\nlet f = track"),
+        "ref_func_as_value"
+    );
+}
+
+const COUNTER_VALUE: &str = "class Counter {
+  var n: Int = 0
+  func bump() { this.n += 1 }
+  func twice() { this.bump(); this.bump() }
+  func doubled() -> Int { this.n * 2 }
+}
+";
+
+#[test]
+fn a_method_that_changes_this_writes_back_to_its_receiver() {
+    let src = format!(
+        "{COUNTER_VALUE}class Game(var counters: Counter[])\nvar c = Counter()\nc.twice()\n\
+        var g = Game([Counter(), Counter()])\ng.counters[1].bump()\n\
+        for ref each in g.counters {{ each.bump() }}\n\
+        let box = Shared(Counter())\nbox.bump()\nbox.value.bump()\n\
+        print(\"{{c.n}} {{g.counters}} {{box.n}}\")"
+    );
+    assert_eq!(output(&src), "2 [Counter(n = 1), Counter(n = 2)] 2");
 }
 
 #[test]
-fn a_ref_parameter_of_a_ref_class_is_a_warning() {
-    let src = "ref class P(var n: Int)\nfunc f(ref p: P) { p.n = 2 }";
-    assert_eq!(warnings(src), ["ref_param_of_ref_class"]);
+fn a_method_that_changes_this_needs_a_place() {
+    for call in [
+        "let k = Counter()\nk.bump()",
+        "Counter().bump()",
+        "func f(k: Counter) { k.twice() }",
+    ] {
+        assert_eq!(
+            first_error(&format!("{COUNTER_VALUE}{call}")),
+            "changes_let",
+            "{call}"
+        );
+    }
+    assert_eq!(
+        output(&format!(
+            "{COUNTER_VALUE}let k = Counter()\nprint(k.doubled())"
+        )),
+        "0"
+    );
+}
+
+#[test]
+fn methods_are_inferred_to_change_this_through_calls_and_recursion() {
+    let src = "class Walk {
+  var steps: Int[] = []
+  func step(n: Int) -> Void { if n > 0 { this.steps.push(n); this.next(n - 1) } }
+  func next(n: Int) -> Void { this.step(n) }
+  func start() { this.next(2) }
+}
+var w = Walk()
+w.start()
+print(w.steps)
+let k = Walk()
+";
+    assert_eq!(output(src), "[2, 1]");
+    for call in ["k.start()", "k.next(1)", "k.step(1)"] {
+        assert_eq!(
+            first_error(&format!("{src}{call}")),
+            "changes_let",
+            "{call}"
+        );
+    }
+}
+
+#[test]
+fn a_method_that_changes_this_after_a_call_back_into_its_caller_is_inferred() {
+    let src = "class C {
+  var n: Int = 0
+  func a(k: Int) -> Void { if k > 0 { this.b(k - 1) } }
+  func b(k: Int) -> Void {
+    this.a(k)
+    this.n += 1
+  }
+}
+var k = C()
+k.b(2)
+let j = C()
+j.a(2)";
+    assert_eq!(first_error(src), "changes_let");
+}
+
+#[test]
+fn a_change_to_this_survives_an_early_return() {
+    let src = "class C {\n  var n: Int = 0\n  func bump() {\n    this.n = 5\n    if this.n > 0 { return }\n    this.n = 9\n  }\n}\nvar c = C()\nc.bump()\nprint(c.n)";
+    assert_eq!(output(src), "5");
+}
+
+#[test]
+fn writes_through_a_shared_dont_change_this() {
+    let src = "shared class Owner(var hits: Int)\nclass Tool {
+  let owner: Owner
+  func apply() { this.box.value += 1; this.owner.hits += 1 }
+  let box: Shared<Int>
+}
+let t = Tool(Owner(0), Shared(0))
+t.apply()
+print(\"{t.box} {t.owner.hits}\")";
+    assert_eq!(output(src), "Shared(1) 1");
+}
+
+#[test]
+fn a_receiver_overlapping_a_ref_argument_is_an_error() {
+    let src = "class C {\n  var n: Int = 0\n  func add(ref x: Int) { this.n += x }\n}\nvar c = C()\nc.add(c.n)";
+    assert_eq!(first_error(src), "overlapping_ref");
+}
+
+#[test]
+fn interface_methods_never_change_this() {
+    let src = "interface Ticks { func tick() }\nclass V: Ticks {\n  var n: Int = 0\n  func tick() { this.n += 1 }\n}";
+    assert_eq!(first_error(src), "interface_changes_this");
+    let shared = "interface Ticks { func tick() }\nshared class S: Ticks {\n  var n: Int = 0\n  func tick() { this.n += 1 }\n}\nlet s = S()\ns.tick()\nprint(s.n)";
+    assert_eq!(output(shared), "1");
+}
+
+#[test]
+fn a_lambda_in_a_method_cant_change_this() {
+    let src = "class C {\n  var n: Int = 0\n  func later() -> func() { func() { this.n += 1 } }\n}";
+    assert_eq!(first_error(src), "assign_to_captured");
+}
+
+#[test]
+fn a_change_through_a_shared_isnt_a_reassignment() {
+    for src in [
+        "var b = Shared(2)\nb.value += 1",
+        "var c = Shared([1])\nc.push(2)",
+        "shared class P(var n: Int)\nvar p = P(1)\np.n += 1",
+    ] {
+        assert_eq!(warnings(src), ["unused_var"], "{src}");
+    }
+    assert_eq!(
+        warnings("var d = Shared(2)\nd = Shared(3)"),
+        Vec::<String>::new()
+    );
+}
+
+const GAME: &str =
+    "class Pos(var x: Int, var y: Int)\nclass Game(var players: Pos[], var score: Int)\n";
+
+#[test]
+fn a_ref_binding_changes_the_original() {
+    let src = format!(
+        "{GAME}func moved(g: Game) -> Game {{\n  var game = g\n  ref p = game.players[1]\n  p.x += 1\n  p.y = 7\n  return game\n}}\n\
+        var game = Game([Pos(0, 0), Pos(1, 1)], 0)\ngame = moved(game)\n\
+        for i in 0..3 {{\n  ref first = game.players[0]\n  first = Pos(i, i)\n  if i == 1 {{ break }}\n}}\n\
+        ref s = game.score\ns += 5\nprint(game)"
+    );
+    assert_eq!(
+        output(&src),
+        "Game(players = [Pos(x = 1, y = 1), Pos(x = 2, y = 7)], score = 5)"
+    );
+}
+
+#[test]
+fn nested_ref_bindings_write_back_innermost_first() {
+    let src = "class Row(var cells: Int[])\nfunc fill() -> Row[] {\n  var rows = [Row([0, 0])]\n  if true {\n    ref row = rows[0]\n    ref cell = row.cells[1]\n    cell = 9\n    return rows\n  }\n  rows\n}\nprint(fill())";
+    assert_eq!(output(src), "[Row(cells = [0, 9])]");
+}
+
+#[test]
+fn until_its_last_use_a_ref_binding_is_the_only_way_to_its_target() {
+    for rest in [
+        "print(game.players)",
+        "game.players.push(Pos(0, 0))",
+        "print(game)",
+    ] {
+        let src = format!(
+            "{GAME}var game = Game([Pos(0, 0)], 0)\nref p = game.players[0]\n{rest}\np.x = 1"
+        );
+        assert_eq!(first_error(&src), "ref_binding_overlap", "{rest}");
+    }
+    let apart = format!(
+        "{GAME}var game = Game([Pos(0, 0)], 0)\nref p = game.players[0]\ngame.score = 2\np.x = 1\nprint(game)"
+    );
+    assert_eq!(
+        output(&apart),
+        "Game(players = [Pos(x = 1, y = 0)], score = 2)"
+    );
+    let captured = format!(
+        "{GAME}var game = Game([Pos(0, 0)], 0)\nref p = game.players[0]\nlet f = func() {{ print(p) }}"
+    );
+    assert_eq!(first_error(&captured), "ref_binding_captured");
+}
+
+#[test]
+fn a_ref_binding_needs_a_var_place() {
+    assert_eq!(
+        first_error(&format!("{GAME}let game = Game([], 0)\nref s = game.score")),
+        "assign_to_let"
+    );
+    panics_with(
+        &format!("{GAME}var game = Game([], 0)\nref p = game.players[3]"),
+        "index_out_of_range",
+    );
+}
+
+#[test]
+fn ref_and_shared_still_name_variables() {
+    assert_eq!(
+        output("var ref = 1\nref = 2\nlet shared = ref + 1\nprint(shared)"),
+        "3"
+    );
+}
+
+#[test]
+fn changing_a_copy_that_is_never_read_warns() {
+    let warned = [
+        "var c = ps[0] ?? P(0)\nc.n += 1",
+        "var c = ps[0] ?? P(0)\nprint(c)\nc.n += 1",
+        "var c = ps[0].orPanic()\nc.n = 2",
+        "var c = box.p\nc.n += 1",
+        "var c = box.p\nc.bump()",
+    ];
+    for src in warned {
+        let src = format!("{COPIES}{src}");
+        assert!(
+            warnings(&src).contains(&"changed_copy".to_string()),
+            "{src}"
+        );
+    }
+    let quiet = [
+        "var c = box.p\nc.n += 1\nprint(c.n)",
+        "var c = box.p\nc.n += 1\nbox.p = c",
+        "var c = box.p\nif true { c.n = 1 } else { print(c) }",
+        "var c = box.p\nfor i in 0..2 {\n  print(c.n)\n  c.n += i\n}",
+        "var c = box.p\nc.n = 1\nlet f = func() { print(c) }",
+        "var c = box.p\nprint(c.doubled())",
+    ];
+    for src in quiet {
+        let src = format!("{COPIES}{src}");
+        assert!(
+            !warnings(&src).contains(&"changed_copy".to_string()),
+            "{src}"
+        );
+    }
+}
+
+#[test]
+fn a_changed_copy_of_a_plain_path_offers_a_ref_binding() {
+    let warned = |src: &str| {
+        let src = format!("{COPIES}{src}");
+        let report = run_source(
+            "test.check",
+            &src,
+            &mut Cursor::new(Vec::new()),
+            &mut Vec::new(),
+        );
+        let d = report
+            .diagnostics
+            .into_iter()
+            .find(|d| d.code.to_string() == "changed_copy");
+        d.expect("warned")
+            .fix
+            .iter()
+            .map(|e| e.text.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(warned("var c = box.p\nc.n += 1"), ["ref"]);
+    assert_eq!(
+        warned("let fixed = Box(P(1))\nvar c = fixed.p\nc.n += 1"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        warned("var c = ps[0] ?? P(0)\nc.n += 1"),
+        Vec::<String>::new()
+    );
+}
+
+const COPIES: &str = "class P {\n  var n: Int\n  func bump() { this.n += 1 }\n  func doubled() -> Int { this.n * 2 }\n}\nclass Box(var p: P)\nvar ps = [P(1)]\nvar box = Box(P(1))\nprint(ps)\nbox = Box(P(2))\nps = []\n";
+
+#[test]
+fn a_lambda_shares_a_shared_local() {
+    let src = "shared clicks = 0\nlet click = func() { clicks += 1 }\nclick()\nclicks += 10\nclick()\nprint(clicks)\n\
+        func pair() -> (func(), func() -> Int) {\n  shared n: Int = 0\n  (func() { n += 1 }, func() -> Int { n })\n}\n\
+        let (bump, read) = pair()\nbump()\nbump()\nprint(read())";
+    assert_eq!(output(src), "12\n2");
+}
+
+#[test]
+fn a_shared_parameter_shares_the_callers_box() {
+    let src = "func track(shared total: Int) { total += 1 }\nfunc show(n: Int) -> Int { n }\n\
+        shared clicks = 0\ntrack(clicks)\ntrack(shared clicks)\nlet box = Shared(5)\ntrack(box)\n\
+        func setNine(ref x: Int) { x = 9 }\nshared other = 0\nsetNine(other)\n\
+        print(\"{clicks} {box} {show(clicks)} {other}\")";
+    assert_eq!(output(src), "2 Shared(6) 2 9");
+    let missing = "func track(shared total: Int) { total += 1 }\ntrack(5)";
+    assert_eq!(first_error(missing), "missing_shared");
+    assert_eq!(first_error("let m = 1\nlet s = shared m"), "not_shared");
+}
+
+#[test]
+fn a_shared_field_is_shared_by_the_objects_given_its_box() {
+    let src = "class Button(label: String, shared presses: Int)\nshared clicks = 0\n\
+        let a = Button(\"A\", presses = clicks)\nlet b = Button(\"B\", presses = shared clicks)\n\
+        let c = Button(\"C\", presses = 0)\na.presses += 2\nc.presses += 5\nlet copy = c\ncopy.presses += 1\n\
+        print(\"{b.presses} {clicks} {c} {a == Button(\"A\", presses = 2)}\")";
+    assert_eq!(output(src), "2 2 Button(label = \"C\", presses = 6) true");
+}
+
+#[test]
+fn a_class_with_a_shared_field_cant_be_a_key() {
+    assert_eq!(
+        first_error("class B(shared n: Int)\nlet m: Map<B, Int> = [=]"),
+        "invalid_key_type"
+    );
+}
+
+#[test]
+fn value_on_a_shared_name_offers_to_drop_it() {
+    assert_eq!(first_error_fix("shared n = 0\nprint(n.value)"), [""]);
+    assert_eq!(
+        output(
+            "class Wrapper(var value: Int)\nshared w = Wrapper(1)\nshared b = Shared(2)\nprint(\"{w.value} {b.value}\")"
+        ),
+        "1 2"
+    );
+}
+
+#[test]
+fn a_lambda_parameter_cant_be_shared() {
+    assert_eq!(
+        first_error("let f = func(shared t: Int) { t += 1 }"),
+        "unexpected_token"
+    );
+}
+
+#[test]
+fn shared_still_names_variables() {
+    assert_eq!(
+        output("let shared = 2\nprint(shared + 1)\nfunc f(x: Int) -> Int { x }\nprint(f(shared))"),
+        "3\n2"
+    );
+    assert_eq!(output("let ref = 1\nlet shared = ref\nprint(shared)"), "1");
+}
+
+#[test]
+fn a_ref_parameter_of_a_shared_class_is_a_warning() {
+    let src = "shared class P(var n: Int)\nfunc f(ref p: P) { p.n = 2 }";
+    assert_eq!(warnings(src), ["ref_param_of_shared_class"]);
 }
 
 #[test]
@@ -2687,6 +3016,23 @@ fn for_ref_writes_each_element_back() {
 fn for_ref_keeps_the_changes_made_before_a_break() {
     let src = "var xs = [1, 2, 3]\nfor ref x in xs {\n  x *= 10\n  if x == 20 { break }\n}\nprint(\"{xs}\")";
     assert_eq!(output(src), "[10, 20, 3]");
+}
+
+#[test]
+fn for_ref_can_pass_its_list_to_a_plain_parameter_but_not_a_ref_one() {
+    let clear = "func clear(ref a: List<Int>) { a = [] }\nclass C {\n  func clear(ref a: List<Int>) { a = [] }\n}\nlet c = C()\nvar xs = [1]\n";
+    for call in ["clear(xs)", "c.clear(xs)"] {
+        let src = format!("{clear}for ref x in xs {{ {call} }}");
+        assert_eq!(first_error(&src), "changed_in_for_ref", "{call}");
+    }
+    let src = "func addLen(ref total: Int, items: Int[]) { total += items.length() }\nvar xs = [1, 2]\nvar sum = 0\nfor ref x in xs {\n  addLen(sum, xs)\n  x += 1\n}\nprint(\"{xs} {sum}\")";
+    assert_eq!(output(src), "[2, 3] 4");
+}
+
+#[test]
+fn for_ref_cant_call_a_method_that_changes_its_lists_owner() {
+    let src = "class P(var x: Int)\nclass G {\n  var ps: P[] = [P(1)]\n  func clear() { this.ps = [] }\n}\nvar g = G()\nfor ref p in g.ps {\n  g.clear()\n  p.x = 5\n}";
+    assert_eq!(first_error(src), "changed_in_for_ref");
 }
 
 #[test]
@@ -2708,13 +3054,13 @@ fn for_ref_cant_change_its_list_or_go_through_a_let() {
 
 #[test]
 fn for_ref_goes_through_a_ref() {
-    let src = "class G(var r: Ref<List<Int>>)\nlet r = Ref([1, 2])\nvar g = G(Ref([3]))\nfor ref x in r { x += 1 }\nfor ref x in g.r { x += 1 }\nprint(\"{r} {g}\")";
-    assert_eq!(output(src), "Ref([2, 3]) G(r = Ref([4]))");
+    let src = "class G(var r: Shared<List<Int>>)\nlet r = Shared([1, 2])\nvar g = G(Shared([3]))\nfor ref x in r { x += 1 }\nfor ref x in g.r { x += 1 }\nprint(\"{r} {g}\")";
+    assert_eq!(output(src), "Shared([2, 3]) G(r = Shared([4]))");
 }
 
 #[test]
 fn for_ref_panics_when_its_element_is_gone() {
-    let src = "ref class Box(var items: List<Int>)\nclass Holder(var box: Box)\nfunc empty(b: Box) { b.items = [] }\nvar h = Holder(Box([1, 2]))\nlet b = h.box\nfor ref x in h.box.items { empty(b) }";
+    let src = "shared class Box(var items: List<Int>)\nclass Holder(var box: Box)\nfunc empty(b: Box) { b.items = [] }\nvar h = Holder(Box([1, 2]))\nlet b = h.box\nfor ref x in h.box.items { empty(b) }";
     panics_with(src, "for_ref_element_gone");
 }
 
@@ -2728,10 +3074,10 @@ fn a_name_called_ref_still_works() {
 
 #[test]
 fn a_write_through_a_call_reaches_only_shared_values() {
-    let src = "ref class Box(var n: Int)\nref class Game {\n  var title: String\n  var box: Box\n  func theBox() -> Box { this.box }\n  func reset() { this.theBox().n = 0 }\n}\nlet g = Game(\"hi\", Box(9))\ng.reset()\nfunc make(b: Box) -> Box { b }\nmake(g.box).n = 7\nprint(\"{g}\")";
+    let src = "shared class Box(var n: Int)\nshared class Game {\n  var title: String\n  var box: Box\n  func theBox() -> Box { this.box }\n  func reset() { this.theBox().n = 0 }\n}\nlet g = Game(\"hi\", Box(9))\ng.reset()\nfunc make(b: Box) -> Box { b }\nmake(g.box).n = 7\nprint(\"{g}\")";
     assert_eq!(output(src), "Game(title = \"hi\", box = Box(n = 7))");
-    let log = "var log = Ref([1])\nfunc theLog() -> Ref<List<Int>> { log }\ntheLog().push(2)\nprint(\"{log}\")";
-    assert_eq!(output(log), "Ref([1, 2])");
+    let log = "var log = Shared([1])\nfunc theLog() -> Shared<List<Int>> { log }\ntheLog().push(2)\nprint(\"{log}\")";
+    assert_eq!(output(log), "Shared([1, 2])");
     assert_eq!(
         first_error("class P(var n: Int)\nfunc make() -> P { P(1) }\nmake().n = 7"),
         "assign_to_let"
@@ -2744,10 +3090,10 @@ fn a_write_through_a_call_reaches_only_shared_values() {
 
 #[test]
 fn paths_run_left_to_right_and_their_base_once() {
-    let src = "var log = Ref([\"\"])\nfunc note(s: String, n: Int) -> Int {\n  log.push(s)\n  n\n}\nvar xs = [0]\nvar grid = [[0]]\nxs[note(\"index\", 0)] = note(\"value\", 1)\nxs[note(\"index\", 0)] += note(\"value\", 1)\ngrid[note(\"index\", 0)].push(note(\"value\", 1))\nref class Box(var n: Int)\nlet b = Box(1)\nfunc make() -> Box {\n  log.push(\"make\")\n  b\n}\nmake().n = 7\nprint(\"{log} {xs} {grid} {b}\")";
+    let src = "var log = Shared([\"\"])\nfunc note(s: String, n: Int) -> Int {\n  log.push(s)\n  n\n}\nvar xs = [0]\nvar grid = [[0]]\nxs[note(\"index\", 0)] = note(\"value\", 1)\nxs[note(\"index\", 0)] += note(\"value\", 1)\ngrid[note(\"index\", 0)].push(note(\"value\", 1))\nshared class Box(var n: Int)\nlet b = Box(1)\nfunc make() -> Box {\n  log.push(\"make\")\n  b\n}\nmake().n = 7\nprint(\"{log} {xs} {grid} {b}\")";
     assert_eq!(
         output(src),
-        "Ref([\"\", \"index\", \"value\", \"index\", \"value\", \"index\", \"value\", \"make\"]) [2] [[0, 1]] Box(n = 7)"
+        "Shared([\"\", \"index\", \"value\", \"index\", \"value\", \"index\", \"value\", \"make\"]) [2] [[0, 1]] Box(n = 7)"
     );
 }
 
@@ -2909,8 +3255,8 @@ fn a_lambda_keeps_what_it_captured_when_it_was_made() {
 
 #[test]
 fn a_lambda_changes_shared_values_it_captured_and_calls_its_own_captures() {
-    let src = "ref class Box(var x: Int)\nfunc g() -> Int { 1 }\nfunc main() {\n  let r = Ref([1])\n  let b = Box(1)\n  let g = func() => 2\n  let f = func() {\n    r.push(2)\n    b.x = 7\n  }\n  f()\n  let h = func() => g()\n  print(\"{r} {b} {h()}\")\n}\nmain()";
-    assert_eq!(output(src), "Ref([1, 2]) Box(x = 7) 2");
-    let callback = "ref class Player {\n  var score: Int = 0\n  func bump() -> func() { func() { this.score += 1 } }\n}\nlet p = Player()\np.bump()()\nprint(p.score)";
+    let src = "shared class Box(var x: Int)\nfunc g() -> Int { 1 }\nfunc main() {\n  let r = Shared([1])\n  let b = Box(1)\n  let g = func() => 2\n  let f = func() {\n    r.push(2)\n    b.x = 7\n  }\n  f()\n  let h = func() => g()\n  print(\"{r} {b} {h()}\")\n}\nmain()";
+    assert_eq!(output(src), "Shared([1, 2]) Box(x = 7) 2");
+    let callback = "shared class Player {\n  var score: Int = 0\n  func bump() -> func() { func() { this.score += 1 } }\n}\nlet p = Player()\np.bump()()\nprint(p.score)";
     assert_eq!(output(callback), "1");
 }

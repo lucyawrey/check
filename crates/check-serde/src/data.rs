@@ -57,6 +57,7 @@ impl From<check_core::value::Value> for Data {
                 named(&r, Some(r.name.to_string()), false)
             }
             Value::Variant(r) => named(&r, Some(r.name.to_string()), true),
+            Value::Cell(v) => v.borrow().clone().into(),
             _ => Data::Other,
         }
     }

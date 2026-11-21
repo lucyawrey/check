@@ -51,16 +51,19 @@
 - `try_error_mismatch` `try` on a `Result` whose error type differs from the function's
 - `assign_to_let` assigning to a `let`
 - `assign_to_captured` assigning to or changing a variable from outside a lambda inside it, top-level `var`s included, since a lambda keeps a copy of what it captures
-- `missing_ref` an argument for a `ref` parameter written without `ref` (quick fix: add it)
-- `ref_not_allowed` `ref` on an argument whose parameter isn't `ref`
-- `overlapping_ref` a `ref` argument that overlaps another argument of the same call (`swap(ref a, ref a)`)
+- `overlapping_ref` a `ref` argument that overlaps another argument of the same call (`swap(a, a)`)
 - `ref_default` a `ref` parameter with a default (a `ref` rest parameter doesn't parse)
-- `ref_func_as_value` a function with `ref` parameters used as a value, which would drop the write-back
-- `ref_where_value_expected` a `Ref<T>` where a `T` is expected (suggests `r.value`)
+- `ref_func_as_value` a function with `ref` or `shared` parameters used as a value, which would drop the write-back or the sharing
+- `shared_where_value_expected` a `Shared<T>` where a `T` is expected (suggests `r.value`)
 - `changed_in_for_ref` changing the list a `for ref` loop goes through, inside the loop
 - `assign_to_parameter` assigning to a parameter not written `var`
 - `change_let_collection` changing a `let` list, map or set (`push`, `pop`, `removeAt`, `add`, `remove`)
-- `invalid_key_type` a map key or set item whose type has no exact equality (`Float`, a function, a collection, a `ref class` or anything holding one)
+- `changes_let` calling a method that changes its value on a `let`, a parameter or a temporary (`k.bump()`)
+- `missing_shared` a plain value for a `shared` parameter (pass `shared x` or a `Shared<T>`)
+- `not_shared` `shared` before something that isn't a shared local, parameter or field
+- `ref_binding_overlap` using what a `ref` binding points to, other than through it, before the binding's last use
+- `ref_binding_captured` a lambda capturing a `ref` binding
+- `invalid_key_type` a map key or set item whose type has no exact equality (`Float`, a function, a collection, a `shared class` or anything holding one)
 - `break_outside_loop` `break` or `continue` outside a loop
 - `return_outside_function` `return` outside a function
 - `loop_value_without_break` a `for`, `while` or `loop` used as a value with no `break` value
@@ -95,6 +98,7 @@
 - `unmet_constraint` a type argument that doesn't implement the interfaces its parameter needs (`<T: Shape>`)
 - `missing_implementation` a type missing a method or field an interface it implements requires
 - `wrong_implementation` a method whose parameter or return types don't match its interface's
+- `interface_changes_this` a value type's implementation of an interface method that changes `this` (use a `shared class`)
 - `conflicting_defaults` two interfaces with defaults for the same method, which the type doesn't override
 - `field_requirement_needs_class` an interface that requires fields, implemented by an enum or built-in type
 - `implement_for_specific_arguments` an interface implemented for some of a generic type's arguments (`implement Shape for Box<Int>`), since they're erased at run time
@@ -128,7 +132,7 @@
 - `stack_overflow` more than 10,000 nested calls
 - `index_out_of_range` writing to a list index that doesn't exist (`list[9] = x`), or a narrowed read whose index is gone
 - `for_ref_element_gone` a `for ref` element whose index is gone when it's written back
-- `missing_key` a map key that isn't there, on a write path (`m[k] += 1`, `m[k].push(x)`, `ref m[k]`) or in a narrowed read
+- `missing_key` a map key that isn't there, on a write path (`m[k] += 1`, `m[k].push(x)`, `m[k]` passed to a `ref` parameter) or in a narrowed read
 - `internal_error` a case the checker should have ruled out reached the interpreter (a bug in Check, not the program); the reason names the case
 - `out_of_steps` a const or `.conx` value that ran past the step budget (10 million loop passes, calls and built-in steps) while being built
 - `data_try_failed` a `try` that failed in a `.conx` value while a host loads it (`check run` stops with the error instead, as for a top-level `try`)
@@ -136,8 +140,9 @@
 
 ## Warnings
 - `unused_var` a `var` that's never reassigned
-- `ref_of_ref_class` `Ref` of a `ref class`, which is already shared
-- `ref_param_of_ref_class` a `ref` parameter of a `ref class` type, which is already shared
+- `changed_copy` changing a `var` copied from a field, index or map lookup, where the change is never read (quick fix for a plain path: `ref` in place of `var`)
+- `shared_wraps_shared_class` `Shared` of a `shared class`, which is already shared
+- `ref_param_of_shared_class` a `ref` parameter of a `shared class` type, which is already shared
 - `shadowed_name` a local that shadows a function or type
 - `repeated_namespace` a `namespace` line that only repeats its package's, which the manifest already sets
 - `interpolated_maybe` interpolating a `T?`

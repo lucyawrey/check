@@ -154,7 +154,7 @@ fn top_level_names(stmts: &[Stmt]) -> HashSet<String> {
     let mut names = HashSet::new();
     for stmt in stmts {
         match stmt {
-            Stmt::Let { name, .. } => {
+            Stmt::Let { name, .. } | Stmt::RefLet { name, .. } => {
                 names.insert(name.clone());
             }
             Stmt::LetPattern { pattern, .. } => bound_names(pattern, &mut names),
@@ -615,6 +615,11 @@ impl Resolver<'_> {
                 self.expr(target);
                 self.expr(value);
             }
+            Stmt::RefLet { name, span, target } => {
+                self.expr(target);
+                let (name, span) = (name.clone(), *span);
+                self.bind(&name, span);
+            }
             Stmt::Expr(e) => self.expr(e),
             Stmt::Func(_)
             | Stmt::Class(_)
@@ -693,7 +698,10 @@ impl Resolver<'_> {
                 self.expr(callee);
                 self.args(args);
             }
-            ExprKind::Spread(x) | ExprKind::Unary(_, x) | ExprKind::Loop(x) => self.expr(x),
+            ExprKind::Spread(x)
+            | ExprKind::SharedOf(x)
+            | ExprKind::Unary(_, x)
+            | ExprKind::Loop(x) => self.expr(x),
             ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => {
                 self.expr(a);
                 self.expr(b);

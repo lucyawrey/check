@@ -35,6 +35,8 @@ type ArgValue = (Option<Rc<str>>, Value, Option<Place>);
 type Place = (Root, Vec<Step>);
 
 type Bound = (Vec<Value>, Vec<Option<Place>>);
+/// Live `ref` bindings: name, place, and the statement of its last use.
+type Bindings<'s> = Vec<(&'s String, Place, usize)>;
 
 type Writer<'f> = &'f mut dyn FnMut(&mut Value) -> Result<(), Flow>;
 
@@ -76,7 +78,7 @@ pub struct Interpreter<'a> {
     globals: HashMap<String, Value>,
     frames: Vec<Frame>,
     depth: usize,
-    /// The `ref class` objects being printed, by address, to stop at a cycle.
+    /// The `shared class` objects being printed, by address, to stop at a cycle.
     printing: Vec<usize>,
     /// Steps left before evaluation stops with `out_of_steps`; `None` is no limit.
     budget: Option<u64>,
@@ -103,8 +105,9 @@ pub fn run(
         Err(_) => unreachable!("start returns only stops and panics"),
     };
     interp.budget = None;
-    for stmt in program {
-        match interp.stmt(stmt) {
+    let mut bound = Vec::new();
+    for i in 0..program.len() {
+        match interp.step(program, i, &mut bound) {
             Ok(_) => {}
             Err(Flow::Panic(p)) => return Err(p),
             Err(Flow::Stop(span, err)) => return Ok(Some((span, err))),
@@ -266,16 +269,19 @@ fn result_variant(name: &str, value: Value) -> Value {
 }
 
 fn descend<'s>(v: &mut Value, steps: &'s [Step], f: Writer) -> Descent<'s> {
+    if let Value::Cell(rc) = v {
+        return Ok(Some((Holder::Value(rc.clone()), steps)));
+    }
     let Some((step, rest)) = steps.split_first() else {
         f(v)?;
         return Ok(None);
     };
     match (v, step) {
         (Value::Shared(rc), _) => Ok(Some((Holder::Record(rc.clone()), steps))),
-        (Value::Ref(rc), Step::Field(name)) if name == "value" => {
+        (Value::SharedBox(rc), Step::Field(name)) if name == "value" => {
             Ok(Some((Holder::Value(rc.clone()), rest)))
         }
-        (Value::Ref(rc), _) => Ok(Some((Holder::Value(rc.clone()), steps))),
+        (Value::SharedBox(rc), _) => Ok(Some((Holder::Value(rc.clone()), steps))),
         (Value::Object(rc), _) => descend_record(Rc::make_mut(rc), steps, f),
         (Value::List(items), Step::Index(i, span)) => {
             let items = Rc::make_mut(items);
@@ -316,19 +322,43 @@ pub(crate) fn grow<R>(f: impl FnOnce() -> R) -> R {
 
 fn through_ref<R>(slot: &mut Value, f: impl FnOnce(&mut Value) -> R) -> R {
     match slot {
-        Value::Ref(v) => f(&mut v.borrow_mut()),
+        Value::SharedBox(v) => f(&mut v.borrow_mut()),
         slot => f(slot),
+    }
+}
+
+fn uncell(v: Value) -> Value {
+    match v {
+        Value::Cell(v) => v.borrow().clone(),
+        v => v,
+    }
+}
+
+fn share_new(v: Value) -> Value {
+    Value::Cell(Rc::new(RefCell::new(v)))
+}
+
+/// A box for a `shared` parameter or field: the one a `Shared` value holds, else a new one.
+fn share(v: Value) -> Value {
+    match v {
+        Value::SharedBox(rc) => Value::Cell(rc),
+        v => share_new(v),
     }
 }
 
 fn deref(v: Value) -> Value {
     match v {
-        Value::Ref(v) => v.borrow().clone(),
+        Value::SharedBox(v) => v.borrow().clone(),
         v => v,
     }
 }
 
+/// A field's value, read through the box of a `shared` field.
 fn field(v: &Value, name: &str, span: Span) -> Eval {
+    raw_field(v, name, span).map(uncell)
+}
+
+fn raw_field(v: &Value, name: &str, span: Span) -> Eval {
     let found = match v {
         Value::Object(r) | Value::Record(r) => r.index(name).map(|i| r.fields[i].clone()),
         Value::Shared(r) => {
@@ -394,7 +424,7 @@ impl Interpreter<'_> {
     }
 
     /// A write path's variable. A lambda's captured variable is a copy that writes can only reach
-    /// through (the checker allows only paths into a `Ref` or `ref class`), so it starts there.
+    /// through (the checker allows only paths into a `Shared` or `shared class`), so it starts there.
     fn root(&self, name: &str) -> Root {
         let frame = self.frames.last().expect("frame");
         let own = frame.scopes.iter().any(|s| s.contains_key(name));
@@ -559,10 +589,14 @@ impl Interpreter<'_> {
                 self.printing.pop();
                 done
             }
-            Value::Ref(r) => {
+            Value::SharedBox(r) => {
                 // A copy, as for `Shared`: printing can run code that changes it.
                 let inner = r.borrow().clone();
-                write_items(out, "Ref(", [&inner].into_iter(), ")", field)
+                write_items(out, "Shared(", [&inner].into_iter(), ")", field)
+            }
+            Value::Cell(r) => {
+                let inner = r.borrow().clone();
+                self.write_text(&inner, quoted, span, out)
             }
             Value::Str(_) if !quoted => {
                 out.push_str(&v.display());
@@ -577,7 +611,12 @@ impl Interpreter<'_> {
 
     fn construct(&mut self, class_name: &str, args: &[Arg], span: Span) -> Eval {
         let class = self.classes[class_name].clone();
-        let (fields, _) = self.bind_args(&class.fields, args)?;
+        let (mut fields, _) = self.bind_args(&class.fields, args)?;
+        for (value, f) in fields.iter_mut().zip(&class.fields) {
+            if f.is_shared {
+                *value = share(std::mem::replace(value, Value::Void));
+            }
+        }
         let record = Record {
             name: class_name.into(),
             ty: class_name.into(),
@@ -591,7 +630,7 @@ impl Interpreter<'_> {
             ),
             fields,
         };
-        let value = if class.is_ref {
+        let value = if class.is_shared {
             Value::Shared(Rc::new(RefCell::new(record)))
         } else {
             Value::Object(Rc::new(record))
@@ -618,7 +657,11 @@ impl Interpreter<'_> {
                     change.value.span,
                 );
             };
-            record.fields[i] = value;
+            let class = self.classes.get(&*record.name);
+            record.fields[i] = match class.is_some_and(|c| c.fields[i].is_shared) {
+                true => share(value),
+                false => value,
+            };
         }
         let class = self.classes.get(&*record.name).cloned();
         copy = match &copy {
@@ -841,9 +884,14 @@ impl Interpreter<'_> {
 
     fn stmt(&mut self, stmt: &Stmt) -> Eval {
         match stmt {
-            Stmt::Let { name, value, .. } => {
+            Stmt::Let {
+                name,
+                value,
+                is_shared,
+                ..
+            } => {
                 let v = self.scoped(|i| i.expr(value))?;
-                self.define(name, v);
+                self.define(name, if *is_shared { share_new(v) } else { v });
                 Ok(Value::Void)
             }
             Stmt::Assign {
@@ -912,24 +960,74 @@ impl Interpreter<'_> {
             | Stmt::Implement(_)
             | Stmt::Interface(_)
             | Stmt::Data(_) => Ok(Value::Void),
+            Stmt::RefLet { .. } => unreachable!("blocks and the program bind refs themselves"),
             Stmt::Expr(e) => self.scoped(|i| i.expr(e)),
         }
     }
 
     fn block(&mut self, stmts: &[Stmt]) -> Eval {
         self.frame().scopes.push(HashMap::new());
+        let mut bound = Vec::new();
         let mut last = Ok(Value::Void);
-        for stmt in stmts {
-            last = self.stmt(stmt);
+        for i in 0..stmts.len() {
+            last = self.step(stmts, i, &mut bound);
             if last.is_err() {
                 break;
             }
         }
-        if matches!(stmts.last(), Some(Stmt::Let { .. } | Stmt::Assign { .. })) {
+        if matches!(
+            stmts.last(),
+            Some(Stmt::Let { .. } | Stmt::Assign { .. } | Stmt::RefLet { .. })
+        ) {
             last = last.map(|_| Value::Void);
+        }
+        // Leaving early writes back the bindings still live, unless a panic ends the program.
+        if !matches!(last, Err(Flow::Panic(_)))
+            && let Err(flow) = self.write_refs(&mut bound, usize::MAX)
+        {
+            last = Err(flow);
         }
         self.frame().scopes.pop();
         last
+    }
+
+    /// Runs `stmts[i]`, then writes back the `ref` bindings whose last use it is.
+    fn step<'s>(&mut self, stmts: &'s [Stmt], i: usize, bound: &mut Bindings<'s>) -> Eval {
+        let value = match &stmts[i] {
+            Stmt::RefLet { name, target, .. } => {
+                let place = self.bind_ref(name, target)?;
+                bound.push((name, place, i + self.info.ref_ends[&target.id]));
+                Value::Void
+            }
+            stmt => self.stmt(stmt)?,
+        };
+        self.write_refs(bound, i)?;
+        Ok(value)
+    }
+
+    /// Writes back the `ref` bindings that end by statement `i`, innermost first.
+    fn write_refs(&mut self, bound: &mut Bindings, i: usize) -> Result<(), Flow> {
+        for k in (0..bound.len()).rev() {
+            if bound[k].2 > i {
+                continue;
+            }
+            let (name, (mut root, steps), _) = bound.remove(k);
+            let value = self.lookup(name).unwrap_or(Value::Void);
+            self.write_steps(&mut root, &steps, &mut |slot| {
+                *slot = value.clone();
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Copies the place `target` names into `name`, resolving it once, and returns the place.
+    fn bind_ref(&mut self, name: &str, target: &Expr) -> Result<Place, Flow> {
+        let mut steps = Vec::new();
+        let mut root = self.path(target, &mut steps)?;
+        let value = self.read_steps(&mut root, &steps)?;
+        self.define(name, value);
+        Ok((root, steps))
     }
 
     fn expr(&mut self, expr: &Expr) -> Eval {
@@ -966,16 +1064,17 @@ impl Interpreter<'_> {
                 Ok(Value::Str(out.into()))
             }
             ExprKind::Name(name) => match self.lookup(name) {
-                Some(v) => Ok(v),
+                Some(v) => Ok(uncell(v)),
                 None => internal(&format!("no variable `{name}`"), expr.span),
             },
+            ExprKind::SharedOf(x) => self.shared_of(x),
             ExprKind::This => match self.lookup("this") {
                 Some(v) => Ok(v),
                 None => internal("no `this`", expr.span),
             },
             ExprKind::Field(base, name) => match self.expr(base)? {
-                Value::Ref(v) if name == "value" => Ok(v.borrow().clone()),
-                Value::Ref(v) => field(&v.borrow(), name, expr.span),
+                Value::SharedBox(v) if name == "value" => Ok(v.borrow().clone()),
+                Value::SharedBox(v) => field(&v.borrow(), name, expr.span),
                 v => field(&v, name, expr.span),
             },
             ExprKind::Is(lhs, pattern) => {
@@ -1304,15 +1403,31 @@ impl Interpreter<'_> {
             .collect())
     }
 
+    fn shared_of(&mut self, x: &Expr) -> Eval {
+        let cell = match &x.kind {
+            ExprKind::Field(base, name) => raw_field(&self.expr(base)?, name, x.span)?,
+            ExprKind::Name(name) => self.lookup(name).unwrap_or(Value::Void),
+            _ => Value::Void,
+        };
+        match cell {
+            Value::Cell(rc) => Ok(Value::SharedBox(rc)),
+            _ => internal("`shared` of something without a box", x.span),
+        }
+    }
+
     fn spread_args(&mut self, args: &[Arg]) -> Result<Vec<ArgValue>, Flow> {
         let mut out = Vec::new();
         for arg in args {
             let name = arg.name.as_deref().map(Rc::from);
-            if arg.is_ref {
+            if self.info.ref_args.contains_key(&arg.value.id) {
                 let mut steps = Vec::new();
                 let mut root = self.path(&arg.value, &mut steps)?;
                 let value = self.read_steps(&mut root, &steps)?;
                 out.push((name, value, Some((root, steps))));
+                continue;
+            }
+            if self.info.shared_args.contains_key(&arg.value.id) {
+                out.push((name, self.shared_of(&arg.value)?, None));
                 continue;
             }
             let ExprKind::Spread(inner) = &arg.value.kind else {
@@ -1355,9 +1470,9 @@ impl Interpreter<'_> {
                     let set: IndexSet<Value> = items.iter().cloned().collect();
                     return Ok(Value::Set(Rc::new(set)));
                 }
-                "Ref" => {
+                "Shared" => {
                     let value = self.args(args)?.remove(0);
-                    return Ok(Value::Ref(Rc::new(RefCell::new(value))));
+                    return Ok(Value::SharedBox(Rc::new(RefCell::new(value))));
                 }
                 "same" => {
                     let values = self.args(args)?;
@@ -1367,7 +1482,7 @@ impl Interpreter<'_> {
                             (Value::Shared(a), Value::Shared(b)) if Rc::ptr_eq(a, b)
                         ) || matches!(
                             (&values[0], &values[1]),
-                            (Value::Ref(a), Value::Ref(b)) if Rc::ptr_eq(a, b)
+                            (Value::SharedBox(a), Value::SharedBox(b)) if Rc::ptr_eq(a, b)
                         ),
                     ));
                 }
@@ -1389,6 +1504,33 @@ impl Interpreter<'_> {
         let (values, places) = self.bind_args(&decl.params, args)?;
         let names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
         let (result, kept) = self.run_decl(decl, values, this, span, &names)?;
+        self.write_back(places, kept)?;
+        Ok(result)
+    }
+
+    /// Calls a method that changes `this`, writing it back to the receiver like a `ref` argument.
+    fn call_changing(
+        &mut self,
+        decl: &Rc<FuncDecl>,
+        args: &[Arg],
+        span: Span,
+        this: Value,
+        (mut root, steps): Place,
+    ) -> Eval {
+        let (values, places) = self.bind_args(&decl.params, args)?;
+        let mut names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+        names.push("this".to_string());
+        let (result, mut kept) = self.run_decl(decl, values, Some(this), span, &names)?;
+        let this = kept.pop().expect("this is kept last");
+        self.write_back(places, kept)?;
+        self.write_steps(&mut root, &steps, &mut |slot| {
+            through_ref(slot, |slot| *slot = this.clone());
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    fn write_back(&mut self, places: Vec<Option<Place>>, kept: Vec<Value>) -> Result<(), Flow> {
         for (place, value) in places.into_iter().zip(kept) {
             if let Some((mut root, steps)) = place {
                 self.write_steps(&mut root, &steps, &mut |slot| {
@@ -1397,7 +1539,7 @@ impl Interpreter<'_> {
                 })?;
             }
         }
-        Ok(result)
+        Ok(())
     }
 
     fn run_decl(
@@ -1423,8 +1565,8 @@ impl Interpreter<'_> {
         let mut scope: HashMap<String, Value> = decl
             .params
             .iter()
-            .map(|p| p.name.clone())
             .zip(values)
+            .map(|(p, v)| (p.name.clone(), if p.is_shared { share(v) } else { v }))
             .collect();
         if let Some(this) = this {
             scope.insert("this".to_string(), this);
@@ -1543,9 +1685,15 @@ impl Interpreter<'_> {
         let info = self.info;
         match info.resolved.get(&id) {
             Some(Resolved::Method(key)) => {
-                let this = deref(self.expr(recv)?);
                 let decl = self.funcs[key].clone();
-                return self.call_named(&decl, args, span, Some(this));
+                if !info.changes_this.contains_key(key) {
+                    let this = deref(self.expr(recv)?);
+                    return self.call_named(&decl, args, span, Some(this));
+                }
+                let mut steps = Vec::new();
+                let mut root = self.path(recv, &mut steps)?;
+                let this = deref(self.read_steps(&mut root, &steps)?);
+                return self.call_changing(&decl, args, span, this, (root, steps));
             }
             Some(Resolved::Dynamic(name)) => {
                 let this = deref(self.expr(recv)?);

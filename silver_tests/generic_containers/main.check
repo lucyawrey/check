@@ -1,4 +1,4 @@
-ref class Stack<T> {
+shared class Stack<T> {
   var items: T[] = []
 
   func push(item: T) { this.items.push(item) }

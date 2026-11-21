@@ -37,6 +37,14 @@ pub struct Info {
     pub aliases: HashMap<String, String>,
     /// Each type's interfaces, their parents included.
     pub implements: HashMap<String, HashSet<String>>,
+    /// Each `ref` binding, by its target, and how many statements after it its last use is.
+    pub ref_ends: HashMap<NodeId, usize>,
+    /// Methods whose body changes `this`, so calls write it back, with where the body starts.
+    pub changes_this: HashMap<String, Span>,
+    /// Arguments passed to a `ref` parameter, which the call writes back.
+    pub ref_args: HashMap<NodeId, Span>,
+    /// Shared names passed to a `shared` parameter or field, which pass their box.
+    pub shared_args: HashMap<NodeId, Span>,
 }
 
 #[derive(Clone)]
@@ -46,6 +54,15 @@ struct ParamSig {
     has_default: bool,
     is_rest: bool,
     is_ref: bool,
+    sharing: Sharing,
+}
+
+/// What a `shared` parameter or field takes: a field also takes a plain value, in a new box.
+#[derive(Clone, Copy, PartialEq)]
+enum Sharing {
+    No,
+    Param,
+    Field,
 }
 
 #[derive(Clone)]
@@ -66,6 +83,7 @@ struct FuncEntry {
     sig: Sig,
     state: FuncState,
     this: Option<(Ty, bool)>,
+    changes_this: bool,
     owner: Option<String>,
     library: bool,
     /// The type parameters it's generic over, its owner's included, and their bounds.
@@ -83,7 +101,7 @@ struct InterfaceDef {
 }
 
 struct ClassDef {
-    is_ref: bool,
+    is_shared: bool,
     fields: Vec<ParamSig>,
     mutable: Vec<bool>,
     private: Vec<bool>,
@@ -93,7 +111,10 @@ struct ClassDef {
 struct FieldInfo {
     ty: Ty,
     mutable: bool,
-    is_ref: bool,
+    /// Its class is a `shared class`.
+    is_shared: bool,
+    /// It's a `shared` field, held in a box that copies of the object share.
+    boxed: bool,
     private: bool,
     readonly: bool,
 }
@@ -126,7 +147,7 @@ type Binding = (String, Span, Ty, bool);
 type OwnMethod = (String, Vec<(Sig, HashMap<String, Ty>)>);
 
 enum ArgSource<'a> {
-    Expr(&'a Expr, bool),
+    Expr(&'a Expr),
     Spread(Ty, Span),
 }
 
@@ -147,6 +168,8 @@ static WILDCARD: Pattern = Pattern {
 enum VarKind {
     Local,
     Param,
+    /// A `shared` local or parameter: its value is in a box, so writes go through.
+    Shared,
 }
 
 struct Var {
@@ -211,6 +234,11 @@ pub struct Checker<'s> {
     /// Collection and key names whose index can't miss, and the innermost scope they
     /// may come from, so a shadowing name isn't narrowed.
     narrowed: Vec<(String, String, usize)>,
+    /// Names of functions and methods with a `ref` parameter, for checks that run before calls
+    /// are resolved.
+    ref_callees: HashSet<String>,
+    /// Field reads of a `shared` field.
+    boxed_fields: HashSet<NodeId>,
     top_level_names: HashSet<String>,
     lambda_types: Vec<(NodeId, Ty)>,
     type_names: HashSet<String>,
@@ -238,6 +266,14 @@ pub struct Checker<'s> {
     impl_spans: HashMap<String, Span>,
     /// Parameter names an `implement` uses for its type's own (`U` for `T`).
     renamed: HashMap<String, String>,
+    current_method: Option<String>,
+    /// Calls on `this` to a method still being checked, as (caller, callee): the caller changes
+    /// `this` as soon as the callee does.
+    pending_changes: Vec<(String, String)>,
+    /// Set while checking a write path: whether it went into a `Shared` or `shared class`.
+    through_shared: bool,
+    /// Set while checking a write path: its variable, when that is a `var`.
+    place_root: Option<String>,
 }
 
 pub(crate) const RESERVED_NAMES: &[&str] = &["Maybe", "Some", "None", "Result", "Ok", "Err"];
@@ -246,7 +282,7 @@ pub(crate) const BUILT_IN_TYPES: &[&str] = &["String", "Int", "Float", "Bool"];
 pub(crate) const MAYBE: &str = "check.std.Maybe";
 pub(crate) const MAP: &str = "Map";
 pub(crate) const SET: &str = "Set";
-pub(crate) const REF: &str = "Ref";
+pub(crate) const SHARED: &str = "Shared";
 /// The bound a map key or set item's type needs; not a real interface.
 const KEY: &str = "check.std.Key";
 pub(crate) const RESULT: &str = "check.std.Result";
@@ -265,6 +301,8 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         loops: Vec::new(),
         lambdas: Vec::new(),
         narrowed: Vec::new(),
+        ref_callees: HashSet::new(),
+        boxed_fields: HashSet::new(),
         top_level_names: HashSet::new(),
         lambda_types: Vec::new(),
         type_names: HashSet::new(),
@@ -283,6 +321,10 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         pending_bounds: Vec::new(),
         impl_spans: HashMap::new(),
         renamed: HashMap::new(),
+        current_method: None,
+        pending_changes: Vec::new(),
+        through_shared: false,
+        place_root: None,
     };
     checker.program(program, library);
     (checker.info, checker.diags)
@@ -367,8 +409,13 @@ impl Checker<'_> {
             self.subsume(default.id, &actual, &ty);
         }
         self.current_type = None;
-        self.check_signatures(own_methods);
-        for stmt in program {
+        let interface_methods = self.check_signatures(own_methods);
+        self.ref_callees = (self.funcs.iter())
+            .filter(|(_, f)| f.sig.params.iter().any(|p| p.is_ref))
+            .map(|(key, _)| key.rsplit('.').next().unwrap_or(key).to_string())
+            .collect();
+        for (i, stmt) in program.iter().enumerate() {
+            self.ref_binding(stmt, &program[i + 1..]);
             self.stmt(stmt);
         }
         self.check_bounds(0);
@@ -376,6 +423,8 @@ impl Checker<'_> {
         for name in names {
             self.ensure_checked(&name, Span::default());
         }
+        self.report_changes(interface_methods);
+        self.changed_copies(program);
         let consts: Vec<String> = self.consts.keys().cloned().collect();
         for key in consts {
             self.const_type(&key);
@@ -526,7 +575,12 @@ impl Checker<'_> {
     fn declare_class(&mut self, c: &ClassDecl) {
         let saved = self.enter_params(&c.type_params);
         self.current_type = Some(c.name.clone());
-        let fields = self.param_sigs(&c.fields);
+        let mut fields = self.param_sigs(&c.fields);
+        for f in &mut fields {
+            if f.sharing == Sharing::Param {
+                f.sharing = Sharing::Field;
+            }
+        }
         self.current_type = None;
         self.check_unique(c.fields.iter().map(|f| (&f.name, f.span)));
         let mutable = c.fields.iter().map(|f| f.is_var).collect();
@@ -538,7 +592,7 @@ impl Checker<'_> {
         self.types.insert(
             c.name.clone(),
             TypeDef::Class(ClassDef {
-                is_ref: c.is_ref,
+                is_shared: c.is_shared,
                 fields,
                 mutable,
                 private: c.fields.iter().map(|f| f.is_private).collect(),
@@ -632,6 +686,7 @@ impl Checker<'_> {
                         has_default: false,
                         is_rest: false,
                         is_ref: false,
+                        sharing: Sharing::No,
                     })
                     .collect(),
             })
@@ -729,6 +784,7 @@ impl Checker<'_> {
             sig: Sig { params, ret },
             state: FuncState::Unchecked,
             this,
+            changes_this: false,
             owner: owner.map(str::to_string),
             library: self.in_library,
             bounds,
@@ -764,8 +820,8 @@ impl Checker<'_> {
             if p.is_ref && p.default.is_some() {
                 self.error(Code::ref_default, p.span);
             }
-            if p.is_ref && self.is_ref_class(&ty) {
-                self.warn(Code::ref_param_of_ref_class, p.span);
+            if p.is_ref && self.is_shared_class(&ty) {
+                self.warn(Code::ref_param_of_shared_class, p.span);
             }
             params.push(ParamSig {
                 name: p.name.clone(),
@@ -773,6 +829,11 @@ impl Checker<'_> {
                 has_default: p.default.is_some(),
                 is_rest: p.is_rest,
                 is_ref: p.is_ref,
+                sharing: if p.is_shared {
+                    Sharing::Param
+                } else {
+                    Sharing::No
+                },
             });
         }
         params
@@ -935,7 +996,7 @@ impl Checker<'_> {
                         Ty::Named(name.clone(), args)
                     }
                     (MAYBE, [inner]) => Ty::maybe(inner.clone()),
-                    (REF, [_]) => Ty::Named(name.clone(), args),
+                    (SHARED, [_]) => Ty::Named(name.clone(), args),
                     _ if !self.type_names.contains(name) => self.error(Code::unknown_name, *span),
                     _ if self.generics.get(name).map_or(0, Vec::len) != args.len() => {
                         self.error(Code::wrong_type_arguments, *span)
@@ -983,6 +1044,10 @@ impl Checker<'_> {
         let saved_bounds = std::mem::replace(&mut self.bounds, entry.bounds.clone());
         let saved_renamed = std::mem::replace(&mut self.renamed, entry.renamed.clone());
         let saved_type = std::mem::replace(&mut self.current_type, entry.owner.clone());
+        let saved_method = std::mem::replace(
+            &mut self.current_method,
+            this.is_some().then(|| name.to_string()),
+        );
         let saved_scopes = self.scopes.split_off(1);
         let saved_loops = std::mem::take(&mut self.loops);
         let saved_lambdas = std::mem::take(&mut self.lambdas);
@@ -999,7 +1064,11 @@ impl Checker<'_> {
                 Var {
                     ty,
                     mutable: p.is_var || p.is_ref,
-                    kind: VarKind::Param,
+                    kind: if p.is_shared {
+                        VarKind::Shared
+                    } else {
+                        VarKind::Param
+                    },
                     span: p.span,
                     reassigned: false,
                     list_len: None,
@@ -1026,6 +1095,7 @@ impl Checker<'_> {
         let bounds = std::mem::replace(&mut self.bounds, saved_bounds);
         self.renamed = saved_renamed;
         self.current_type = saved_type;
+        self.current_method = saved_method;
         self.scopes.truncate(1);
         self.scopes.extend(saved_scopes);
         self.loops = saved_loops;
@@ -1216,11 +1286,11 @@ impl Checker<'_> {
         if want == KEY {
             return self.is_key(&ty, &mut HashSet::new());
         }
-        // Every type `==` works on is `Eq`; a `ref class` has to say so.
+        // Every type `==` works on is `Eq`; a `shared class` has to say so.
         if want == EQ
             && !matches!(ty, Ty::Param(_))
             && !self.is_interface(&ty)
-            && !self.is_ref_class(&ty)
+            && !self.is_shared_class(&ty)
         {
             return !self.lacks_eq(&ty, &mut HashSet::new());
         }
@@ -1371,9 +1441,28 @@ impl Checker<'_> {
         own_methods
     }
 
+    /// Methods that change `this` through a call to one still being checked, and the rule that
+    /// interface methods never change it (generic calls on a `let` rely on it).
+    fn report_changes(&mut self, interface_methods: Vec<String>) {
+        for key in interface_methods {
+            if self.funcs[&key].changes_this {
+                self.error(Code::interface_changes_this, self.funcs[&key].decl.span);
+            }
+        }
+        self.info.changes_this = (self.funcs.iter())
+            .filter(|(_, f)| f.changes_this)
+            .map(|(k, f)| {
+                let at = f.decl.body.as_ref().map_or(f.decl.span, |b| b.span).start;
+                (k.clone(), Span::new(at, at))
+            })
+            .collect();
+    }
+
     /// Checks a type's own methods against the signatures its interfaces declare.
-    fn check_signatures(&mut self, own_methods: Vec<OwnMethod>) {
+    fn check_signatures(&mut self, own_methods: Vec<OwnMethod>) -> Vec<String> {
+        let mut keys = Vec::new();
         for (key, wants) in own_methods {
+            keys.push(key.clone());
             let span = self.funcs[&key].decl.span;
             let Some(sig) = self.ensure_checked(&key, span) else {
                 continue;
@@ -1394,6 +1483,7 @@ impl Checker<'_> {
                 }
             }
         }
+        keys
     }
 
     fn add_coercion(&mut self, id: NodeId, to_float: bool, wraps: usize) {
@@ -1432,10 +1522,10 @@ impl Checker<'_> {
         }
         let a = self.subst.shallow(actual);
         if let Ty::Named(n, args) = &a
-            && n == REF
+            && n == SHARED
             && self.subst.unify(&args[0], expected)
         {
-            self.ref_value_hint(expr);
+            self.ref_value_hint(expr, false);
             return;
         }
         let code = if matches!(a, Ty::Maybe(_)) {
@@ -1446,9 +1536,25 @@ impl Checker<'_> {
         self.error(code, expr.span);
     }
 
-    fn ref_value_hint(&mut self, e: &Expr) {
-        let mut d = Diagnostic::error(Code::ref_where_value_expected, e.span);
-        d.detail = Some(format!("{}.value", self.operand_text(e)));
+    /// For an operator on a `Shared` local, the hint also suggests declaring it `shared`.
+    fn ref_value_hint(&mut self, e: &Expr, operator: bool) {
+        let fixed = format!("{}.value", self.operand_text(e));
+        let mut d =
+            Diagnostic::error(Code::shared_where_value_expected, e.span).with_quick_fix(vec![
+                Edit {
+                    span: e.span,
+                    text: fixed.clone(),
+                },
+            ]);
+        let mut detail = fixed;
+        if operator
+            && let ExprKind::Name(n) = &e.kind
+            && self.lookup(n).is_some_and(|v| v.kind == VarKind::Local)
+            && !self.is_captured(n)
+        {
+            detail.push_str(" [or declare it with shared]");
+        }
+        d.detail = Some(detail);
         self.diags.push(d);
     }
 
@@ -1568,11 +1674,12 @@ impl Checker<'_> {
                 name,
                 span,
                 is_var,
+                is_shared,
                 ty,
                 value,
                 ..
             } => {
-                if *is_var {
+                if *is_var && !is_shared {
                     self.var_keywords.insert(span.start, *keyword);
                 }
                 let declared = ty.as_ref().map(|t| self.type_from(t));
@@ -1610,13 +1717,18 @@ impl Checker<'_> {
                     ExprKind::List(items) if !is_var => Some(items.len()),
                     _ => None,
                 };
+                let kind = if *is_shared {
+                    VarKind::Shared
+                } else {
+                    VarKind::Local
+                };
                 self.declare(
                     name,
                     *span,
                     Var {
                         ty,
                         mutable: *is_var,
-                        kind: VarKind::Local,
+                        kind,
                         span: *span,
                         reassigned: false,
                         list_len,
@@ -1631,6 +1743,22 @@ impl Checker<'_> {
                 span,
             } => {
                 self.assign(target, *op, value, *span);
+                Ty::Void
+            }
+            Stmt::RefLet { name, span, target } => {
+                let (ty, err) = self.place(target);
+                if let Some(code) = err {
+                    self.error(code, target.span);
+                }
+                let var = Var {
+                    ty,
+                    mutable: true,
+                    kind: VarKind::Local,
+                    span: *span,
+                    reassigned: true,
+                    list_len: None,
+                };
+                self.declare(name, *span, var);
                 Ty::Void
             }
             Stmt::LetPattern {
@@ -1725,13 +1853,8 @@ impl Checker<'_> {
                 return (self.const_type(&key), Some(Code::assign_to_let));
             }
         }
-        let captured = self.lambdas.last().is_some_and(|&(base, _)| {
-            self.scopes
-                .iter()
-                .rposition(|s| s.contains_key(name))
-                .is_none_or(|i| i < base)
-        });
-        // A write into a `Ref` or `ref class` it captured goes through the captured copy.
+        let captured = self.is_captured(name);
+        // A write into a `Shared` or `shared class` it captured goes through the captured copy.
         self.capture(name);
         let Some(var) = self.lookup_mut(name) else {
             let code = if name == "this" {
@@ -1743,33 +1866,148 @@ impl Checker<'_> {
             };
             return (self.error(code, span), None);
         };
+        if var.kind == VarKind::Shared {
+            let ty = var.ty.clone();
+            self.through_shared = true;
+            return (ty, None);
+        }
         if !var.mutable {
-            let code = if var.kind == VarKind::Param && name != "this" {
+            let (ty, kind) = (var.ty.clone(), var.kind);
+            // `changes_let` here only marks a write rooted at a value's `this`: `place` takes it.
+            let code = if name != "this" && kind == VarKind::Param {
                 Code::assign_to_parameter
-            } else {
+            } else if name != "this" || self.is_shared_class(&ty) {
                 Code::assign_to_let
+            } else if captured {
+                Code::assign_to_captured
+            } else {
+                Code::changes_let
             };
-            return (var.ty.clone(), Some(code));
+            return (ty, Some(code));
         }
-        var.reassigned = true;
-        if captured {
-            return (var.ty.clone(), Some(Code::assign_to_captured));
+        let ty = var.ty.clone();
+        if !captured {
+            var.list_len = None;
         }
-        var.list_len = None;
-        (var.ty.clone(), None)
+        self.place_root = Some(name.to_string());
+        (ty, captured.then_some(Code::assign_to_captured))
+    }
+
+    /// Whether `name` comes from outside the lambda being checked.
+    fn is_captured(&self, name: &str) -> bool {
+        self.lambdas.last().is_some_and(|&(base, _)| {
+            self.scopes
+                .iter()
+                .rposition(|s| s.contains_key(name))
+                .is_none_or(|i| i < base)
+        })
+    }
+
+    /// A place's type and error, whether it goes through a `Shared` or `shared class`, and its
+    /// root variable, without marking anything changed.
+    fn place_parts(&mut self, target: &Expr) -> (Ty, Option<Code>, bool, Option<String>) {
+        let saved = (
+            std::mem::take(&mut self.through_shared),
+            self.place_root.take(),
+        );
+        let (ty, err) = self.place_path(target);
+        let through = std::mem::replace(&mut self.through_shared, saved.0);
+        let root = std::mem::replace(&mut self.place_root, saved.1);
+        (ty, err, through, root)
     }
 
     fn place(&mut self, target: &Expr) -> (Ty, Option<Code>) {
+        let (ty, mut err, through, root) = self.place_parts(target);
+        if err == Some(Code::changes_let) {
+            err = None;
+            if let Some(key) = self.current_method.clone() {
+                self.mark_changes_this(key);
+            }
+        }
+        // A change through a `Shared` or `shared class` leaves the variable itself as it was.
+        if !through && let Some(var) = root.and_then(|n| self.lookup_mut(&n)) {
+            var.reassigned = true;
+        }
+        (ty, err)
+    }
+
+    /// `shared x`: the box behind a shared local, parameter or field.
+    fn shared_of(&mut self, x: &Expr) -> Ty {
+        let t = match &x.kind {
+            ExprKind::Name(n) => self.name(x.id, n, x.span, None),
+            _ => self.expr(x, None),
+        };
+        if !self.is_boxed(x) {
+            return self.error(Code::not_shared, x.span);
+        }
+        Ty::Named(SHARED.to_string(), vec![t])
+    }
+
+    /// A shared local, parameter or field, already checked as an expression.
+    fn is_boxed(&self, x: &Expr) -> bool {
+        match &x.kind {
+            ExprKind::Name(n) => self.lookup(n).is_some_and(|v| v.kind == VarKind::Shared),
+            ExprKind::Field(..) => self.boxed_fields.contains(&x.id),
+            _ => false,
+        }
+    }
+
+    /// Marked as soon as it's known, so calls checked later in the same cycle of methods see it.
+    fn mark_changes_this(&mut self, key: String) {
+        let mut work = vec![key];
+        while let Some(key) = work.pop() {
+            let Some(f) = self.funcs.get_mut(&key).filter(|f| !f.changes_this) else {
+                continue;
+            };
+            f.changes_this = true;
+            work.extend(
+                (self.pending_changes.iter())
+                    .filter(|(_, callee)| *callee == key)
+                    .map(|(caller, _)| caller.clone()),
+            );
+        }
+    }
+
+    fn changing_method(&mut self, ty: &Ty, name: &str) -> bool {
+        let ty = self.subst.shallow(ty);
+        let Some(tag) = self.tag(&ty) else {
+            return false;
+        };
+        let key = self.method_key(&tag, name, &ty);
+        self.funcs.get(&key).is_some_and(|f| f.this.is_some())
+            && self.ensure_checked(&key, Span::default()).is_some()
+            && self.funcs[&key].changes_this
+    }
+
+    /// A receiver its call changes, already checked as an expression, must be a place.
+    fn changed_receiver(&mut self, recv: &Expr, code: Code) {
+        let before = self.diags.len();
+        let (_, err) = self.place(recv);
+        self.diags.truncate(before);
+        if let Some(err) = err {
+            let code = match err {
+                Code::readonly_field | Code::assign_to_captured => err,
+                _ => code,
+            };
+            self.error(code, recv.span);
+        }
+    }
+
+    fn place_path(&mut self, target: &Expr) -> (Ty, Option<Code>) {
         match &target.kind {
             ExprKind::Name(name) => self.place_name(name, target.span),
             ExprKind::This => self.place_name("this", target.span),
             ExprKind::Field(base, name) if self.type_ref(base).is_none() => {
-                let (bt, base_err) = self.place(base);
+                let (bt, base_err) = self.place_path(base);
                 let (bt, base_err) = match self.subst.shallow(&bt) {
-                    Ty::Named(n, mut a) if n == REF && name == "value" => {
+                    Ty::Named(n, mut a) if n == SHARED && name == "value" => {
+                        self.through_shared = true;
                         return (a.remove(0), None);
                     }
-                    Ty::Named(n, mut a) if n == REF => (a.remove(0), None),
+                    Ty::Named(n, mut a) if n == SHARED => {
+                        self.through_shared = true;
+                        (a.remove(0), None)
+                    }
                     bt => (bt, base_err),
                 };
                 match self.subst.shallow(&bt) {
@@ -1786,14 +2024,19 @@ impl Checker<'_> {
                                 let FieldInfo {
                                     ty,
                                     mutable,
-                                    is_ref,
+                                    is_shared,
+                                    boxed,
                                     ..
                                 } = f;
-                                let err = if !mutable {
+                                let err = if boxed {
+                                    self.through_shared = true;
+                                    None
+                                } else if !mutable {
                                     Some(Code::assign_to_let)
                                 } else if f.readonly && !self.inside(&class) {
                                     Some(Code::readonly_field)
-                                } else if is_ref {
+                                } else if is_shared {
+                                    self.through_shared = true;
                                     None
                                 } else {
                                     base_err
@@ -1813,9 +2056,12 @@ impl Checker<'_> {
                 }
             }
             ExprKind::Index(list, index) => {
-                let (lt, base_err) = self.place(list);
+                let (lt, base_err) = self.place_path(list);
                 let (lt, base_err) = match self.subst.shallow(&lt) {
-                    Ty::Named(n, mut a) if n == REF => (a.remove(0), None),
+                    Ty::Named(n, mut a) if n == SHARED => {
+                        self.through_shared = true;
+                        (a.remove(0), None)
+                    }
                     lt => (lt, base_err),
                 };
                 let (key, value) = match self.subst.shallow(&lt) {
@@ -1856,7 +2102,8 @@ impl Checker<'_> {
         Some(FieldInfo {
             ty,
             mutable: c.mutable[i],
-            is_ref: c.is_ref,
+            is_shared: c.is_shared,
+            boxed: c.fields[i].sharing == Sharing::Field,
             private: c.private[i],
             readonly: c.readonly[i],
         })
@@ -1942,7 +2189,7 @@ impl Checker<'_> {
         }
     }
 
-    /// Whether `==` can't compare `ty`: it holds a `ref class`, interface or `T` that isn't `Eq`.
+    /// Whether `==` can't compare `ty`: it holds a `shared class`, interface or `T` that isn't `Eq`.
     fn lacks_eq(&mut self, ty: &Ty, seen: &mut HashSet<String>) -> bool {
         let ty = self.subst.shallow(ty);
         match &ty {
@@ -1952,11 +2199,11 @@ impl Checker<'_> {
             Ty::Named(name, args) if name == MAP || name == SET => {
                 args.iter().any(|a| self.lacks_eq(a, seen))
             }
-            Ty::Named(name, _) if name == REF => true,
+            Ty::Named(name, _) if name == SHARED => true,
             Ty::Func(..) => true,
             Ty::Record(_, fields) => fields.iter().any(|f| self.lacks_eq(f, seen)),
             Ty::Named(name, args) if seen.insert(Show(&self.resolve(&ty)).to_string()) => {
-                if self.is_ref_class(&ty) && !self.implements(&ty, &Ty::named(EQ)) {
+                if self.is_shared_class(&ty) && !self.implements(&ty, &Ty::named(EQ)) {
                     return true;
                 }
                 let fields = self.field_types(name, args);
@@ -1996,8 +2243,15 @@ impl Checker<'_> {
                 None => false,
             },
             Ty::Record(_, fields) => fields.iter().all(|f| self.is_key(f, seen)),
-            Ty::Named(name, _) if name == MAP || name == SET || name == REF => false,
-            Ty::Named(..) if self.is_interface(&ty) || self.is_ref_class(&ty) => false,
+            Ty::Named(name, _) if name == MAP || name == SET || name == SHARED => false,
+            Ty::Named(..) if self.is_interface(&ty) || self.is_shared_class(&ty) => false,
+            Ty::Named(name, _)
+                if self
+                    .class(name)
+                    .is_some_and(|c| c.fields.iter().any(|f| f.sharing == Sharing::Field)) =>
+            {
+                false
+            }
             Ty::Named(name, args) => {
                 if !seen.insert(Show(&self.resolve(&ty)).to_string()) {
                     return true;
@@ -2033,14 +2287,14 @@ impl Checker<'_> {
 
     fn unref(&self, ty: &Ty) -> Ty {
         match self.subst.shallow(ty) {
-            Ty::Named(n, a) if n == REF => self.subst.shallow(&a[0]),
+            Ty::Named(n, a) if n == SHARED => self.subst.shallow(&a[0]),
             t => t,
         }
     }
 
-    fn is_ref_class(&self, ty: &Ty) -> bool {
+    fn is_shared_class(&self, ty: &Ty) -> bool {
         matches!(self.subst.shallow(ty), Ty::Named(n, _)
-            if matches!(self.types.get(&n), Some(TypeDef::Class(c)) if c.is_ref))
+            if matches!(self.types.get(&n), Some(TypeDef::Class(c)) if c.is_shared))
     }
 
     fn bare_variant(&self, e: &Expr) -> bool {
@@ -2111,7 +2365,7 @@ impl Checker<'_> {
                     self.error(Code::slash_for_int, span);
                     return;
                 }
-                if matches!(self.subst.shallow(&ty), Ty::Named(n, _) if n == REF) {
+                if matches!(self.subst.shallow(&ty), Ty::Named(n, _) if n == SHARED) {
                     return;
                 }
                 result
@@ -2124,6 +2378,7 @@ impl Checker<'_> {
         self.scopes.push(HashMap::new());
         let mut last = Ty::Void;
         for (i, stmt) in stmts.iter().enumerate() {
+            self.ref_binding(stmt, &stmts[i + 1..]);
             let is_last = i + 1 == stmts.len();
             last = match (stmt, is_last) {
                 (Stmt::Expr(e), true) => self.expr(e, expected),
@@ -2140,6 +2395,7 @@ impl Checker<'_> {
                 last = Ty::Void;
             }
         }
+        self.changed_copies(stmts);
         self.finish_scope();
         last
     }
@@ -2149,9 +2405,11 @@ impl Checker<'_> {
         match &expr.kind {
             ExprKind::Block(stmts) => {
                 self.scopes.push(HashMap::new());
-                for stmt in stmts {
+                for (i, stmt) in stmts.iter().enumerate() {
+                    self.ref_binding(stmt, &stmts[i + 1..]);
                     self.stmt(stmt);
                 }
+                self.changed_copies(stmts);
                 self.finish_scope();
             }
             ExprKind::If(cond, then, otherwise) => {
@@ -2170,6 +2428,7 @@ impl Checker<'_> {
 
     pub fn expr(&mut self, expr: &Expr, expected: Option<&Ty>) -> Ty {
         match &expr.kind {
+            ExprKind::SharedOf(x) => self.shared_of(x),
             ExprKind::Int(_) => Ty::Int,
             ExprKind::Float(_) => Ty::Float,
             ExprKind::Bool(_) => Ty::Bool,
@@ -2193,7 +2452,22 @@ impl Checker<'_> {
                 }
                 None => self.error(Code::this_outside_method, expr.span),
             },
-            ExprKind::Field(base, name) => self.field_expr(expr.id, base, name, expr.span),
+            ExprKind::Field(base, name) => {
+                let before = self.diags.len();
+                let ty = self.field_expr(expr.id, base, name, expr.span);
+                let shared_name = name == "value" && self.is_boxed(base);
+                let missing = (self.diags[before..].iter_mut())
+                    .find(|d| d.code == Code::unknown_field && d.span == expr.span);
+                if let Some(d) = missing.filter(|_| shared_name) {
+                    d.detail = Some("[it's shared: it already reads as its value]".to_string());
+                    d.fix = vec![Edit {
+                        span: Span::new(base.span.end, expr.span.end),
+                        text: String::new(),
+                    }];
+                    d.quick_fix_only = true;
+                }
+                ty
+            }
             ExprKind::Match(scrutinee, arms) => {
                 self.match_expr(expr, scrutinee, arms, expected, true)
             }
@@ -2257,12 +2531,14 @@ impl Checker<'_> {
             ExprKind::Unary(op, operand) => self.unary(*op, operand, expr.span),
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expr.span),
             ExprKind::Call(callee, args) => {
+                let ty = self.call(expr.id, callee, args, expr.span, expected);
                 self.check_overlap(None, args);
-                self.call(expr.id, callee, args, expr.span, expected)
+                ty
             }
             ExprKind::Method(recv, name, args) => {
+                let ty = self.method(expr.id, recv, name, args, expr.span);
                 self.check_overlap(Some(recv), args);
-                self.method(expr.id, recv, name, args, expr.span)
+                ty
             }
             ExprKind::Index(list, index) => self.index(expr.id, list, index, expr.span),
             ExprKind::Lambda(params, ret, body) => {
@@ -2415,7 +2691,6 @@ impl Checker<'_> {
 
     fn record_literal(&mut self, expr: &Expr, args: &[Arg], expected: Option<&Ty>) -> Ty {
         if let Some(ExprKind::Spread(inner)) = args.first().map(|a| &a.value.kind) {
-            self.no_ref_args(&args[1..]);
             return self.record_copy(inner, &args[1..]);
         }
         let expected = expected.map(|e| match self.subst.shallow(e) {
@@ -2427,7 +2702,6 @@ impl Checker<'_> {
         {
             return self.construct(expr.id, class, args, expr.span);
         }
-        self.no_ref_args(args);
         if args.is_empty() {
             return self.error(Code::type_needed, expr.span);
         }
@@ -2541,8 +2815,8 @@ impl Checker<'_> {
         }
         let bt = self.expr(base, None);
         let bt = match self.subst.shallow(&bt) {
-            Ty::Named(n, mut a) if n == REF && name == "value" => return a.remove(0),
-            Ty::Named(n, mut a) if n == REF => a.remove(0),
+            Ty::Named(n, mut a) if n == SHARED && name == "value" => return a.remove(0),
+            Ty::Named(n, mut a) if n == SHARED => a.remove(0),
             bt => bt,
         };
         match self.subst.shallow(&bt) {
@@ -2553,7 +2827,12 @@ impl Checker<'_> {
                 }
             }
             Ty::Named(class, args) => match self.visible_field(&class, &args, name, span) {
-                Some(f) => f.ty,
+                Some(f) => {
+                    if f.boxed {
+                        self.boxed_fields.insert(id);
+                    }
+                    f.ty
+                }
                 None => self.error(Code::unknown_field, span),
             },
             Ty::Record(names, fields) => match record_field(&names, &fields, name) {
@@ -2576,7 +2855,7 @@ impl Checker<'_> {
             let Some(sig) = self.ensure_checked(name, span) else {
                 return Ty::Error;
             };
-            if sig.params.iter().any(|p| p.is_ref) {
+            if (sig.params.iter()).any(|p| p.is_ref || p.sharing != Sharing::No) {
                 return self.error(Code::ref_func_as_value, span);
             }
             let map = self.instantiate(name, span);
@@ -2763,16 +3042,16 @@ impl Checker<'_> {
             return Ty::Error;
         }
         let inner = |t: &Ty| match t {
-            Ty::Named(n, args) if n == REF => Some(args[0].clone()),
+            Ty::Named(n, args) if n == SHARED => Some(args[0].clone()),
             _ => None,
         };
         match (inner(&a), inner(&b)) {
             (Some(t), None) => {
-                self.ref_value_hint(lhs);
+                self.ref_value_hint(lhs, true);
                 a = self.subst.shallow(&t);
             }
             (None, Some(t)) => {
-                self.ref_value_hint(rhs);
+                self.ref_value_hint(rhs, true);
                 b = self.subst.shallow(&t);
             }
             _ => {}
@@ -2849,7 +3128,7 @@ impl Checker<'_> {
         let mut known = true;
         for (i, arg) in args.iter().enumerate() {
             let ExprKind::Spread(inner) = &arg.value.kind else {
-                out.push((arg.name.clone(), ArgSource::Expr(&arg.value, arg.is_ref)));
+                out.push((arg.name.clone(), ArgSource::Expr(&arg.value)));
                 continue;
             };
             let t = self.expr(inner, None);
@@ -2873,7 +3152,7 @@ impl Checker<'_> {
         }
         if !known {
             for (_, source) in out {
-                if let ArgSource::Expr(e, _) = source {
+                if let ArgSource::Expr(e) = source {
                     self.expr(e, None);
                 }
             }
@@ -2882,36 +3161,48 @@ impl Checker<'_> {
         Some(out)
     }
 
-    fn check_arg(&mut self, source: &ArgSource, param: &Ty, ref_param: bool) {
-        match source {
-            ArgSource::Expr(e, true) if ref_param => {
-                let (t, err) = self.place(e);
-                if let Some(code) = err {
-                    self.error(code, e.span);
-                } else if !self.subst.unify(&t, param) {
+    fn check_arg(&mut self, source: &ArgSource, param: &Ty, ref_param: bool, sharing: Sharing) {
+        if sharing != Sharing::No
+            && let ArgSource::Expr(e) = source
+        {
+            let t = self.expr(e, Some(param));
+            let boxed = Ty::Named(SHARED.to_string(), vec![param.clone()]);
+            if self.is_boxed(e) {
+                self.info.shared_args.insert(e.id, e.span);
+                if !self.subst.unify(&t, param) {
                     let code = self.mismatch(&t, param, Code::type_mismatch);
                     self.error(code, e.span);
                 }
+            } else if matches!(self.subst.shallow(&t), Ty::Named(n, _) if n == SHARED) {
+                self.expect(e, &t, &boxed);
+            } else if sharing == Sharing::Field {
+                self.expect(e, &t, param);
+            } else {
+                self.error(Code::missing_shared, e.span);
             }
-            ArgSource::Expr(e, is_ref) => {
-                if ref_param {
-                    let mut d = Diagnostic::error(Code::missing_ref, e.span);
-                    if ref_path(e).is_some() {
-                        d = d.with_quick_fix(vec![Edit {
-                            span: Span::new(e.span.start, e.span.start),
-                            text: "ref ".to_string(),
-                        }]);
+            return;
+        }
+        match source {
+            ArgSource::Expr(e) if ref_param => {
+                self.info.ref_args.insert(e.id, e.span);
+                let (t, err) = self.place(e);
+                let fits = self.subst.unify(&t, param);
+                let boxed = !fits
+                    && matches!(self.subst.shallow(&t), Ty::Named(n, a)
+                        if n == SHARED && self.subst.unify(&a[0], param));
+                match err {
+                    _ if boxed => self.ref_value_hint(e, false),
+                    Some(code) => {
+                        self.error(code, e.span);
                     }
-                    self.diags.push(d);
-                    if let Some((root, _)) = ref_path(e)
-                        && let Some(var) =
-                            self.scopes.iter_mut().rev().find_map(|s| s.get_mut(root))
-                    {
-                        var.reassigned = true;
+                    None if !fits => {
+                        let code = self.mismatch(&t, param, Code::type_mismatch);
+                        self.error(code, e.span);
                     }
-                } else if *is_ref {
-                    self.error(Code::ref_not_allowed, e.span);
+                    None => {}
                 }
+            }
+            ArgSource::Expr(e) => {
                 let t = self.expr(e, Some(param));
                 self.expect(e, &t, param);
             }
@@ -2925,14 +3216,8 @@ impl Checker<'_> {
     }
 
     fn skip_arg(&mut self, source: &ArgSource) {
-        if let ArgSource::Expr(e, _) = source {
+        if let ArgSource::Expr(e) = source {
             self.expr(e, None);
-        }
-    }
-
-    fn no_ref_args(&mut self, args: &[Arg]) {
-        for a in args.iter().filter(|a| a.is_ref) {
-            self.error(Code::ref_not_allowed, a.value.span);
         }
     }
 
@@ -2948,7 +3233,7 @@ impl Checker<'_> {
             return false;
         }
         for ((_, source), param) in sources.iter().zip(params) {
-            self.check_arg(source, param, false);
+            self.check_arg(source, param, false, Sharing::No);
         }
         true
     }
@@ -2966,9 +3251,6 @@ impl Checker<'_> {
         {
             if self.funcs.contains_key(name) {
                 return self.call_named(name, args, span);
-            }
-            if matches!(name.as_str(), "print" | "Some" | REF | "same") {
-                self.no_ref_args(args);
             }
             match name.as_str() {
                 "print" => {
@@ -3001,20 +3283,20 @@ impl Checker<'_> {
                     self.args_of(args, span, &[Ty::list(item.clone())]);
                     return Ty::Named(SET.to_string(), vec![item]);
                 }
-                REF => {
+                SHARED => {
                     if args.len() != 1 {
                         return self.error(Code::wrong_arguments, span);
                     }
                     let inner = match expected.map(|e| self.subst.shallow(e)) {
-                        Some(Ty::Named(n, mut a)) if n == REF => a.remove(0),
+                        Some(Ty::Named(n, mut a)) if n == SHARED => a.remove(0),
                         _ => self.subst.fresh(),
                     };
                     let t = self.expr(&args[0].value, Some(&inner));
                     self.expect(&args[0].value, &t, &inner);
-                    if self.is_ref_class(&inner) {
-                        self.warn(Code::ref_of_ref_class, span);
+                    if self.is_shared_class(&inner) {
+                        self.warn(Code::shared_wraps_shared_class, span);
                     }
-                    return Ty::Named(REF.to_string(), vec![inner]);
+                    return Ty::Named(SHARED.to_string(), vec![inner]);
                 }
                 "same" => {
                     if args.len() != 2 {
@@ -3022,8 +3304,8 @@ impl Checker<'_> {
                     }
                     let a = self.expr(&args[0].value, None);
                     let b = self.expr(&args[1].value, None);
-                    let shared = self.is_ref_class(&a)
-                        || matches!(self.subst.shallow(&a), Ty::Named(n, _) if n == REF);
+                    let shared = self.is_shared_class(&a)
+                        || matches!(self.subst.shallow(&a), Ty::Named(n, _) if n == SHARED);
                     if !shared || !self.subst.unify(&a, &b) {
                         self.error(Code::type_mismatch, span);
                     }
@@ -3180,10 +3462,10 @@ impl Checker<'_> {
         for (k, source) in positional.into_iter().enumerate() {
             if let Some(&i) = fixed.get(k) {
                 filled[i] = true;
-                self.check_arg(source, &params[i].ty, params[i].is_ref);
+                self.check_arg(source, &params[i].ty, params[i].is_ref, params[i].sharing);
             } else if let Some(r) = rest {
                 filled[r] = true;
-                self.check_arg(source, &params[r].ty, false);
+                self.check_arg(source, &params[r].ty, false, Sharing::No);
             } else {
                 self.skip_arg(source);
                 ok = false;
@@ -3199,7 +3481,7 @@ impl Checker<'_> {
             {
                 Some(i) if !filled[i] => {
                     filled[i] = true;
-                    self.check_arg(source, &params[i].ty, params[i].is_ref);
+                    self.check_arg(source, &params[i].ty, params[i].is_ref, params[i].sharing);
                 }
                 _ => {
                     self.skip_arg(source);
@@ -3231,22 +3513,25 @@ impl Checker<'_> {
             return self.unknown_method(args, span);
         }
         let recv_ty = if MUTATING.contains(&name) {
-            let (t, err) = self.place(recv);
-            if let Some(code) = err
-                && self.is_collection(&t)
-            {
-                let code = if matches!(code, Code::readonly_field | Code::assign_to_captured) {
-                    code
-                } else {
-                    Code::change_let_collection
-                };
-                self.error(code, recv.span);
+            // Typed as a write path (`grid[i]` is a list, not a maybe), but only a collection's
+            // method changes it.
+            let (t, _) = self.place_path(recv);
+            (self.through_shared, self.place_root) = (false, None);
+            if self.is_collection(&t) {
+                self.changed_receiver(recv, Code::change_let_collection);
             }
             t
         } else {
             self.expr(recv, None)
         };
-        let recv_ty = self.unref(&recv_ty);
+        let boxed = matches!(self.subst.shallow(&recv_ty), Ty::Named(n, _) if n == SHARED);
+        let mut recv_ty = self.unref(&recv_ty);
+        // A method that changes an element is a write through the index, as `xs[i].n = 1` is.
+        if let (ExprKind::Index(..), Ty::Maybe(inner)) = (&recv.kind, self.subst.shallow(&recv_ty))
+            && self.changing_method(&inner, name)
+        {
+            recv_ty = self.subst.shallow(&inner);
+        }
         if self.is_interface(&recv_ty) || matches!(recv_ty, Ty::Param(_)) {
             let Some(sig) = self.interface_method(&recv_ty, name) else {
                 return self.unknown_method(args, span);
@@ -3262,7 +3547,19 @@ impl Checker<'_> {
             if self.funcs.get(&key).is_some_and(|f| f.this.is_some()) {
                 self.check_private_method(&key, &tag, span);
                 self.info.resolved.insert(id, Resolved::Method(key.clone()));
-                return self.call_entry(&key, Some(&recv_ty), args, span);
+                let ret = self.call_entry(&key, Some(&recv_ty), args, span);
+                let f = &self.funcs[&key];
+                if f.changes_this {
+                    if !boxed {
+                        self.changed_receiver(recv, Code::changes_let);
+                    }
+                } else if f.state == FuncState::InProgress
+                    && let Some(caller) = &self.current_method
+                    && ref_path(recv).is_some_and(|(root, _)| root == "this")
+                {
+                    self.pending_changes.push((caller.clone(), key));
+                }
+                return ret;
             }
         }
         match recv_ty {
@@ -3587,8 +3884,11 @@ impl Checker<'_> {
         let is_map = self
             .lookup(m)
             .is_some_and(|v| matches!(self.subst.shallow(&v.ty), Ty::Named(n, _) if n == MAP));
-        (method == "contains" && is_map && !mutates(then, m) && !mutates(then, k))
-            .then(|| (m.clone(), k.clone(), self.scopes.len() - 1))
+        (method == "contains"
+            && is_map
+            && !mutates(then, m, &self.ref_callees)
+            && !mutates(then, k, &self.ref_callees))
+        .then(|| (m.clone(), k.clone(), self.scopes.len() - 1))
     }
 
     fn match_expr(
@@ -4143,42 +4443,184 @@ impl Checker<'_> {
     }
 
     fn check_overlap(&mut self, recv: Option<&Expr>, args: &[Arg]) {
-        let refs: Vec<(&Expr, RefPath)> = args
+        let (refs, plain): (Vec<&Arg>, Vec<&Arg>) = args
             .iter()
-            .filter(|a| a.is_ref)
+            .partition(|a| self.info.ref_args.contains_key(&a.value.id));
+        let refs: Vec<(&Expr, RefPath)> = refs
+            .into_iter()
             .filter_map(|a| Some((&a.value, ref_path(&a.value)?)))
             .collect();
         for (i, (e, path)) in refs.iter().enumerate() {
             let mut readers: Vec<&Expr> = recv.into_iter().collect();
-            readers.extend(args.iter().filter(|a| !a.is_ref).map(|a| &a.value));
+            readers.extend(plain.iter().map(|a| &a.value));
             for (j, (other, _)) in refs.iter().enumerate() {
                 if j != i {
                     index_exprs(other, &mut readers);
                 }
             }
-            let reads = readers.iter().any(|r| {
-                let mut bases = Vec::new();
-                find_expr(r, &mut |x, _| {
-                    if bases.contains(&(x as *const Expr)) {
-                        return false;
-                    }
-                    let Some(p) = ref_path(x) else {
-                        return false;
-                    };
-                    path_bases(x, &mut bases);
-                    overlaps(&p, path)
-                })
-                .is_some()
-            });
+            let reads = readers.iter().any(|r| uses_path(r, path).is_some());
             if reads || refs[..i].iter().any(|(_, p)| overlaps(p, path)) {
                 self.error(Code::overlapping_ref, e.span);
             }
         }
     }
 
+    /// Warns about a `var` copied from a field, index or map lookup whose last change is never
+    /// read. Reads in a loop or branch with the change count as after it, and a var a lambda
+    /// captures never warns.
+    fn changed_copies(&mut self, stmts: &[Stmt]) {
+        for (i, stmt) in stmts.iter().enumerate() {
+            let Stmt::Let {
+                keyword,
+                name,
+                is_var: true,
+                is_shared: false,
+                ty,
+                value,
+                ..
+            } = stmt
+            else {
+                continue;
+            };
+            let Some(copied) = copied_path(value) else {
+                continue;
+            };
+            let shared = self
+                .scopes
+                .last()
+                .and_then(|s| s.get(name))
+                .is_none_or(|v| {
+                    let t = self.subst.shallow(&v.ty);
+                    self.is_shared_class(&t) || matches!(t, Ty::Named(n, _) if n == SHARED)
+                });
+            if shared {
+                continue;
+            }
+            let mut unread = None;
+            for s in &stmts[i + 1..] {
+                let uses = self.copy_uses(name, s);
+                if uses.captured {
+                    unread = None;
+                    break;
+                }
+                unread = match uses.change {
+                    Some(_) if uses.read && uses.branches => None,
+                    Some(change) => Some(change),
+                    None if uses.read => None,
+                    None => unread,
+                };
+            }
+            let Some(change) = unread else {
+                continue;
+            };
+            let mut d = Diagnostic::warning(Code::changed_copy, change);
+            let before = self.diags.len();
+            let (_, err, _, _) = self.place_parts(copied);
+            self.diags.truncate(before);
+            // In a method, a `ref` binding to a path through `this` is fine: the method then
+            // changes `this`.
+            let bindable = matches!(err, None | Some(Code::changes_let));
+            if bindable && ty.is_none() && std::ptr::eq(copied, value) {
+                d = d.with_quick_fix(vec![Edit {
+                    span: *keyword,
+                    text: "ref".to_string(),
+                }]);
+            }
+            self.diags.push(d);
+        }
+    }
+
+    /// How statement `s` uses the var `name`: its last change's span (a write into it, or a call
+    /// that changes it), whether it reads it otherwise, and whether it can run its parts in
+    /// another order (a loop or branch).
+    fn copy_uses(&self, name: &str, s: &Stmt) -> CopyUses {
+        let mut changed_roots: Vec<*const Expr> = Vec::new();
+        let mut uses = CopyUses::default();
+        let exprs = stmt_exprs(s);
+        if let Stmt::Assign { target, .. } = s
+            && let Some(root) = steps_root(target, name)
+        {
+            changed_roots.push(root);
+            uses.change = Some(target.span);
+        }
+        for e in &exprs {
+            find_expr(e, &mut |x, assigned| {
+                match &x.kind {
+                    ExprKind::Method(recv, m, _) if self.changes_receiver(x.id, m) => {
+                        if let Some(root) = path_root(recv, name) {
+                            changed_roots.push(root);
+                            uses.change = Some(x.span);
+                        }
+                    }
+                    ExprKind::Lambda(_, _, body) => {
+                        uses.captured |= find_expr(body, &mut |y, _| is_name(y, name)).is_some();
+                    }
+                    ExprKind::If(..)
+                    | ExprKind::Match(..)
+                    | ExprKind::While(..)
+                    | ExprKind::Loop(_)
+                    | ExprKind::For(..) => uses.branches = true,
+                    _ if assigned => {
+                        if let Some(root) = steps_root(x, name) {
+                            changed_roots.push(root);
+                            uses.change = Some(x.span);
+                        }
+                    }
+                    _ => {}
+                }
+                false
+            });
+        }
+        for e in &exprs {
+            find_expr(e, &mut |x, _| {
+                uses.read |= is_name(x, name) && !changed_roots.contains(&(x as *const Expr));
+                false
+            });
+        }
+        uses
+    }
+
+    fn changes_receiver(&self, id: NodeId, method: &str) -> bool {
+        match self.info.resolved.get(&id) {
+            Some(Resolved::Method(key)) => self.funcs.get(key).is_some_and(|f| f.changes_this),
+            _ => MUTATING.contains(&method),
+        }
+    }
+
+    /// `ref name = target` lasts until its last use. Until then, the rest of its block reaches
+    /// the target only through `name`, and no lambda captures `name`.
+    fn ref_binding(&mut self, stmt: &Stmt, rest: &[Stmt]) {
+        let Stmt::RefLet { name, target, .. } = stmt else {
+            return;
+        };
+        let live = ref_end(name, rest).map_or(0, |k| k + 1);
+        self.info.ref_ends.insert(target.id, live);
+        let Some(path) = ref_path(target) else {
+            return;
+        };
+        for e in rest[..live].iter().flat_map(stmt_exprs) {
+            if let Some(hit) = uses_path(e, &path) {
+                self.error(Code::ref_binding_overlap, hit.span);
+            }
+            let captures = find_expr(e, &mut |x, _| {
+                let ExprKind::Lambda(_, _, body) = &x.kind else {
+                    return false;
+                };
+                find_expr(
+                    body,
+                    &mut |y, _| matches!(&y.kind, ExprKind::Name(n) if n == name),
+                )
+                .is_some()
+            });
+            if let Some(hit) = captures {
+                self.error(Code::ref_binding_captured, hit.span);
+            }
+        }
+    }
+
     fn for_ref(&mut self, id: NodeId, pattern: &Pattern, iter: &Expr, body: &Expr) -> Ty {
         let (t, err) = self.place(iter);
-        let shared = matches!(self.subst.shallow(&t), Ty::Named(n, _) if n == REF);
+        let shared = matches!(self.subst.shallow(&t), Ty::Named(n, _) if n == SHARED);
         if let Some(code) = err.filter(|_| !shared) {
             self.error(code, iter.span);
         }
@@ -4190,17 +4632,26 @@ impl Checker<'_> {
         let PatternKind::Name(name) = &pattern.kind else {
             return self.error(Code::unexpected_token, pattern.span);
         };
-        if let Some(path) = ref_path(iter)
-            && let Some(hit) = changes(body, &|e| ref_path(e).is_some_and(|p| overlaps(&p, &path)))
-        {
-            self.error(Code::changed_in_for_ref, hit.span);
-        }
         self.push_bindings(vec![(name.clone(), pattern.span, elem, true)]);
         if let Some(var) = self.scopes.last_mut().and_then(|s| s.get_mut(name)) {
             var.reassigned = true;
         }
         let ty = self.valued_loop(id, body);
         self.finish_scope();
+        // After the body, so its calls are resolved.
+        let changed = |call: &Expr, arg: Option<&Expr>| match (arg, &call.kind) {
+            (Some(a), _) => self.info.ref_args.contains_key(&a.id),
+            (None, ExprKind::Method(_, m, _)) => self.changes_receiver(call.id, m),
+            (None, _) => false,
+        };
+        let hit = ref_path(iter).and_then(|path| {
+            changes(body, &changed, &|e| {
+                ref_path(e).is_some_and(|p| overlaps(&p, &path))
+            })
+        });
+        if let Some(hit) = hit {
+            self.error(Code::changed_in_for_ref, hit.span);
+        }
         ty
     }
 
@@ -4219,7 +4670,7 @@ impl Checker<'_> {
         self.report_missing(vec![vec![Cell::Pat(pattern)]], &elem, pattern.span);
         let narrowed_list = match &pattern.kind {
             PatternKind::Name(name) => narrowing_list(iter)
-                .filter(|list| !mutates(body, list))
+                .filter(|list| !mutates(body, list, &self.ref_callees))
                 .map(|list| (list, name.clone(), self.scopes.len())),
             _ => None,
         };
@@ -4265,19 +4716,41 @@ fn narrowing_list(iter: &Expr) -> Option<String> {
     }
 }
 
-fn mutates(expr: &Expr, list: &str) -> bool {
-    changes(expr, &|e| matches!(&e.kind, ExprKind::Name(n) if n == list)).is_some()
+/// Runs before `expr` is checked, so calls are matched by name only: any argument to a function
+/// or method with a `ref` parameter counts as changed.
+fn mutates(expr: &Expr, list: &str, ref_callees: &HashSet<String>) -> bool {
+    let changed = |call: &Expr, arg: Option<&Expr>| match (arg, &call.kind) {
+        (Some(_), ExprKind::Method(_, m, _)) => ref_callees.contains(m),
+        (Some(_), ExprKind::Call(f, _)) => {
+            matches!(&f.kind, ExprKind::Name(n) if ref_callees.contains(n))
+        }
+        (None, ExprKind::Method(_, m, _)) => MUTATING.contains(&m.as_str()),
+        _ => false,
+    };
+    changes(
+        expr,
+        &changed,
+        &|e| matches!(&e.kind, ExprKind::Name(n) if n == list),
+    )
+    .is_some()
 }
 
-fn changes<'a>(expr: &'a Expr, is_target: &dyn Fn(&Expr) -> bool) -> Option<&'a Expr> {
+/// `changed(call, Some(arg))` says whether a call changes that argument, and
+/// `changed(call, None)` whether it changes its receiver.
+fn changes<'a>(
+    expr: &'a Expr,
+    changed: &dyn Fn(&Expr, Option<&Expr>) -> bool,
+    is_target: &dyn Fn(&Expr) -> bool,
+) -> Option<&'a Expr> {
     find_expr(expr, &mut |e, assigned| {
+        let passes =
+            |args: &[Arg]| (args.iter()).any(|a| is_target(&a.value) && changed(e, Some(&a.value)));
         (assigned && is_target(e))
             || match &e.kind {
-                ExprKind::Method(recv, m, args) => {
-                    (is_target(recv) && MUTATING.contains(&m.as_str()))
-                        || args.iter().any(|a| a.is_ref && is_target(&a.value))
+                ExprKind::Method(recv, _, args) => {
+                    (is_target(recv) && changed(e, None)) || passes(args)
                 }
-                ExprKind::Call(_, args) => args.iter().any(|a| a.is_ref && is_target(&a.value)),
+                ExprKind::Call(_, args) => passes(args),
                 ExprKind::For(_, iter, _, true) => is_target(iter),
                 _ => false,
             }
@@ -4306,6 +4779,7 @@ fn find_expr<'a>(e: &'a Expr, hit: &mut dyn FnMut(&Expr, bool) -> bool) -> Optio
                         kids.push(value);
                     }
                     Stmt::Let { value, .. } | Stmt::LetPattern { value, .. } => kids.push(value),
+                    Stmt::RefLet { target, .. } => kids.push(target),
                     Stmt::Expr(x) => kids.push(x),
                     _ => {}
                 }
@@ -4326,6 +4800,7 @@ fn find_expr<'a>(e: &'a Expr, hit: &mut dyn FnMut(&Expr, bool) -> bool) -> Optio
         | ExprKind::Loop(x)
         | ExprKind::Field(x, _)
         | ExprKind::Is(x, _)
+        | ExprKind::SharedOf(x)
         | ExprKind::Spread(x) => kids.push(x),
         ExprKind::Lambda(_, _, x) => kids.push(x),
         ExprKind::Match(subject, arms) => {
@@ -4370,6 +4845,101 @@ fn ref_path(e: &Expr) -> Option<RefPath<'_>> {
             Some((root, steps))
         }
         _ => None,
+    }
+}
+
+/// The first path in `e` that overlaps `path`, not counting the shorter paths inside a path.
+fn uses_path<'a>(e: &'a Expr, path: &RefPath) -> Option<&'a Expr> {
+    let mut bases = Vec::new();
+    find_expr(e, &mut |x, _| {
+        if bases.contains(&(x as *const Expr)) {
+            return false;
+        }
+        let Some(p) = ref_path(x) else {
+            return false;
+        };
+        path_bases(x, &mut bases);
+        overlaps(&p, path)
+    })
+}
+
+/// The index in `rest` of the last statement that uses `name`, counting uses of the `ref`
+/// bindings made from it, which write back into it.
+fn ref_end(name: &str, rest: &[Stmt]) -> Option<usize> {
+    let mut end = None;
+    for (j, s) in rest.iter().enumerate() {
+        let mentions = |e: &Expr| {
+            find_expr(
+                e,
+                &mut |x, _| matches!(&x.kind, ExprKind::Name(n) if n == name),
+            )
+            .is_some()
+        };
+        if stmt_exprs(s).into_iter().any(mentions) {
+            end = Some(j);
+        }
+        if let Stmt::RefLet {
+            name: inner,
+            target,
+            ..
+        } = s
+            && ref_path(target).is_some_and(|(root, _)| root == name)
+            && let Some(k) = ref_end(inner, &rest[j + 1..])
+        {
+            end = Some(j + 1 + k);
+        }
+    }
+    end
+}
+
+#[derive(Default)]
+struct CopyUses {
+    change: Option<Span>,
+    read: bool,
+    branches: bool,
+    captured: bool,
+}
+
+/// The field, index or map lookup `e` copies, also through `??`, `try` and `.orPanic`.
+fn copied_path(e: &Expr) -> Option<&Expr> {
+    match &e.kind {
+        ExprKind::Field(..) | ExprKind::Index(..) if ref_path(e).is_some() => Some(e),
+        ExprKind::Binary(BinOp::Coalesce, x, _) | ExprKind::Unary(UnOp::Try, x) => copied_path(x),
+        ExprKind::Method(x, m, _) if m == "orPanic" => copied_path(x),
+        _ => None,
+    }
+}
+
+fn is_name(e: &Expr, name: &str) -> bool {
+    matches!(&e.kind, ExprKind::Name(n) if n == name)
+}
+
+/// The `name` a path starts from, if `e` is a path rooted in it.
+fn path_root<'a>(e: &'a Expr, name: &str) -> Option<&'a Expr> {
+    match &e.kind {
+        ExprKind::Field(base, _) | ExprKind::Index(base, _) => path_root(base, name),
+        _ => is_name(e, name).then_some(e),
+    }
+}
+
+/// Like `path_root`, for a path with at least one field or index after the name.
+fn steps_root<'a>(e: &'a Expr, name: &str) -> Option<&'a Expr> {
+    match &e.kind {
+        ExprKind::Field(base, _) | ExprKind::Index(base, _) => path_root(base, name),
+        _ => None,
+    }
+}
+
+fn stmt_exprs(s: &Stmt) -> Vec<&Expr> {
+    match s {
+        Stmt::Assign { target, value, .. } => vec![target, value],
+        Stmt::Let { value, .. } => vec![value],
+        Stmt::LetPattern {
+            value, otherwise, ..
+        } => std::iter::once(value).chain(otherwise).collect(),
+        Stmt::RefLet { target, .. } => vec![target],
+        Stmt::Expr(e) => vec![e],
+        _ => Vec::new(),
     }
 }
 

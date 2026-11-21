@@ -17,7 +17,7 @@ enum Kind {
 
 class Portal(address: String, label: String? = None)
 
-ref class Counter(count: Int)
+shared class Counter(count: Int)
 
 class Place {
   let title: String
@@ -177,7 +177,7 @@ fn reads_the_hosts_file_not_other_data_in_the_schema_unit() {
 }
 
 #[test]
-fn reads_a_ref_class_like_a_class() {
+fn reads_a_shared_class_like_a_class() {
     #[derive(Deserialize)]
     struct Counter {
         count: i64,

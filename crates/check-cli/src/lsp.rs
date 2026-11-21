@@ -15,13 +15,14 @@ use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
     Notification as _, PublishDiagnostics,
 };
-use lsp_types::request::{CodeActionRequest, Request as _};
+use lsp_types::request::{CodeActionRequest, InlayHintRequest, Request as _};
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOptions, CodeActionOrCommand, CodeActionParams,
     DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, NumberOrString, Position, PublishDiagnosticsParams, Range,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, TextEdit, Uri, WorkspaceEdit,
+    DidOpenTextDocumentParams, InlayHint, InlayHintLabel, InlayHintParams, NumberOrString, OneOf,
+    Position, PublishDiagnosticsParams, Range, ServerCapabilities, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
+    WorkspaceEdit,
 };
 
 use crate::Disk;
@@ -66,6 +67,7 @@ fn serve(conn: &Connection) -> Result<()> {
             }
             .into(),
         ),
+        inlay_hint_provider: Some(OneOf::Left(true)),
         ..Default::default()
     };
     conn.initialize(serde_json::to_value(capabilities)?)?;
@@ -138,13 +140,52 @@ impl Server {
     }
 
     fn request(&self, req: Request) -> Result<Response> {
-        if req.method != CodeActionRequest::METHOD {
-            return Ok(Response::new_err(
+        match req.method.as_str() {
+            CodeActionRequest::METHOD => self.code_actions(req),
+            InlayHintRequest::METHOD => {
+                let p: InlayHintParams = serde_json::from_value(req.params)?;
+                let hints = path_of(&p.text_document.uri)
+                    .map(|path| self.inlay_hints(&path))
+                    .unwrap_or_default();
+                Ok(Response::new_ok(req.id, hints))
+            }
+            _ => Ok(Response::new_err(
                 req.id,
                 ErrorCode::MethodNotFound as i32,
                 req.method,
-            ));
+            )),
         }
+    }
+
+    /// A hint before the body of each method that changes `this`, and before each argument a
+    /// call can change.
+    fn inlay_hints(&self, path: &str) -> Vec<InlayHint> {
+        let (_, checked) = self.check(path);
+        let sources = &checked.sources;
+        let info = &checked.info;
+        let this = info
+            .changes_this
+            .values()
+            .map(|span| (span, "[changes this]"));
+        let args = (info.ref_args.values())
+            .chain(info.shared_args.values())
+            .map(|span| (span, "[changed by the call]"));
+        this.chain(args)
+            .filter(|(span, _)| sources.file(span.start).path == path)
+            .map(|(span, label)| InlayHint {
+                position: range_of(*span, sources).start,
+                label: InlayHintLabel::String(label.to_string()),
+                kind: None,
+                text_edits: None,
+                tooltip: None,
+                padding_left: None,
+                padding_right: Some(true),
+                data: None,
+            })
+            .collect()
+    }
+
+    fn code_actions(&self, req: Request) -> Result<Response> {
         let p: CodeActionParams = serde_json::from_value(req.params)?;
         let only = p.context.only;
         let wants = |kind: &str| {

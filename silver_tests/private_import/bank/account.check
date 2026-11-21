@@ -1,4 +1,4 @@
-ref class Account {
+shared class Account {
   readonly var balance: Int = 0
 }
 
