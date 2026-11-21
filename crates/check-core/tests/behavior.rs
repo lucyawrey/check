@@ -3285,3 +3285,9 @@ fn reading_a_variable_that_might_not_be_set_is_an_error() {
     );
     assert_eq!(first_error("let x: Int\nx = 1"), "top_level_without_value");
 }
+
+#[test]
+fn a_maybe_of_a_maybe_is_written_with_two_question_marks() {
+    let src = "let m: Map<String, Int?> = [\"a\" = None]\nlet x: Int?? = m[\"a\"]\nlet y: List<Int??> = [x]\nfunc f(v: Int??) -> Int?? { v }\nprint(\"{x} {y} {f(None)}\")";
+    assert_eq!(output(src), "Some(None) [Some(None)] None");
+}

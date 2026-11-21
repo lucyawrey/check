@@ -1245,6 +1245,16 @@ impl Parser<'_> {
         }
     }
 
+    /// Whether the token after the next one can't continue an expression, as after `x as? T`.
+    fn type_ends_after_next(&self) -> bool {
+        matches!(
+            self.peek_at(1),
+            Tok::Sym("=" | "," | ")" | ">" | ">>" | "]" | "{" | "}" | "->" | ";")
+                | Tok::Newline
+                | Tok::Eof
+        )
+    }
+
     fn type_expr(&mut self) -> PResult<TypeExpr> {
         let start = self.span();
         let mut ty = if self.eat_kw("func") {
@@ -1301,6 +1311,10 @@ impl Parser<'_> {
         loop {
             if self.eat_sym("?") {
                 ty = TypeExpr::Maybe(Box::new(ty));
+            } else if self.is_sym("??") && self.type_ends_after_next() {
+                // The lexer reads `??` as the operator; a type ending here means two `?`s.
+                self.advance();
+                ty = TypeExpr::Maybe(Box::new(TypeExpr::Maybe(Box::new(ty))));
             } else if self.is_sym("[") && matches!(self.peek_at(1), Tok::Sym("]")) {
                 self.advance();
                 self.advance();
