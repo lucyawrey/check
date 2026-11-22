@@ -679,10 +679,10 @@ fn external_functions_belong_only_in_library_files() {
 }
 
 #[test]
-fn implement_needs_a_class_enum_or_simple_built_in_type() {
+fn implement_needs_a_known_type_with_its_type_arguments() {
     assert_eq!(
         first_error("implement List {\n  func f() { }\n}"),
-        "unknown_name"
+        "wrong_type_arguments"
     );
     assert_eq!(
         first_error("implement Nope {\n  func f() { }\n}"),
@@ -691,6 +691,10 @@ fn implement_needs_a_class_enum_or_simple_built_in_type() {
     assert_eq!(
         output("implement Int {\n  func double() -> Int { this * 2 }\n}\nprint(21.double())"),
         "42"
+    );
+    assert_eq!(
+        output("implement List<T> {\n  func second() -> T? { this[1] }\n}\nprint([1, 2].second())"),
+        "Some(2)"
     );
 }
 
@@ -3608,5 +3612,26 @@ fn a_call_through_a_function_value_that_changes_a_narrowed_global_undoes_the_nar
             "{map}func run(g: func()) {{\n  if m.contains(k) {{\n    g()\n    print(m[k] + 1)\n  }}\n}}"
         )),
         "invalid_operand_types"
+    );
+}
+
+#[test]
+fn an_implement_block_can_bound_or_nest_its_type_parameters() {
+    let has = "implement List<T: Eq> {\n  func has(x: T) -> Bool {\n    for y in this { if y == x { return true } }\n    false\n  }\n}\n";
+    assert_eq!(output(&format!("{has}print([1, 2].has(2))")), "true");
+    assert_eq!(
+        first_error(&format!("{has}let f = func() {{ }}\nprint([f].has(f))")),
+        "unmet_constraint"
+    );
+    let flat = "implement Maybe<Maybe<T>> {\n  func flat() -> T? {\n    match this {\n      Some(inner) => inner\n      None => None\n    }\n  }\n}\n";
+    assert_eq!(
+        output(&format!(
+            "{flat}let x: Int?? = Some(Some(1))\nprint(x.flat())"
+        )),
+        "Some(1)"
+    );
+    assert_eq!(
+        first_error(&format!("{flat}let y: Int? = Some(1)\nprint(y.flat())")),
+        "unknown_method"
     );
 }

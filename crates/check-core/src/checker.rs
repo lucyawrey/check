@@ -670,8 +670,14 @@ impl Checker<'_> {
     }
 
     fn declare_implement(&mut self, i: &ImplementDecl) {
-        let arity = self.generics.get(&i.target).map_or(0, Vec::len);
+        let own = match i.target.as_str() {
+            "List" | SET => vec!["T".to_string()],
+            MAP => vec!["K".to_string(), "V".to_string()],
+            name => self.generics.get(name).cloned().unwrap_or_default(),
+        };
+        let arity = own.len();
         let known = BUILT_IN_TYPES.contains(&i.target.as_str())
+            || ["List", MAP, SET].contains(&i.target.as_str())
             || (self.type_names.contains(&i.target) && !self.interfaces.contains_key(&i.target));
         if !known {
             self.error(Code::unknown_name, i.span);
@@ -684,7 +690,6 @@ impl Checker<'_> {
         // A name in `Box<U>` that isn't a type introduces a parameter, which stands for the
         // type's own (`T`) so every implementation reads alike.
         let saved = (self.bounds.clone(), self.renamed.clone());
-        let own = self.generics.get(&i.target).cloned().unwrap_or_default();
         let mut whole = true;
         for (a, p) in i.target_args.iter().zip(&own) {
             match a {
@@ -696,8 +701,18 @@ impl Checker<'_> {
                     self.renamed.insert(n.clone(), p.clone());
                     self.bounds.insert(p.clone(), Vec::new());
                 }
-                _ => whole = false,
+                _ => {
+                    whole = false;
+                    for n in self.nested_params(a) {
+                        self.bounds.insert(n, Vec::new());
+                    }
+                }
             }
+        }
+        for b in &i.bounds {
+            let name = self.renamed.get(&b.name).cloned().unwrap_or(b.name.clone());
+            let bounds = b.bounds.iter().map(|t| self.type_from(t)).collect();
+            self.bounds.insert(name, bounds);
         }
         let args: Vec<Ty> = i.target_args.iter().map(|a| self.type_from(a)).collect();
         let this = match i.target.as_str() {
@@ -706,6 +721,7 @@ impl Checker<'_> {
             "Float" => Ty::Float,
             "Bool" => Ty::Bool,
             MAYBE => Ty::maybe(args.first().cloned().unwrap_or(Ty::Error)),
+            "List" => Ty::list(args.first().cloned().unwrap_or(Ty::Error)),
             name => Ty::Named(name.to_string(), args.clone()),
         };
         if let Some(iface) = &i.interface {
@@ -720,6 +736,22 @@ impl Checker<'_> {
         }
         self.declare_members(&i.target, this, &i.members);
         (self.bounds, self.renamed) = saved;
+    }
+
+    /// The names inside a nested target argument (`T` in `Maybe<Maybe<T>>`) that aren't types.
+    fn nested_params(&self, t: &TypeExpr) -> Vec<String> {
+        match t {
+            TypeExpr::Name(n, _)
+                if !self.type_names.contains(n) && !BUILT_IN_TYPES.contains(&n.as_str()) =>
+            {
+                vec![n.clone()]
+            }
+            TypeExpr::Generic(_, args, _) => {
+                args.iter().flat_map(|a| self.nested_params(a)).collect()
+            }
+            TypeExpr::Maybe(inner) => self.nested_params(inner),
+            _ => Vec::new(),
+        }
     }
 
     fn declare_enum(&mut self, e: &EnumDecl) {

@@ -421,16 +421,12 @@ impl Resolver<'_> {
                 }
                 // A name in `Box<T>` that isn't a type introduces a parameter.
                 let saved = self.type_params.clone();
-                for a in &mut i.target_args {
-                    match a {
-                        TypeExpr::Name(n, _)
-                            if !BUILT_IN_TYPES.contains(&n.as_str())
-                                && self.lookup(n, true, None).is_none() =>
-                        {
-                            self.type_params.insert(n.clone());
-                        }
-                        _ => self.type_expr(a),
-                    }
+                for a in &i.target_args {
+                    self.introduce_params(a);
+                }
+                self.type_exprs(&mut i.target_args);
+                for b in &mut i.bounds {
+                    self.type_exprs(&mut b.bounds);
                 }
                 // Methods for some type arguments only are keyed by them: `Box<Int>.get`.
                 let specific = i
@@ -479,6 +475,24 @@ impl Resolver<'_> {
             self.type_exprs(&mut p.bounds);
         }
         saved
+    }
+
+    fn introduce_params(&mut self, t: &TypeExpr) {
+        match t {
+            TypeExpr::Name(n, _)
+                if !BUILT_IN_TYPES.contains(&n.as_str())
+                    && self.lookup(n, true, None).is_none() =>
+            {
+                self.type_params.insert(n.clone());
+            }
+            TypeExpr::Generic(_, args, _) => {
+                for a in args {
+                    self.introduce_params(a);
+                }
+            }
+            TypeExpr::Maybe(inner) => self.introduce_params(inner),
+            _ => {}
+        }
     }
 
     fn type_exprs(&mut self, types: &mut [TypeExpr]) {
