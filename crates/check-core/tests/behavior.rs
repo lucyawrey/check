@@ -3213,7 +3213,7 @@ fn a_lambda_cant_change_what_it_captured() {
 #[test]
 fn a_function_that_empties_a_narrowed_list_is_caught_before_it_runs() {
     let src = "var xs = [1, 2, 3]\nfunc clear() { xs = [] }\nfor i in xs.indices() {\n  clear()\n  print(xs[i] * 2)\n}";
-    assert_eq!(first_error(src), "unhandled_maybe");
+    assert_eq!(first_error(src), "invalid_operand_types");
 }
 
 #[test]
@@ -3524,13 +3524,19 @@ fn a_call_that_changes_a_narrowed_global_undoes_the_narrowing() {
         first_error(&format!(
             "{map}if m.contains(k) {{\n  clear()\n  print(m[k] + 1)\n}}"
         )),
-        "unhandled_maybe"
+        "invalid_operand_types"
+    );
+    assert_eq!(
+        output(&format!(
+            "{map}if m.contains(k) {{\n  m[k] += 1\n  let v = m[k]\n  clear()\n  print(v)\n}}"
+        )),
+        "2"
     );
     assert_eq!(
         first_error(&format!(
-            "{map}if m.contains(k) {{\n  m[k] += 1\n  clear()\n}}"
+            "{map}if m.contains(k) {{\n  for _ in 0..2 {{\n    print(m[k])\n    clear()\n  }}\n}}"
         )),
-        "compound_on_missing_index"
+        "unhandled_maybe"
     );
     assert_eq!(
         output(&format!(
@@ -3540,4 +3546,24 @@ fn a_call_that_changes_a_narrowed_global_undoes_the_narrowing() {
     );
     let list = "var xs = [1, 2]\nclass Box {\n  func drop() { xs.pop() }\n}\nlet b = Box()\nfor i in xs.indices() {\n  print(xs[i] + 1)\n  b.drop()\n}";
     assert_eq!(first_error(list), "unhandled_maybe");
+}
+
+#[test]
+fn a_call_through_a_function_value_that_changes_a_narrowed_global_undoes_the_narrowing() {
+    let map = "var m = [\"a\" = 1]\nfunc clear() { m = [\"b\" = 2] }\nfunc apply(g: func()) { g() }\ninterface Wipe { func wipe() }\nclass W: Wipe {\n  func wipe() { clear() }\n}\nlet w: Wipe = W()\nlet k = \"a\"\n";
+    let in_branch =
+        |body: &str| format!("{map}if m.contains(k) {{\n  {body}\n  print(m[k] + 1)\n}}");
+    for call in [
+        "let f = clear\n  f()",
+        "apply(clear)",
+        "apply(func() => clear())",
+        "w.wipe()",
+    ] {
+        assert_eq!(
+            first_error(&in_branch(call)),
+            "invalid_operand_types",
+            "{call}"
+        );
+    }
+    assert_eq!(output(&in_branch("let f = func() => clear()")), "2");
 }

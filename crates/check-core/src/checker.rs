@@ -223,6 +223,7 @@ enum LoopKind {
 }
 
 struct LoopCtx {
+    order: usize,
     kind: LoopKind,
     break_ty: Option<Ty>,
     break_flow: Option<Flow>,
@@ -274,6 +275,9 @@ pub struct Checker<'s> {
     /// Collection and key names whose index can't miss, and the innermost scope they
     /// may come from, so a shadowing name isn't narrowed.
     narrowed: Vec<Narrowing>,
+    order: usize,
+    fn_values: HashMap<Span, HashSet<String>>,
+    lambda_writes: HashMap<NodeId, HashSet<String>>,
     /// Names of functions and methods with a `ref` parameter, for checks that run before calls
     /// are resolved.
     ref_callees: HashSet<String>,
@@ -349,6 +353,9 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         let_sets: HashMap::new(),
         lambdas: Vec::new(),
         narrowed: Vec::new(),
+        order: 0,
+        fn_values: HashMap::new(),
+        lambda_writes: HashMap::new(),
         ref_callees: HashSet::new(),
         boxed_fields: HashSet::new(),
         top_level_names: HashSet::new(),
@@ -458,7 +465,6 @@ impl Checker<'_> {
             self.subsume(default.id, &actual, &ty);
         }
         self.current_type = None;
-        let interface_methods = self.check_signatures(own_methods);
         self.ref_callees = (self.funcs.iter())
             .filter(|(_, f)| f.sig.params.iter().any(|p| p.is_ref))
             .map(|(key, _)| key.rsplit('.').next().unwrap_or(key).to_string())
@@ -467,6 +473,7 @@ impl Checker<'_> {
             self.ref_binding(stmt, &program[i + 1..]);
             self.stmt(stmt);
         }
+        let interface_methods = self.check_signatures(own_methods);
         self.check_bounds(0);
         let names: Vec<String> = self.funcs.keys().cloned().collect();
         for name in names {
@@ -1818,6 +1825,10 @@ impl Checker<'_> {
                 } else {
                     VarKind::Local
                 };
+                let writes = self.value_writes(value);
+                if !writes.is_empty() {
+                    self.fn_values.insert(*span, writes);
+                }
                 self.declare(
                     name,
                     *span,
@@ -1839,6 +1850,12 @@ impl Checker<'_> {
                 span,
             } => {
                 self.assign(target, *op, value, *span);
+                if let ExprKind::Name(n) = &target.kind
+                    && let Some(decl) = self.lookup(n).map(|v| v.span)
+                {
+                    let writes = self.value_writes(value);
+                    self.fn_values.entry(decl).or_default().extend(writes);
+                }
                 Ty::Void
             }
             Stmt::RefLet { name, span, target } => {
@@ -2077,12 +2094,6 @@ impl Checker<'_> {
 
     fn ref_to_global_the_callee_writes(&mut self, callee: &str, args: &[Arg]) {
         let writes = self.funcs[callee].writes_globals.clone();
-        for i in 0..self.narrowed.len() {
-            let collection = &self.narrowed[i].collection;
-            if writes.contains(collection) && self.scope_of(collection) == Some(0) {
-                self.narrowed[i].written_by_a_call = true;
-            }
-        }
         for arg in args {
             if self.info.ref_args.contains_key(&arg.value.id)
                 && let Some((root, _)) = ref_path(&arg.value)
@@ -2092,9 +2103,7 @@ impl Checker<'_> {
                 self.error(Code::ref_global_written, arg.value.span);
             }
         }
-        if let Some(f) = self.fns.last_mut() {
-            f.writes_globals.extend(writes);
-        }
+        self.note_writes(writes);
     }
 
     /// `shared x`: the box behind a shared local, parameter or field.
@@ -2750,11 +2759,13 @@ impl Checker<'_> {
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expr.span),
             ExprKind::Call(callee, args) => {
                 let ty = self.call(expr.id, callee, args, expr.span, expected);
+                self.args_writes(args);
                 self.check_overlap(None, args);
                 ty
             }
             ExprKind::Method(recv, name, args) => {
                 let ty = self.method(expr.id, recv, name, args, expr.span);
+                self.args_writes(args);
                 self.check_overlap(Some(recv), args);
                 ty
             }
@@ -2779,7 +2790,9 @@ impl Checker<'_> {
             }
             ExprKind::For(pattern, iter, body, true) => self.for_ref(expr.id, pattern, iter, body),
             ExprKind::Loop(body) => {
+                let order = self.next_order();
                 self.loops.push(LoopCtx {
+                    order,
                     kind: LoopKind::Loop,
                     break_ty: None,
                     break_flow: None,
@@ -3671,6 +3684,8 @@ impl Checker<'_> {
             }
         }
         let callee_ty = self.expr(callee, None);
+        let writes = self.value_writes(callee);
+        self.note_writes(writes);
         match self.subst.shallow(&callee_ty) {
             Ty::Func(params, ret) => {
                 self.args_of(args, span, &params);
@@ -3890,6 +3905,8 @@ impl Checker<'_> {
                 return self.unknown_method(args, span);
             };
             self.match_args(&sig.params, args, span);
+            let writes = self.implementations_writes(&recv_ty, name, span);
+            self.note_writes(writes);
             self.info
                 .resolved
                 .insert(id, Resolved::Dynamic(name.to_string()));
@@ -4127,7 +4144,8 @@ impl Checker<'_> {
 
     fn narrowing_of(&self, collection: &str, index: &str) -> Option<usize> {
         self.narrowed.iter().rposition(|n| {
-            n.collection == collection
+            !n.ended
+                && n.collection == collection
                 && n.index == index
                 && [collection, index]
                     .iter()
@@ -4139,26 +4157,56 @@ impl Checker<'_> {
         if let (ExprKind::Name(l), ExprKind::Name(i)) = (&list.kind, &index.kind)
             && let Some(at) = self.narrowing_of(l, i)
         {
-            self.narrowed[at].reads_relying_on_it.push(read);
+            let order = self.next_order();
+            self.narrowed[at].reads_relying_on_it.push((order, read));
         }
     }
 
+    fn next_order(&mut self) -> usize {
+        self.order += 1;
+        self.order
+    }
+
     fn push_narrowing(&mut self, (collection, index, scope): (String, String, usize)) {
+        let order = self.next_order();
         self.narrowed.push(Narrowing {
             collection,
             index,
             scope,
+            order,
+            fns: self.fns.len(),
+            ended: false,
             reads_relying_on_it: Vec::new(),
-            written_by_a_call: false,
         });
     }
 
     fn pop_narrowing(&mut self) {
-        let n = self.narrowed.pop().expect("a narrowing");
-        if !n.written_by_a_call {
-            return;
+        self.narrowed.pop().expect("a narrowing");
+    }
+
+    fn narrowed_globals_written(&mut self, writes: &HashSet<String>) {
+        let mut lost = Vec::new();
+        for i in 0..self.narrowed.len() {
+            let n = &self.narrowed[i];
+            if n.ended
+                || n.fns != self.fns.len()
+                || !writes.contains(&n.collection)
+                || self.scope_of(&n.collection) != Some(0)
+            {
+                continue;
+            }
+            let loop_start = self.loops.iter().map(|l| l.order).find(|&o| o > n.order);
+            let n = &mut self.narrowed[i];
+            n.ended = true;
+            if let Some(start) = loop_start {
+                let (after, before) = std::mem::take(&mut n.reads_relying_on_it)
+                    .into_iter()
+                    .partition(|(order, _)| *order > start);
+                n.reads_relying_on_it = before;
+                lost.extend(after);
+            }
         }
-        for read in n.reads_relying_on_it {
+        for (_, read) in lost {
             match read {
                 NarrowedRead::Value(id, span) => {
                     self.info.unwrapped_index.remove(&id);
@@ -4166,6 +4214,77 @@ impl Checker<'_> {
                 }
                 NarrowedRead::Compound(d) => self.diags.push(d),
             }
+        }
+    }
+
+    fn note_writes(&mut self, writes: HashSet<String>) {
+        self.narrowed_globals_written(&writes);
+        if let Some(f) = self.fns.last_mut() {
+            f.writes_globals.extend(writes);
+        }
+    }
+
+    fn value_writes(&self, e: &Expr) -> HashSet<String> {
+        match &e.kind {
+            ExprKind::Name(n) => match self.lookup(n) {
+                Some(var) => self.fn_values.get(&var.span).cloned().unwrap_or_default(),
+                None => self
+                    .funcs
+                    .get(n)
+                    .map(|f| f.writes_globals.clone())
+                    .unwrap_or_default(),
+            },
+            ExprKind::Lambda(..) => self.lambda_writes.get(&e.id).cloned().unwrap_or_default(),
+            _ => HashSet::new(),
+        }
+    }
+
+    fn implementations_writes(&mut self, recv: &Ty, name: &str, span: Span) -> HashSet<String> {
+        let names_of = |c: &Self, i: &Ty| -> Vec<String> {
+            c.interfaces_of(i)
+                .into_iter()
+                .filter_map(|i| match i {
+                    Ty::Named(n, _) => Some(n),
+                    _ => None,
+                })
+                .collect()
+        };
+        let wanted = names_of(self, recv);
+        let mut owners = wanted.clone();
+        for (tag, list) in &self.impls {
+            if list
+                .iter()
+                .any(|i| names_of(self, i).iter().any(|n| wanted.contains(n)))
+            {
+                owners.push(tag.clone());
+            }
+        }
+        let keys: Vec<String> = self
+            .funcs
+            .keys()
+            .filter(|k| {
+                owners.iter().any(|t| {
+                    **k == format!("{t}.{name}")
+                        || (k.starts_with(&format!("{t}<")) && k.ends_with(&format!(">.{name}")))
+                })
+            })
+            .cloned()
+            .collect();
+        let mut writes = HashSet::new();
+        for key in keys {
+            self.ensure_checked(&key, span);
+            writes.extend(self.funcs[&key].writes_globals.iter().cloned());
+        }
+        writes
+    }
+
+    fn args_writes(&mut self, args: &[Arg]) {
+        let writes: HashSet<String> = args
+            .iter()
+            .flat_map(|a| self.value_writes(&a.value))
+            .collect();
+        if !writes.is_empty() {
+            self.note_writes(writes);
         }
     }
 
@@ -4252,6 +4371,8 @@ impl Checker<'_> {
         self.lambdas.push((self.scopes.len(), BTreeSet::new()));
         self.scopes.push(scope);
         let ret = self.function_body(body, declared);
+        let writes = std::mem::take(&mut self.body_writes);
+        self.lambda_writes.insert(id, writes);
         self.finish_scope();
         self.loops = saved_loops;
         self.flow = saved_flow;
@@ -4878,7 +4999,9 @@ impl Checker<'_> {
     }
 
     fn valued_loop(&mut self, id: NodeId, body: &Expr) -> Ty {
+        let order = self.next_order();
         self.loops.push(LoopCtx {
+            order,
             kind: LoopKind::Valued,
             break_ty: None,
             break_flow: None,
@@ -5214,8 +5337,10 @@ struct Narrowing {
     collection: String,
     index: String,
     scope: usize,
-    reads_relying_on_it: Vec<NarrowedRead>,
-    written_by_a_call: bool,
+    order: usize,
+    fns: usize,
+    ended: bool,
+    reads_relying_on_it: Vec<(usize, NarrowedRead)>,
 }
 
 enum NarrowedRead {
