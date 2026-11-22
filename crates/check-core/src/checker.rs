@@ -331,6 +331,8 @@ pub(crate) const SHARED: &str = "Shared";
 /// The bound a map key or set item's type needs; not a real interface.
 const KEY: &str = "check.std.Key";
 const ANY_GLOBAL: &str = "*";
+/// The type implementing an interface, inside its declaration.
+pub(crate) const THIS: &str = "This";
 pub(crate) const RESULT: &str = "check.std.Result";
 pub(crate) const PRINTABLE: &str = "check.std.Printable";
 pub(crate) const EQ: &str = "check.std.Eq";
@@ -606,6 +608,7 @@ impl Checker<'_> {
         for m in &i.members.methods {
             let short = m.name.rsplit('.').next().unwrap_or(&m.name).to_string();
             let inner = self.enter_params(&m.type_params);
+            self.bounds.insert(THIS.to_string(), Vec::new());
             let params = self.param_sigs(&m.params);
             let ret = Some(m.ret.as_ref().map_or(Ty::Void, |t| self.type_from(t)));
             self.bounds = inner;
@@ -1446,12 +1449,7 @@ impl Checker<'_> {
                 let Ty::Named(name, args) = i else { continue };
                 tags.insert(name.clone());
                 let def = &self.interfaces[name];
-                let map: HashMap<String, Ty> = def
-                    .params
-                    .iter()
-                    .cloned()
-                    .zip(args.iter().cloned())
-                    .collect();
+                let map = interface_map(def, args.clone(), &this);
                 let fields: Vec<(String, Ty, bool)> = def
                     .fields
                     .iter()
@@ -1489,12 +1487,7 @@ impl Checker<'_> {
                     let Ty::Named(name, args) = i else { continue };
                     let def = &self.interfaces[name];
                     if let Some((_, sig, has_body)) = def.methods.iter().find(|(n, ..)| *n == m) {
-                        let map: HashMap<String, Ty> = def
-                            .params
-                            .iter()
-                            .cloned()
-                            .zip(args.iter().cloned())
-                            .collect();
+                        let map = interface_map(def, args.clone(), &this);
                         versions.push((name.clone(), sig.clone(), *has_body, map));
                     }
                 }
@@ -3810,7 +3803,7 @@ impl Checker<'_> {
                 return None;
             };
             let def = &self.interfaces[&iface];
-            let map: HashMap<String, Ty> = def.params.iter().cloned().zip(args).collect();
+            let map = interface_map(def, args, ty);
             let (_, sig, _) = def.methods.iter().find(|m| m.0 == name)?;
             Some(Sig {
                 params: sig
@@ -5373,6 +5366,12 @@ impl Checker<'_> {
         }
         ty
     }
+}
+
+fn interface_map(def: &InterfaceDef, args: Vec<Ty>, this: &Ty) -> HashMap<String, Ty> {
+    let mut map: HashMap<String, Ty> = def.params.iter().cloned().zip(args).collect();
+    map.insert(THIS.to_string(), this.clone());
+    map
 }
 
 fn each_name_assign(body: &Expr, each: &mut dyn FnMut(&str, &Expr)) {

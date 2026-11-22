@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::ast::*;
-use crate::checker::BUILT_IN_TYPES;
+use crate::checker::{BUILT_IN_TYPES, THIS};
 use crate::diag::{Code, Diagnostic, Span};
 
 pub struct SourceFile {
@@ -381,6 +381,7 @@ impl Resolver<'_> {
             Stmt::Interface(i) => {
                 let key = self.own_key(&i.name);
                 let saved = self.enter_type_params(&mut i.type_params);
+                self.type_params.insert(THIS.to_string());
                 self.type_exprs(&mut i.parents);
                 for field in &mut i.fields {
                     self.param(field);

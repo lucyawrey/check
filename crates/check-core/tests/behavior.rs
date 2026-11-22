@@ -3635,3 +3635,14 @@ fn an_implement_block_can_bound_or_nest_its_type_parameters() {
         "unknown_method"
     );
 }
+
+#[test]
+fn an_interface_names_the_implementing_type_as_this() {
+    let src = |param: &str| {
+        format!(
+            "interface Bigger {{\n  func bigger(other: This) -> Bool\n}}\nclass P(n: Int)\nimplement Bigger for P {{\n  func bigger(other: {param}) -> Bool {{ true }}\n}}\nfunc pick<T: Bigger>(a: T, b: T) -> T {{\n  if a.bigger(b) {{ a }} else {{ b }}\n}}\nprint(pick(P(1), P(2)).n)"
+        )
+    };
+    assert_eq!(output(&src("P")), "1");
+    assert_eq!(first_error(&src("Int")), "wrong_implementation");
+}
