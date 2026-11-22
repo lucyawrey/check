@@ -3488,6 +3488,15 @@ fn a_class_pattern_outside_its_type_cant_name_a_private_field() {
         )),
         "0"
     );
+    let bag = "class Bag(a: Int, private var ...rest: List<Int> = [])\nlet b = Bag(1)\n";
+    assert_eq!(
+        first_error(&format!("{bag}match b {{\n  Bag(a, _, y) => print(y)\n}}")),
+        "private_member"
+    );
+    assert_eq!(
+        output(&format!("{bag}match b {{\n  Bag(a, ..._) => print(a)\n}}")),
+        "1"
+    );
 }
 
 #[test]

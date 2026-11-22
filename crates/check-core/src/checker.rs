@@ -4681,8 +4681,15 @@ impl Checker<'_> {
             .map(|c| (c.fields.clone(), c.private.clone()))
             .unwrap_or_default();
         if !self.inside(class) {
-            for (item, _) in (items.iter().zip(&private)).filter(|(_, p)| **p) {
-                if !matches!(item.kind, PatternKind::Wildcard) {
+            let rest = fields.iter().position(|f| f.is_rest);
+            for (i, item) in items.iter().enumerate() {
+                let field = rest.map_or(i, |r| i.min(r));
+                let binds_nothing = match &item.kind {
+                    PatternKind::Wildcard => true,
+                    PatternKind::Rest(name) => name == "_",
+                    _ => false,
+                };
+                if private.get(field).is_some_and(|p| *p) && !binds_nothing {
                     self.error(Code::private_member, item.span);
                 }
             }
