@@ -3670,3 +3670,65 @@ fn comparable_types_order_with_compare_and_comparison_operators() {
         "Equal"
     );
 }
+
+#[test]
+fn lists_find_test_order_and_sum_their_items() {
+    let xs = "var xs = [3, 1, 2]\n";
+    for (call, expected) in [
+        ("xs.find(func(x) => x < 3)", "Some(1)"),
+        ("xs.any(func(x) => x > 2)", "true"),
+        ("xs.all(func(x) => x > 1)", "false"),
+        ("xs.indexOf(2)", "Some(2)"),
+        ("xs.indexOf(7)", "None"),
+        ("xs.sorted()", "[1, 2, 3]"),
+        ("xs.reversed()", "[2, 1, 3]"),
+        ("xs.sum()", "6"),
+        ("xs.min()", "Some(1)"),
+        ("xs.max()", "Some(3)"),
+        ("[1.5, 2.5].sum()", "4.0"),
+        ("[\"b\", \"a\"].sorted()", "[\"a\", \"b\"]"),
+        ("[0.0 / 0.0, 2.0, 1.0].sorted()", "[1.0, 2.0, NaN]"),
+    ] {
+        assert_eq!(output(&format!("{xs}print({call})")), expected, "{call}");
+    }
+    assert_eq!(
+        output(&format!("{xs}xs.insert(1, 9)\nxs.insert(4, 8)\nprint(xs)")),
+        "[3, 9, 1, 2, 8]"
+    );
+    assert_eq!(output("let e: List<Int> = []\nprint(e.min())"), "None");
+    panics_with(&format!("{xs}xs.insert(5, 0)"), "index_out_of_range");
+    assert_eq!(
+        first_error("let ys = [1]\nys.insert(0, 2)"),
+        "change_let_collection"
+    );
+    assert_eq!(first_error("print([\"a\"].sum())"), "unknown_method");
+}
+
+#[test]
+fn sorting_keeps_equal_items_in_their_order() {
+    let src = "class P(key: Int, tag: String)\nimplement Comparable for P {\n  func compare(other: P) -> Ordering { this.key.compare(other.key) }\n}\nlet ps = [P(2, \"a\"), P(1, \"b\"), P(2, \"c\"), P(1, \"d\")]\nprint(ps.sorted().map(func(p) => p.tag))\nprint(ps.min())";
+    assert_eq!(
+        output(src),
+        "[\"b\", \"d\", \"a\", \"c\"]\nSome(P(key = 1, tag = \"b\"))"
+    );
+}
+
+#[test]
+fn std_methods_that_take_a_function_keep_narrowing() {
+    let src = "var m = [\"a\" = 1]\nlet k = \"a\"\nif m.contains(k) {\n  print([1].map(func(x) => x + 1).filter(func(x) => x > 0).any(func(x) => x > 1))\n  print(m[k] + 1)\n}";
+    assert_eq!(output(src), "true\n2");
+}
+
+#[test]
+fn flatten_removes_one_layer_of_maybe() {
+    assert_eq!(
+        output(
+            "let x: Int?? = Some(Some(1))\nprint(x.flatten())\nlet y: Int?? = Some(None)\nprint(y.flatten())"
+        ),
+        "Some(1)\nNone"
+    );
+    assert_eq!(
+        first_error("let x: Int? = Some(1)\nprint(x.flatten())"),
+        "unknown_method"
+    );
+}

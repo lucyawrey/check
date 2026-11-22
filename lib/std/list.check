@@ -118,7 +118,7 @@ implement List<T: Comparable> {
     var best: T? = None
     for item in this {
       best = match best {
-        Some(b) if b <= item => Some(b)
+        Some(b) if not (b.compare(item) is Greater) => Some(b)
         _ => Some(item)
       }
     }
@@ -129,7 +129,7 @@ implement List<T: Comparable> {
     var best: T? = None
     for item in this {
       best = match best {
-        Some(b) if b >= item => Some(b)
+        Some(b) if not (b.compare(item) is Less) => Some(b)
         _ => Some(item)
       }
     }
@@ -145,7 +145,7 @@ private func merged<T: Comparable>(left: List<T>, right: List<T>) -> List<T> {
     match left[i] {
       Some(l) {
         match right[j] {
-          Some(r) if r < l {
+          Some(r) if r.compare(l) is Less {
             out.push(r)
             j += 1
           }
