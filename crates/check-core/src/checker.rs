@@ -2758,13 +2758,11 @@ impl Checker<'_> {
             ExprKind::Binary(op, lhs, rhs) => self.binary(*op, lhs, rhs, expr.span),
             ExprKind::Call(callee, args) => {
                 let ty = self.call(expr.id, callee, args, expr.span, expected);
-                self.args_writes(args);
                 self.check_overlap(None, args);
                 ty
             }
             ExprKind::Method(recv, name, args) => {
                 let ty = self.method(expr.id, recv, name, args, expr.span);
-                self.args_writes(args);
                 self.check_overlap(Some(recv), args);
                 ty
             }
@@ -3555,6 +3553,9 @@ impl Checker<'_> {
             ArgSource::Expr(e) => {
                 let t = self.expr(e, Some(param));
                 self.expect(e, &t, param);
+                if matches!(self.subst.shallow(&t), Ty::Func(..)) {
+                    self.note_value_writes(e);
+                }
             }
             ArgSource::Spread(t, span) => {
                 if !self.subst.unify(t, param) {
@@ -3677,8 +3678,7 @@ impl Checker<'_> {
             }
         }
         let callee_ty = self.expr(callee, None);
-        let writes = self.value_writes(callee);
-        self.note_writes(writes);
+        self.note_value_writes(callee);
         match self.subst.shallow(&callee_ty) {
             Ty::Func(params, ret) => {
                 self.args_of(args, span, &params);
@@ -4303,13 +4303,13 @@ impl Checker<'_> {
         writes
     }
 
-    fn args_writes(&mut self, args: &[Arg]) {
-        let writes: HashSet<String> = args
-            .iter()
-            .flat_map(|a| self.value_writes(&a.value))
-            .filter(|w| w != ANY_GLOBAL)
-            .collect();
-        if !writes.is_empty() {
+    fn note_value_writes(&mut self, e: &Expr) {
+        let writes = self.value_writes(e);
+        let param = matches!(&e.kind, ExprKind::Name(n)
+            if self.lookup(n).is_some_and(|v| matches!(v.kind, VarKind::Param)));
+        if param {
+            self.narrowed_globals_written(&writes);
+        } else {
             self.note_writes(writes);
         }
     }

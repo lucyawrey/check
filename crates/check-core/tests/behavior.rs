@@ -3579,12 +3579,14 @@ fn a_call_that_changes_a_narrowed_global_undoes_the_narrowing() {
 
 #[test]
 fn a_call_through_a_function_value_that_changes_a_narrowed_global_undoes_the_narrowing() {
-    let map = "var m = [\"a\" = 1]\nfunc clear() { m = [\"b\" = 2] }\nfunc apply(g: func()) { g() }\ninterface Wipe { func wipe() }\nclass W: Wipe {\n  func wipe() { clear() }\n}\nlet w: Wipe = W()\nclass H(f: func())\nfunc maker() -> func() { clear }\nlet k = \"a\"\n";
+    let map = "var m = [\"a\" = 1]\nfunc clear() { m = [\"b\" = 2] }\nfunc apply(g: func()) { g() }\nfunc forward(g: func()) { apply(g) }\ninterface Wipe { func wipe() }\nclass W: Wipe {\n  func wipe() { clear() }\n}\nlet w: Wipe = W()\nclass H(f: func())\nfunc maker() -> func() { clear }\nlet k = \"a\"\n";
     let in_branch =
         |body: &str| format!("{map}if m.contains(k) {{\n  {body}\n  print(m[k] + 1)\n}}");
     for call in [
         "let f = clear\n  f()",
         "apply(clear)",
+        "forward(clear)",
+        "apply(H(clear).f)",
         "apply(func() => clear())",
         "w.wipe()",
         "let g = H(clear).f\n  g()",
@@ -3599,6 +3601,8 @@ fn a_call_through_a_function_value_that_changes_a_narrowed_global_undoes_the_nar
         );
     }
     assert_eq!(output(&in_branch("let f = func() => clear()")), "2");
+    assert_eq!(output(&in_branch("apply(func() { })")), "2");
+    assert_eq!(output(&in_branch("forward(func() { })")), "2");
     assert_eq!(
         first_error(&format!(
             "{map}func run(g: func()) {{\n  if m.contains(k) {{\n    g()\n    print(m[k] + 1)\n  }}\n}}"
