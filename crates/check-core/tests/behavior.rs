@@ -3562,6 +3562,12 @@ fn a_call_that_changes_a_narrowed_global_undoes_the_narrowing() {
         "unhandled_maybe"
     );
     assert_eq!(
+        first_error(&format!(
+            "{map}if m.contains(k) {{\n  while m[k] > 0 {{\n    clear()\n  }}\n}}"
+        )),
+        "unhandled_maybe"
+    );
+    assert_eq!(
         output(&format!(
             "{map}if m.contains(k) {{\n  print(look())\n  print(m[k] + 1)\n}}"
         )),
@@ -3573,7 +3579,7 @@ fn a_call_that_changes_a_narrowed_global_undoes_the_narrowing() {
 
 #[test]
 fn a_call_through_a_function_value_that_changes_a_narrowed_global_undoes_the_narrowing() {
-    let map = "var m = [\"a\" = 1]\nfunc clear() { m = [\"b\" = 2] }\nfunc apply(g: func()) { g() }\ninterface Wipe { func wipe() }\nclass W: Wipe {\n  func wipe() { clear() }\n}\nlet w: Wipe = W()\nlet k = \"a\"\n";
+    let map = "var m = [\"a\" = 1]\nfunc clear() { m = [\"b\" = 2] }\nfunc apply(g: func()) { g() }\ninterface Wipe { func wipe() }\nclass W: Wipe {\n  func wipe() { clear() }\n}\nlet w: Wipe = W()\nclass H(f: func())\nfunc maker() -> func() { clear }\nlet k = \"a\"\n";
     let in_branch =
         |body: &str| format!("{map}if m.contains(k) {{\n  {body}\n  print(m[k] + 1)\n}}");
     for call in [
@@ -3581,6 +3587,10 @@ fn a_call_through_a_function_value_that_changes_a_narrowed_global_undoes_the_nar
         "apply(clear)",
         "apply(func() => clear())",
         "w.wipe()",
+        "let g = H(clear).f\n  g()",
+        "for g in [clear] { g() }",
+        "let g = maker()\n  g()",
+        "var f = func() { }\n  for _ in 0..2 {\n    f()\n    f = clear\n  }",
     ] {
         assert_eq!(
             first_error(&in_branch(call)),
@@ -3589,4 +3599,10 @@ fn a_call_through_a_function_value_that_changes_a_narrowed_global_undoes_the_nar
         );
     }
     assert_eq!(output(&in_branch("let f = func() => clear()")), "2");
+    assert_eq!(
+        first_error(&format!(
+            "{map}func run(g: func()) {{\n  if m.contains(k) {{\n    g()\n    print(m[k] + 1)\n  }}\n}}"
+        )),
+        "invalid_operand_types"
+    );
 }

@@ -330,6 +330,7 @@ pub(crate) const SET: &str = "Set";
 pub(crate) const SHARED: &str = "Shared";
 /// The bound a map key or set item's type needs; not a real interface.
 const KEY: &str = "check.std.Key";
+const ANY_GLOBAL: &str = "*";
 pub(crate) const RESULT: &str = "check.std.Result";
 pub(crate) const PRINTABLE: &str = "check.std.Printable";
 pub(crate) const EQ: &str = "check.std.Eq";
@@ -1826,9 +1827,7 @@ impl Checker<'_> {
                     VarKind::Local
                 };
                 let writes = self.value_writes(value);
-                if !writes.is_empty() {
-                    self.fn_values.insert(*span, writes);
-                }
+                self.fn_values.insert(*span, writes);
                 self.declare(
                     name,
                     *span,
@@ -2778,6 +2777,7 @@ impl Checker<'_> {
                 self.if_expr(expr, cond, then, otherwise.as_deref(), expected)
             }
             ExprKind::While(cond, body) => {
+                self.push_loop(LoopKind::Valued, body);
                 let c = self.expr(cond, Some(&Ty::Bool));
                 self.expect(cond, &c, &Ty::Bool);
                 self.push_bindings(self.exports(cond));
@@ -2790,14 +2790,7 @@ impl Checker<'_> {
             }
             ExprKind::For(pattern, iter, body, true) => self.for_ref(expr.id, pattern, iter, body),
             ExprKind::Loop(body) => {
-                let order = self.next_order();
-                self.loops.push(LoopCtx {
-                    order,
-                    kind: LoopKind::Loop,
-                    break_ty: None,
-                    break_flow: None,
-                    set_before: self.flow.maybe_set.clone(),
-                });
+                self.push_loop(LoopKind::Loop, body);
                 self.unused(body);
                 self.let_set_again_by_the_loop();
                 let ctx = self.loops.pop().expect("loop context");
@@ -4190,7 +4183,7 @@ impl Checker<'_> {
             let n = &self.narrowed[i];
             if n.ended
                 || n.fns != self.fns.len()
-                || !writes.contains(&n.collection)
+                || !(writes.contains(&n.collection) || writes.contains(ANY_GLOBAL))
                 || self.scope_of(&n.collection) != Some(0)
             {
                 continue;
@@ -4227,15 +4220,47 @@ impl Checker<'_> {
     fn value_writes(&self, e: &Expr) -> HashSet<String> {
         match &e.kind {
             ExprKind::Name(n) => match self.lookup(n) {
-                Some(var) => self.fn_values.get(&var.span).cloned().unwrap_or_default(),
+                Some(var) => self
+                    .fn_values
+                    .get(&var.span)
+                    .cloned()
+                    .unwrap_or_else(any_global),
                 None => self
                     .funcs
                     .get(n)
                     .map(|f| f.writes_globals.clone())
                     .unwrap_or_default(),
             },
-            ExprKind::Lambda(..) => self.lambda_writes.get(&e.id).cloned().unwrap_or_default(),
-            _ => HashSet::new(),
+            ExprKind::Lambda(..) => self
+                .lambda_writes
+                .get(&e.id)
+                .cloned()
+                .unwrap_or_else(any_global),
+            _ => any_global(),
+        }
+    }
+
+    fn loop_assigned_fn_values(&mut self, body: &Expr) {
+        let mut funcs = Vec::new();
+        each_name_assign(body, &mut |_, value| {
+            if let ExprKind::Name(n) = &value.kind
+                && self.lookup(n).is_none()
+                && self.funcs.contains_key(n)
+            {
+                funcs.push((n.clone(), value.span));
+            }
+        });
+        for (name, span) in funcs {
+            self.ensure_checked(&name, span);
+        }
+        let mut assigned = Vec::new();
+        each_name_assign(body, &mut |target, value| {
+            if let Some(var) = self.lookup(target) {
+                assigned.push((var.span, self.value_writes(value)));
+            }
+        });
+        for (decl, writes) in assigned {
+            self.fn_values.entry(decl).or_default().extend(writes);
         }
     }
 
@@ -4282,6 +4307,7 @@ impl Checker<'_> {
         let writes: HashSet<String> = args
             .iter()
             .flat_map(|a| self.value_writes(&a.value))
+            .filter(|w| w != ANY_GLOBAL)
             .collect();
         if !writes.is_empty() {
             self.note_writes(writes);
@@ -5005,15 +5031,19 @@ impl Checker<'_> {
         }
     }
 
-    fn valued_loop(&mut self, id: NodeId, body: &Expr) -> Ty {
+    fn push_loop(&mut self, kind: LoopKind, body: &Expr) {
         let order = self.next_order();
         self.loops.push(LoopCtx {
             order,
-            kind: LoopKind::Valued,
+            kind,
             break_ty: None,
             break_flow: None,
             set_before: self.flow.maybe_set.clone(),
         });
+        self.loop_assigned_fn_values(body);
+    }
+
+    fn valued_loop(&mut self, id: NodeId, body: &Expr) -> Ty {
         let before = self.flow.clone();
         self.unused(body);
         self.let_set_again_by_the_loop();
@@ -5260,6 +5290,7 @@ impl Checker<'_> {
         if let Some(var) = self.scopes.last_mut().and_then(|s| s.get_mut(name)) {
             var.reassigned = true;
         }
+        self.push_loop(LoopKind::Valued, body);
         let ty = self.valued_loop(id, body);
         self.finish_scope();
         // After the body, so its calls are resolved.
@@ -5302,6 +5333,7 @@ impl Checker<'_> {
             self.push_narrowing(narrowed);
         }
         self.push_bindings(binds);
+        self.push_loop(LoopKind::Valued, body);
         let ty = self.valued_loop(id, body);
         self.finish_scope();
         if narrowed_list.is_some() {
@@ -5309,6 +5341,25 @@ impl Checker<'_> {
         }
         ty
     }
+}
+
+fn each_name_assign(body: &Expr, each: &mut dyn FnMut(&str, &Expr)) {
+    find_expr(body, &mut |e, _| {
+        if let ExprKind::Block(stmts) = &e.kind {
+            for s in stmts {
+                if let Stmt::Assign { target, value, .. } = s
+                    && let ExprKind::Name(n) = &target.kind
+                {
+                    each(n, value);
+                }
+            }
+        }
+        false
+    });
+}
+
+fn any_global() -> HashSet<String> {
+    HashSet::from([ANY_GLOBAL.to_string()])
 }
 
 fn record_field(names: &[String], fields: &[Ty], name: &str) -> Option<Ty> {
