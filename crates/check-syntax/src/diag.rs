@@ -193,6 +193,7 @@ codes! {
     ref_global_written,
     record_beside_class,
     fields_only_body,
+    bracket_on_new_line,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

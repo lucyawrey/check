@@ -91,7 +91,7 @@ pub fn from_str_unchecked<T: DeserializeOwned>(path: &str, text: &str) -> Result
     let mut diagnostics = Vec::new();
     let base = sources.add(path, text);
     let tokens = lexer::lex(text, base, true, &mut diagnostics);
-    let file = parser::parse_data(tokens, &mut 0, &mut diagnostics);
+    let file = parser::parse_data(tokens, text, base, &mut 0, &mut diagnostics);
     if !path.ends_with(".con") {
         diagnostics.push(Diagnostic::error(Code::not_pure_data, file.value.span));
     }

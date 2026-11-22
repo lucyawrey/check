@@ -17,13 +17,15 @@ type PResult<T> = Result<T, ()>;
 
 pub fn parse_data(
     tokens: Vec<Token>,
+    src: &str,
+    base: usize,
     next_id: &mut NodeId,
     diags: &mut Vec<Diagnostic>,
 ) -> DataFile {
     let mut parser = Parser {
         tokens,
-        src: "",
-        base: 0,
+        src,
+        base,
         pos: 0,
         next_id,
         diags,
@@ -487,6 +489,7 @@ impl Parser<'_> {
     }
 
     fn body(&mut self, mut item: impl FnMut(&mut Self) -> PResult<()>) -> PResult<()> {
+        self.open_on_next_line("{");
         let start = self.expect_sym("{")?;
         loop {
             self.skip_newlines();
@@ -615,7 +618,20 @@ impl Parser<'_> {
             token.span.start += 1;
             return Ok(());
         }
-        self.expect_sym(">").map(|_| ())
+        let close = self.expect_sym(">")?;
+        let next = self.tokens[self.pos].clone();
+        if !matches!(
+            next.tok,
+            Tok::Newline | Tok::Eof | Tok::Sym(">" | ">>" | "," | ")")
+        ) && self.text_between(close.end, next.span.start).contains('\n')
+        {
+            let line_break = Token {
+                tok: Tok::Newline,
+                span: Span::new(close.end, close.end),
+            };
+            self.tokens.insert(self.pos, line_break);
+        }
+        Ok(())
     }
 
     /// `optional_body` lets a method end after its signature, as in an interface.
@@ -689,11 +705,13 @@ impl Parser<'_> {
         let mut init = None;
         let mut members = Members::default();
         let interfaces;
+        self.open_on_next_line("(");
         if self.is_sym("(") {
             fields = self.params(true, false)?;
             interfaces = self.interface_list()?;
         } else {
             interfaces = self.interface_list()?;
+            self.open_on_next_line("{");
             let owner = name.clone();
             let open = self.pos;
             let errors_before = self.error_count();
@@ -1116,12 +1134,16 @@ impl Parser<'_> {
         let start = self.advance().span;
         let (name, _) = self.ident()?;
         let type_params = self.type_params()?;
+        self.open_on_next_line("(");
         let params = self.params(false, true)?;
         let ret = if self.eat_sym("->") {
             Some(self.type_expr()?)
         } else {
             None
         };
+        if !is_external {
+            self.open_on_next_line("{");
+        }
         let ends =
             matches!(self.peek(), Tok::Newline | Tok::Eof) || self.is_sym("}") || self.is_sym(";");
         let body = if is_external || (optional_body && ends) {
@@ -1265,6 +1287,22 @@ impl Parser<'_> {
         }];
         self.diags
             .push(Diagnostic::error(Code::trailing_separator, span).with_fix(fix));
+    }
+
+    fn open_on_next_line(&mut self, open: &str) {
+        if *self.peek() != Tok::Newline || !self.next_line_starts_with(open) {
+            return;
+        }
+        let from = self.prev_span().end;
+        self.skip_newlines();
+        let mut d = Diagnostic::warning(Code::bracket_on_new_line, self.span());
+        if self.text_between(from, self.span().start).trim().is_empty() {
+            d = d.with_fix(vec![Edit {
+                span: Span::new(from, self.span().start),
+                text: if open == "{" { " " } else { "" }.to_string(),
+            }]);
+        }
+        self.diags.push(d);
     }
 
     fn next_line_starts_with(&self, sym: &str) -> bool {

@@ -159,6 +159,29 @@ fn rewrites_a_class_with_only_fields_in_the_header_form() {
 }
 
 #[test]
+fn joins_a_bracket_on_the_line_after_a_declaration_header() {
+    let cases = [
+        (
+            "class Box<T>\n{\n  let v: T\n  func get() -> T { this.v }\n}\nprint(Box(1).get())",
+            "class Box<T> {\n  let v: T\n  func get() -> T { this.v }\n}\nprint(Box(1).get())",
+        ),
+        (
+            "class Pair\n(a: Int, b: Int)\nprint(Pair(1, 2).b)",
+            "class Pair(a: Int, b: Int)\nprint(Pair(1, 2).b)",
+        ),
+        (
+            "func first<T>\n(xs: List<T>) -> T?\n{\n  xs[0]\n}\nprint(first([1]) ?? 0)",
+            "func first<T>(xs: List<T>) -> T? {\n  xs[0]\n}\nprint(first([1]) ?? 0)",
+        ),
+    ];
+    for (before, after) in cases {
+        assert_eq!(tidied(before), after, "{before}");
+    }
+    let commented = "enum E // note\n{\n  A\n}\nprint(E.A)";
+    assert_eq!(tidied(commented), commented);
+}
+
+#[test]
 fn fixes_imports_and_namespaces() {
     let lib = ("lib/a.check", "func a() -> Int { 1 }");
     let (after, _) = tidy_files(&[("main.check", "import \"lib\""), lib], BOTH);
@@ -229,7 +252,6 @@ fn shows_each_change_with_its_rule() {
 #[test]
 fn leaves_alone_what_has_no_safe_fix() {
     for src in [
-        "func f() -> Int\n{\n  1\n}",
         "func f()",
         "let n = 1\nif n == 1 {\n  print(\"a\")\n} // done\nelse {\n  print(\"b\")\n}",
         "func f() -> Int // note\n  => 1",

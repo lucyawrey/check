@@ -158,6 +158,7 @@ ref_changed_elsewhere = "[Something else changed this `ref` argument's place dur
 ref_global_written = "[This function also changes this global, so it can't be passed as `ref`]"
 record_beside_class = "[The class is already written beside this record: leave it out]"
 fields_only_body = "[A class with only fields is written with its fields in `()`]"
+bracket_on_new_line = "[Put the `{` or `(` on the same line as the declaration before it]"
 
 // Command line
 tidy_summary = "[Made {fixes} fixes in {files} files]"
