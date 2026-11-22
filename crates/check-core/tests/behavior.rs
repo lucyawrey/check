@@ -3474,6 +3474,20 @@ fn a_generic_type_at_a_line_end_ends_the_line() {
 }
 
 #[test]
+fn a_function_left_in_a_block_by_a_broken_header_is_an_error_not_a_crash() {
+    assert_eq!(
+        first_error("class Box x\n{\n  func get() -> Int { 1 }\n}"),
+        "unexpected_token"
+    );
+}
+
+#[test]
+fn type_arguments_can_span_lines() {
+    let src = "func nested() -> Map<String, List<Int>\n> {\n  [\"a\" = [1]]\n}\nprint(nested())";
+    assert_eq!(output(src), "[\"a\" = [1]]");
+}
+
+#[test]
 fn a_class_pattern_outside_its_type_cant_name_a_private_field() {
     let counter = "class Counter {\n  var count = 0\n  private let step = 1\n  func tick() { this.count += this.step }\n}\nlet c = Counter()\n";
     assert_eq!(

@@ -335,9 +335,9 @@ impl Resolver<'_> {
     /// The key of this file's own declaration of `name`.
     fn own_key(&self, name: &str) -> String {
         let key = qualify(self.namespace, name);
-        self.decls[&key]
-            .iter()
-            .find(|d| d.unit == self.unit)
+        self.decls
+            .get(&key)
+            .and_then(|ds| ds.iter().find(|d| d.unit == self.unit))
             .map_or(key.clone(), |d| d.key.clone())
     }
 
