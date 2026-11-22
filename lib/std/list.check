@@ -1,0 +1,201 @@
+implement List<T> {
+  external func length() -> Int
+  external func push(item: T)
+  external func pop() -> T?
+  external func removeAt(index: Int) -> T?
+  external func insert(index: Int, item: T)
+
+  func isEmpty() -> Bool { this.length() == 0 }
+
+  func first() -> T? { this[0] }
+
+  func last() -> T? { this[this.length() - 1] }
+
+  func indices() -> Range<Int> { 0..this.length() }
+
+  func enumerate() -> List<(Int, T)> {
+    var out: List<(Int, T)> = []
+    var i = 0
+    for item in this {
+      out.push((i, item))
+      i += 1
+    }
+    out
+  }
+
+  func map<U>(transform: func(T) -> U) -> List<U> {
+    var out: List<U> = []
+    for item in this {
+      out.push(transform(item))
+    }
+    out
+  }
+
+  func filter(keep: func(T) -> Bool) -> List<T> {
+    var out: List<T> = []
+    for item in this {
+      if keep(item) { out.push(item) }
+    }
+    out
+  }
+
+  func find(test: func(T) -> Bool) -> T? {
+    for item in this {
+      if test(item) { return Some(item) }
+    }
+    None
+  }
+
+  func any(test: func(T) -> Bool) -> Bool {
+    for item in this {
+      if test(item) { return true }
+    }
+    false
+  }
+
+  func all(test: func(T) -> Bool) -> Bool {
+    for item in this {
+      if not test(item) { return false }
+    }
+    true
+  }
+
+  func reversed() -> List<T> {
+    var rest = this
+    var out: List<T> = []
+    loop {
+      match rest.pop() {
+        Some(item) => out.push(item)
+        None => break
+      }
+    }
+    out
+  }
+}
+
+implement List<T: Eq> {
+  func contains(item: T) -> Bool {
+    for x in this {
+      if x == item { return true }
+    }
+    false
+  }
+
+  func indexOf(item: T) -> Int? {
+    var i = 0
+    for x in this {
+      if x == item { return Some(i) }
+      i += 1
+    }
+    None
+  }
+}
+
+implement List<T: Comparable> {
+  func sorted() -> List<T> {
+    var runs: List<List<T>> = this.map(func(item) => [item])
+    while runs.length() > 1 {
+      var next: List<List<T>> = []
+      var i = 0
+      loop {
+        match runs[i] {
+          Some(left) {
+            match runs[i + 1] {
+              Some(right) => next.push(merged(left, right))
+              None => next.push(left)
+            }
+            i += 2
+          }
+          None => break
+        }
+      }
+      runs = next
+    }
+    runs.first() ?? []
+  }
+
+  func min() -> T? {
+    var best: T? = None
+    for item in this {
+      best = match best {
+        Some(b) if b <= item => Some(b)
+        _ => Some(item)
+      }
+    }
+    best
+  }
+
+  func max() -> T? {
+    var best: T? = None
+    for item in this {
+      best = match best {
+        Some(b) if b >= item => Some(b)
+        _ => Some(item)
+      }
+    }
+    best
+  }
+}
+
+private func merged<T: Comparable>(left: List<T>, right: List<T>) -> List<T> {
+  var out: List<T> = []
+  var i = 0
+  var j = 0
+  loop {
+    match left[i] {
+      Some(l) {
+        match right[j] {
+          Some(r) if r < l {
+            out.push(r)
+            j += 1
+          }
+          _ {
+            out.push(l)
+            i += 1
+          }
+        }
+      }
+      None {
+        match right[j] {
+          Some(r) {
+            out.push(r)
+            j += 1
+          }
+          None => break
+        }
+      }
+    }
+  }
+  out
+}
+
+implement List<Int> {
+  func sum() -> Int {
+    var total = 0
+    for item in this {
+      total += item
+    }
+    total
+  }
+}
+
+implement List<Float> {
+  func sum() -> Float {
+    var total = 0.0
+    for item in this {
+      total += item
+    }
+    total
+  }
+}
+
+implement List<String> {
+  func join(separator: String) -> String {
+    var out = ""
+    for (i, item) in this.enumerate() {
+      if i > 0 { out += separator }
+      out += item
+    }
+    out
+  }
+}

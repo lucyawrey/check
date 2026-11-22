@@ -657,6 +657,7 @@ fn library_files_hold_only_declarations_that_match_the_rust_bodies() {
     let mut bodies: Vec<&str> = check_core::host::FUNCTIONS
         .iter()
         .map(|(n, _)| *n)
+        .chain(check_core::interp::BUILT_IN_METHODS.iter().copied())
         .collect();
     names.sort();
     bodies.sort();
@@ -3171,8 +3172,8 @@ fn deep_programs_reach_the_call_limit_without_overflowing() {
             "func f(n: Int) -> Int {{\n  match n {{\n    0 => 0\n    _ {{\n      var t = 0\n      for i in 0..1 {{ t = [1].map(func(x) => x + f(n - 1))[0] ?? 0 }}\n      t\n    }}\n  }}\n}}\nprint(f({levels}))"
         )
     };
-    assert_eq!(output(&src(4_900)), "4900");
-    panics_with(&src(5_100), "stack_overflow");
+    assert_eq!(output(&src(3_300)), "3300");
+    panics_with(&src(3_400), "stack_overflow");
     let list = |len: i64, end: &str| {
         format!(
             "enum L {{ Nil, Cons(Int, L) }}\nvar l: L = Nil\nvar i = 0\nwhile i < {len} {{\n  l = Cons(i, l)\n  i += 1\n}}\n{end}"
@@ -3276,8 +3277,8 @@ fn loading_data_stops_on_a_failed_try_or_an_endless_loop() {
         data_panic("[Item(\"sword\", { loop { } })]").as_deref(),
         Some("out_of_steps")
     );
-    // Few loop passes, but each `contains` looks at 100,000 items.
-    let busy = "[Item(\"sword\", {\n  var xs: List<Int> = []\n  for i in 0..100000 { xs.push(i) }\n  var n = 0\n  for j in 0..200 { if xs.contains(-1) { n += 1 } }\n  n\n})]";
+    // Few loop passes, but each `keys()` copies 100,000 entries.
+    let busy = "[Item(\"sword\", {\n  var m: Map<Int, Int> = [=]\n  for i in 0..100000 { m[i] = i }\n  var n = 0\n  for j in 0..200 { n += m.keys().length() }\n  n\n})]";
     assert_eq!(data_panic(busy).as_deref(), Some("out_of_steps"));
     // Map inserts are hashed, so this is quick (it took minutes with linear lookups).
     let inserts = "[Item(\"sword\", {\n  var m: Map<Int, Int> = [=]\n  for i in 0..100000 { m[i] = i }\n  m.length()\n})]";

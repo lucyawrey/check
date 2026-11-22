@@ -88,6 +88,26 @@ pub struct Interpreter<'a> {
 
 const MAX_DEPTH: usize = 10_000;
 
+/// The `external` methods in `check:std` whose bodies are here rather than in `host.rs`.
+pub const BUILT_IN_METHODS: &[&str] = &[
+    "List.length",
+    "List.push",
+    "List.pop",
+    "List.removeAt",
+    "List.insert",
+    "Map.length",
+    "Map.contains",
+    "Map.remove",
+    "Map.keys",
+    "Map.values",
+    "Set.length",
+    "Set.contains",
+    "Set.add",
+    "Set.remove",
+    "check.std.Maybe.orPanic",
+    "check.std.Result.orPanic",
+];
+
 /// The step budget for consts and data values, so loading data can't hang a host.
 const DATA_BUDGET: u64 = 10_000_000;
 
@@ -1637,11 +1657,14 @@ impl Interpreter<'_> {
         keep: &[String],
     ) -> Result<(Value, Vec<Value>), Flow> {
         let Some(body) = &decl.body else {
+            let Some(f) = host::find(&decl.name) else {
+                let this = this.expect("an external without a host body is a built-in method");
+                let name = decl.name.rsplit('.').next().unwrap_or(&decl.name);
+                return Ok((self.builtin_method(this, name, values, span)?, Vec::new()));
+            };
             if let Some(this) = this {
                 values.insert(0, this);
             }
-            let f =
-                host::find(&decl.name).expect("every external declaration has a body in host.rs");
             let mut io = Io {
                 input: &mut *self.input,
                 output: &mut *self.output,
@@ -1789,10 +1812,15 @@ impl Interpreter<'_> {
             Some(r) => return self.resolved(r, args, span),
             None => {}
         }
-        if matches!(name, "push" | "pop" | "removeAt" | "add" | "remove") {
+        if matches!(
+            name,
+            "push" | "pop" | "removeAt" | "insert" | "add" | "remove"
+        ) {
             let mut steps = Vec::new();
             let mut root = self.path(recv, &mut steps)?;
-            let mut arg = self.args(args)?.into_iter().next();
+            let mut values = self.args(args)?.into_iter();
+            let mut arg = values.next();
+            let mut item = values.next();
             let mut out = Value::Void;
             self.write_steps(&mut root, &steps, &mut |slot| {
                 through_ref(slot, |slot| {
@@ -1835,6 +1863,15 @@ impl Interpreter<'_> {
                             Ok(i) if i < items.len() => Value::Some(Rc::new(items.remove(i))),
                             _ => Value::None,
                         },
+                        ("insert", Some(Value::Int(i))) => {
+                            match (usize::try_from(i), item.take()) {
+                                (Ok(i), Some(v)) if i <= items.len() => {
+                                    items.insert(i, v);
+                                    Value::Void
+                                }
+                                _ => return panic(Code::index_out_of_range, span),
+                            }
+                        }
                         _ => return internal(&format!("`{name}` with the wrong argument"), span),
                     };
                     Ok(())
@@ -1849,34 +1886,17 @@ impl Interpreter<'_> {
 
     fn builtin_method(&mut self, recv: Value, name: &str, args: Vec<Value>, span: Span) -> Eval {
         let scanned = match &recv {
-            Value::List(items) if matches!(name, "contains" | "join" | "enumerate") => items.len(),
             Value::Map(entries) if matches!(name, "keys" | "values") => entries.len(),
             _ => 1,
         };
         self.spend(scanned as u64, span)?;
-        let arg_str = |i: usize| args.get(i).map(Value::display).unwrap_or_default();
+        let reason = match args.first() {
+            Some(Value::Some(r)) => Some(r.display()),
+            _ => None,
+        };
         Ok(match (recv, name) {
             (Value::List(items), "length") => Value::Int(items.len() as i64),
-            (Value::List(items), "isEmpty") => Value::Bool(items.is_empty()),
-            (Value::List(items), "contains") => {
-                Value::Bool(args.first().is_some_and(|a| items.contains(a)))
-            }
-            (Value::List(items), "first") => items
-                .first()
-                .map_or(Value::None, |v| Value::Some(Rc::new(v.clone()))),
-            (Value::List(items), "last") => items
-                .last()
-                .map_or(Value::None, |v| Value::Some(Rc::new(v.clone()))),
-            (Value::List(items), "indices") => Value::Range(0, items.len() as i64, false),
-            (Value::List(items), "enumerate") => Value::List(Rc::new(
-                items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, x)| pair(Value::Int(i as i64), x.clone()))
-                    .collect(),
-            )),
             (Value::Map(entries), "length") => Value::Int(entries.len() as i64),
-            (Value::Map(entries), "isEmpty") => Value::Bool(entries.is_empty()),
             (Value::Map(entries), "contains") => {
                 Value::Bool(args.first().is_some_and(|k| entries.contains_key(k)))
             }
@@ -1887,35 +1907,11 @@ impl Interpreter<'_> {
                 Value::List(Rc::new(entries.iter().map(|(_, v)| v.clone()).collect()))
             }
             (Value::Set(items), "length") => Value::Int(items.len() as i64),
-            (Value::Set(items), "isEmpty") => Value::Bool(items.is_empty()),
             (Value::Set(items), "contains") => {
                 Value::Bool(args.first().is_some_and(|a| items.contains(a)))
             }
-            (Value::List(items), "join") => {
-                let parts: Vec<String> = items.iter().map(Value::display).collect();
-                Value::Str(parts.join(&arg_str(0)).into())
-            }
-            (Value::List(items), "map") => {
-                let f = args.into_iter().next().unwrap_or(Value::Void);
-                let mut out = Vec::with_capacity(items.len());
-                for item in items.iter() {
-                    out.push(self.call_value(&f, vec![item.clone()], span)?);
-                }
-                Value::List(Rc::new(out))
-            }
-            (Value::List(items), "filter") => {
-                let f = args.into_iter().next().unwrap_or(Value::Void);
-                let mut out = Vec::new();
-                for item in items.iter() {
-                    if self.call_value(&f, vec![item.clone()], span)?.truthy() {
-                        out.push(item.clone());
-                    }
-                }
-                Value::List(Rc::new(out))
-            }
             (Value::Some(v), "orPanic") => (*v).clone(),
             (Value::None, "orPanic") => {
-                let reason = args.first().map(Value::display);
                 return Err(Flow::Panic(Panic {
                     code: Code::or_panic_on_none,
                     span,
@@ -1926,8 +1922,8 @@ impl Interpreter<'_> {
             (Value::Variant(r), "orPanic") if &*r.name == "Ok" => r.fields[0].clone(),
             (Value::Variant(r), "orPanic") => {
                 let err = self.text(&r.fields[0], false, span)?;
-                let reason = match args.first() {
-                    Some(reason) => format!("{}: {err}", reason.display()),
+                let reason = match reason {
+                    Some(reason) => format!("{reason}: {err}"),
                     None => err,
                 };
                 return Err(Flow::Panic(Panic {
@@ -1936,27 +1932,6 @@ impl Interpreter<'_> {
                     reason: Some(reason),
                     stack: Vec::new(),
                 }));
-            }
-            (Value::Variant(r), "ok") if &*r.name == "Ok" => {
-                Value::Some(Rc::new(r.fields[0].clone()))
-            }
-            (Value::Variant(_), "ok") => Value::None,
-            (v @ (Value::Some(_) | Value::None), "orErr") => {
-                let (name, field) = match v {
-                    Value::Some(v) => ("Ok", (*v).clone()),
-                    _ => ("Err", args.into_iter().next().unwrap_or(Value::Void)),
-                };
-                result_variant(name, field)
-            }
-            (v @ (Value::Some(_) | Value::None), "flatten") => {
-                let mut v = v;
-                while let Value::Some(inner) = &v {
-                    match &**inner {
-                        Value::Some(_) | Value::None => v = (**inner).clone(),
-                        _ => break,
-                    }
-                }
-                v
             }
             (recv, name) => {
                 return internal(&format!("no method `{name}` on {}", recv.code()), span);

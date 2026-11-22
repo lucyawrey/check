@@ -1,0 +1,18 @@
+implement Map<K, V> {
+  external func length() -> Int
+  external func contains(key: K) -> Bool
+  external func remove(key: K) -> V?
+  external func keys() -> List<K>
+  external func values() -> List<V>
+
+  func isEmpty() -> Bool { this.length() == 0 }
+}
+
+implement Set<T> {
+  external func length() -> Int
+  external func contains(item: T) -> Bool
+  external func add(item: T)
+  external func remove(item: T) -> Bool
+
+  func isEmpty() -> Bool { this.length() == 0 }
+}

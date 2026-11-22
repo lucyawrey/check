@@ -43,7 +43,6 @@
 - `negative_literal_exponent` a negative literal exponent on an `Int` (`2 ** -1`)
 - `unhandled_maybe` a `T?` used where a `T` is needed
 - `doubled_maybe` a `T?` body in an `if` without `else` or a value loop, where a plain `T?` is expected
-- `flatten_without_nesting` `flatten()` on a `T?` with nothing nested
 - `not_iterable` `for` over something that isn't a list or range
 - `try_outside_failable` `try` in a function that returns neither a `Maybe` nor a `Result` (added by the agent while building, 2026-11-14)
 - `try_result_in_maybe` `try` on a `Result` in a function returning a `Maybe` (suggests `try x.ok()`)

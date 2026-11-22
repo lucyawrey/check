@@ -84,6 +84,8 @@ pub struct ImplementDecl {
     pub target_args: Vec<TypeExpr>,
     /// `T: Eq` in `implement List<T: Eq>`.
     pub bounds: Vec<TypeParam>,
+    /// The names in the target that the resolver found to be parameters, not types.
+    pub params: Vec<String>,
     pub interface: Option<TypeExpr>,
     pub span: Span,
     pub members: Members,

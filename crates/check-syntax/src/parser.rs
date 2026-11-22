@@ -542,6 +542,7 @@ impl Parser<'_> {
             target,
             target_args,
             bounds,
+            params: Vec::new(),
             interface,
             span: start.to(self.prev_span()),
             members,

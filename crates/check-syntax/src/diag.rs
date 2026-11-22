@@ -88,7 +88,6 @@ codes! {
     negative_literal_exponent,
     unhandled_maybe,
     doubled_maybe,
-    flatten_without_nesting,
     not_iterable,
     invalid_key_type,
     try_outside_failable,

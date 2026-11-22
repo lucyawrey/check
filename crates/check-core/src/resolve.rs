@@ -425,6 +425,7 @@ impl Resolver<'_> {
                 for a in &i.target_args {
                     self.introduce_params(a);
                 }
+                i.params = self.type_params.difference(&saved).cloned().collect();
                 self.type_exprs(&mut i.target_args);
                 for b in &mut i.bounds {
                     self.type_exprs(&mut b.bounds);
