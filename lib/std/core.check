@@ -15,3 +15,25 @@ interface Printable {
 }
 
 interface Eq {}
+
+enum Ordering {
+  Less
+  Equal
+  Greater
+}
+
+interface Comparable {
+  func compare(other: This) -> Ordering
+}
+
+implement Comparable for Int {
+  external func compare(other: Int) -> Ordering
+}
+
+implement Comparable for Float {
+  external func compare(other: Float) -> Ordering
+}
+
+implement Comparable for String {
+  external func compare(other: String) -> Ordering
+}

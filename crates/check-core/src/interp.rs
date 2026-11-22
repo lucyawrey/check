@@ -552,6 +552,22 @@ impl Interpreter<'_> {
     }
 
     /// The method `name` of `this`'s type, its own or an interface default.
+    fn compare_by_method(&mut self, op: BinOp, l: Value, r: Value, span: Span) -> Eval {
+        let decl = self.find_method(&l, "compare");
+        let names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+        let (order, _) = self.run_decl(&decl, vec![r], Some(l), span, &names)?;
+        let name = match &order {
+            Value::Variant(v) => v.name.clone(),
+            _ => unreachable!("compare returns an Ordering"),
+        };
+        Ok(Value::Bool(match op {
+            BinOp::Lt => &*name == "Less",
+            BinOp::Gt => &*name == "Greater",
+            BinOp::Le => &*name != "Greater",
+            _ => &*name != "Less",
+        }))
+    }
+
     fn find_method(&self, this: &Value, name: &str) -> Rc<FuncDecl> {
         let key = format!("{}.{name}", this.tag());
         let key = self.info.aliases.get(&key).unwrap_or(&key);
@@ -1438,6 +1454,11 @@ impl Interpreter<'_> {
             _ => {
                 let l = self.expr(lhs)?;
                 let r = self.expr(rhs)?;
+                if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge)
+                    && matches!(l, Value::Object(_) | Value::Variant(_))
+                {
+                    return self.compare_by_method(op, l, r, span);
+                }
                 arith(op, l, r, span)
             }
         }

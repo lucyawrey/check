@@ -3646,3 +3646,26 @@ fn an_interface_names_the_implementing_type_as_this() {
     assert_eq!(output(&src("P")), "1");
     assert_eq!(first_error(&src("Int")), "wrong_implementation");
 }
+
+#[test]
+fn comparable_types_order_with_compare_and_comparison_operators() {
+    let p = "class P(n: Int)\nimplement Comparable for P {\n  func compare(other: P) -> Ordering { this.n.compare(other.n) }\n}\nfunc least<T: Comparable>(a: T, b: T) -> T { if a < b { a } else { b } }\n";
+    assert_eq!(
+        output(&format!(
+            "{p}print(P(1) < P(2))\nprint(P(3) <= P(2))\nprint(least(P(5), P(4)).n)\nprint(least(\"x\", \"w\"))"
+        )),
+        "true\nfalse\n4\nw"
+    );
+    assert_eq!(
+        output("print(2.compare(1))\nprint((0.0 / 0.0).compare(1.0))\nprint(\"a\".compare(\"b\"))"),
+        "Greater\nGreater\nLess"
+    );
+    assert_eq!(
+        first_error("class Q(n: Int)\nprint(Q(1) < Q(2))"),
+        "invalid_operand_types"
+    );
+    assert_eq!(
+        output("enum Mood {\n  Equal\n  Other\n}\nlet m: Mood = Equal\nprint(m)"),
+        "Equal"
+    );
+}

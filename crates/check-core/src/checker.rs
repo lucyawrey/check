@@ -336,6 +336,8 @@ pub(crate) const THIS: &str = "This";
 pub(crate) const RESULT: &str = "check.std.Result";
 pub(crate) const PRINTABLE: &str = "check.std.Printable";
 pub(crate) const EQ: &str = "check.std.Eq";
+pub(crate) const ORDERING: &str = "check.std.Ordering";
+const COMPARABLE: &str = "check.std.Comparable";
 
 pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Vec<Diagnostic>) {
     let mut checker = Checker {
@@ -3478,7 +3480,9 @@ impl Checker<'_> {
                 if numeric {
                     widen(self);
                     Ty::Bool
-                } else if a == Ty::Str && b == Ty::Str {
+                } else if (a == Ty::Str && b == Ty::Str)
+                    || (self.subst.unify(&a, &b) && self.implements(&a, &Ty::named(COMPARABLE)))
+                {
                     Ty::Bool
                 } else {
                     self.error(Code::invalid_operand_types, span)
