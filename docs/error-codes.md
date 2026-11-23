@@ -101,6 +101,7 @@
 - `conflicting_defaults` two interfaces with defaults for the same method, which the type doesn't override
 - `field_requirement_needs_class` an interface that requires fields, implemented by an enum or built-in type
 - `implement_for_specific_arguments` an interface implemented for some of a generic type's arguments (`implement Shape for Box<Int>`), since they're erased at run time
+- `bound_on_concrete_type` a bound on a type rather than a parameter in an `implement` target (`implement List<Int: Eq>`)
 - `list_needs_type` a list of values of different types with no declared element type (`let xs: Shape[] = ...`)
 - `interface_field_extras` an interface field with a default, `private` or `readonly`, which only an implementing class can give it
 - `code_in_pure_data` something other than a literal in a `.con` file (use `.conx` for computed values)
@@ -143,6 +144,7 @@
 - `shared_wraps_shared_class` `Shared` of a `shared class`, which is already shared
 - `ref_param_of_shared_class` a `ref` parameter of a `shared class` type, which is already shared
 - `shadowed_name` a local that shadows a function or type
+- `replaces_std_method` a method an `implement` adds with the same name as a `check:std` method on that type, which replaces it
 - `repeated_namespace` a `namespace` line that only repeats its package's, which the manifest already sets
 - `interpolated_maybe` interpolating a `T?`
 - `nested_maybe` an `if` or loop value that is a `T??`

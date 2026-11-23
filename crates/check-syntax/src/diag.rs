@@ -144,6 +144,7 @@ codes! {
     conflicting_defaults,
     field_requirement_needs_class,
     implement_for_specific_arguments,
+    bound_on_concrete_type,
     list_needs_type,
     interface_field_extras,
     code_in_pure_data,
@@ -193,6 +194,7 @@ codes! {
     record_beside_class,
     fields_only_body,
     bracket_on_new_line,
+    replaces_std_method,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

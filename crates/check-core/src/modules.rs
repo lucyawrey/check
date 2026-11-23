@@ -80,6 +80,10 @@ const LIBRARY: &[(usize, &str, &str)] = &[
     ),
 ];
 
+pub fn is_std_file(path: &str) -> bool {
+    LIBRARY.iter().any(|(u, p, _)| *u == STD && *p == path)
+}
+
 const MANIFESTS: &[(usize, &str, &str)] = &[
     (
         STD,

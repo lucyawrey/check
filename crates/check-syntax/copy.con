@@ -109,6 +109,7 @@ wrong_implementation = "[These types don't match the interface's]"
 conflicting_defaults = "[Two interfaces give this method different defaults: write it here]"
 field_requirement_needs_class = "[This interface requires fields, so only a class can implement it]"
 implement_for_specific_arguments = "[An interface has to be implemented for every version of a generic type]"
+bound_on_concrete_type = "[a bound in an `implement` target on a type, not a parameter]"
 list_needs_type = "[This list mixes types: write its element type]"
 interface_field_extras = "[An interface field can't have a default, or be private or readonly]"
 code_in_pure_data = "[A `.con` file can only hold values, not code]"
@@ -158,6 +159,7 @@ ref_global_written = "[This function also changes this global, so it can't be pa
 record_beside_class = "[The class is already written beside this record: leave it out]"
 fields_only_body = "[A class with only fields is written with its fields in `()`]"
 bracket_on_new_line = "[Put the `{` or `(` on the same line as the declaration before it]"
+replaces_std_method = "[a method that replaces a `check:std` method of the same name]"
 
 // Command line
 tidy_summary = "[Made {fixes} fixes in {files} files]"

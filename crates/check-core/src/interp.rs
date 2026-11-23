@@ -88,7 +88,6 @@ pub struct Interpreter<'a> {
 
 const MAX_DEPTH: usize = 10_000;
 
-/// The `external` methods in `check:std` whose bodies are here rather than in `host.rs`.
 pub const BUILT_IN_METHODS: &[&str] = &[
     "List.length",
     "List.push",
@@ -571,7 +570,6 @@ impl Interpreter<'_> {
             .is_some_and(|i| i.contains(iface))
     }
 
-    /// The method `name` of `this`'s type, its own or an interface default.
     fn compare_by_method(&mut self, op: BinOp, l: Value, r: Value, span: Span) -> Eval {
         let decl = self.find_method(&l, "compare");
         let names: Vec<String> = decl.params.iter().map(|p| p.name.clone()).collect();
@@ -588,6 +586,7 @@ impl Interpreter<'_> {
         }))
     }
 
+    /// The method `name` of `this`'s type, its own or an interface default.
     fn find_method(&self, this: &Value, name: &str) -> Rc<FuncDecl> {
         let key = format!("{}.{name}", this.tag());
         let key = self.info.aliases.get(&key).unwrap_or(&key);
@@ -1475,7 +1474,7 @@ impl Interpreter<'_> {
                 let l = self.expr(lhs)?;
                 let r = self.expr(rhs)?;
                 if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge)
-                    && matches!(l, Value::Object(_) | Value::Variant(_))
+                    && !matches!(l, Value::Int(_) | Value::Float(_) | Value::Str(_))
                 {
                     return self.compare_by_method(op, l, r, span);
                 }

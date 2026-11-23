@@ -331,7 +331,6 @@ pub(crate) const SHARED: &str = "Shared";
 /// The bound a map key or set item's type needs; not a real interface.
 const KEY: &str = "check.std.Key";
 const ANY_GLOBAL: &str = "*";
-/// The type implementing an interface, inside its declaration.
 pub(crate) const THIS: &str = "This";
 pub(crate) const RESULT: &str = "check.std.Result";
 pub(crate) const PRINTABLE: &str = "check.std.Printable";
@@ -674,12 +673,16 @@ impl Checker<'_> {
         self.save_type_bounds(&c.name, &c.type_params, saved);
     }
 
-    fn declare_implement(&mut self, i: &ImplementDecl) {
-        let own = match i.target.as_str() {
+    fn type_params_of(&self, name: &str) -> Vec<String> {
+        match name {
             "List" | SET => vec!["T".to_string()],
             MAP => vec!["K".to_string(), "V".to_string()],
             name => self.generics.get(name).cloned().unwrap_or_default(),
-        };
+        }
+    }
+
+    fn declare_implement(&mut self, i: &ImplementDecl) {
+        let own = self.type_params_of(&i.target);
         let arity = own.len();
         let known = BUILT_IN_TYPES.contains(&i.target.as_str())
             || ["List", MAP, SET].contains(&i.target.as_str())
@@ -711,6 +714,10 @@ impl Checker<'_> {
             }
         }
         for b in &i.bounds {
+            if !i.params.contains(&b.name) {
+                self.error(Code::bound_on_concrete_type, b.span);
+                continue;
+            }
             let name = self.renamed.get(&b.name).cloned().unwrap_or(b.name.clone());
             let bounds = b.bounds.iter().map(|t| self.type_from(t)).collect();
             self.bounds.insert(name, bounds);
@@ -837,9 +844,12 @@ impl Checker<'_> {
     }
 
     fn declare_func(&mut self, decl: &FuncDecl, this: Option<(Ty, bool)>, owner: Option<&str>) {
-        if self.funcs.contains_key(&decl.name) {
+        if let Some(existing) = self.funcs.get(&decl.name) {
             if !self.in_library {
                 self.error(Code::duplicate_name, decl.span);
+            } else if owner.is_some() && !existing.library {
+                let span = existing.decl.span;
+                self.warn(Code::replaces_std_method, span);
             }
             return;
         }
@@ -1415,14 +1425,19 @@ impl Checker<'_> {
         let mut owners: Vec<String> = self.impls.keys().cloned().collect();
         owners.sort();
         for owner in owners {
-            let this = self.own_type(&owner);
+            let params: Vec<Ty> = self
+                .type_params_of(&owner)
+                .into_iter()
+                .map(Ty::Param)
+                .collect();
             let this = match owner.as_str() {
                 "Int" => Ty::Int,
                 "Float" => Ty::Float,
                 "Bool" => Ty::Bool,
                 "String" => Ty::Str,
-                MAYBE => Ty::maybe(Ty::Param(self.generics[MAYBE][0].clone())),
-                _ => this,
+                MAYBE => Ty::maybe(params[0].clone()),
+                "List" => Ty::list(params[0].clone()),
+                _ => Ty::Named(owner.clone(), params),
             };
             let span = self.impl_spans[&owner];
             let all = self.interfaces_of(&this);
@@ -3919,7 +3934,6 @@ impl Checker<'_> {
             let key = self.method_key(&tag, name, &recv_ty);
             if self.funcs.get(&key).is_some_and(|f| f.this.is_some()) {
                 self.check_private_method(&key, &tag, span);
-                // A built-in change to a collection writes back by name, as it has no body.
                 if self.funcs[&key].decl.body.is_some() || !MUTATING.contains(&name) {
                     self.info.resolved.insert(id, Resolved::Method(key.clone()));
                 }

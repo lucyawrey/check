@@ -409,16 +409,19 @@ fn edge_values_that_have_an_answer_dont_overflow() {
     prints("0..=3", "0..=3");
 }
 
-#[test]
-fn a_panic_lists_the_calls_it_came_through() {
-    let src = "func a() { panic(\"boom\") }\nfunc b() { a() }\nb()";
+fn panic_text(src: &str) -> String {
     let report = run_source(
         "test.check",
         src,
         &mut Cursor::new(Vec::new()),
         &mut Vec::new(),
     );
-    let text = report.panic_text.unwrap_or_default();
+    report.panic_text.unwrap_or_default()
+}
+
+#[test]
+fn a_panic_lists_the_calls_it_came_through() {
+    let text = panic_text("func a() { panic(\"boom\") }\nfunc b() { a() }\nb()");
     assert!(text.contains("test.check:1:12"), "{text}");
     assert!(text.contains("at test.check:2:12"), "{text}");
     assert!(text.contains("at test.check:3:1"), "{text}");
@@ -3731,4 +3734,47 @@ fn flatten_removes_one_layer_of_maybe() {
         first_error("let x: Int? = Some(1)\nprint(x.flatten())"),
         "unknown_method"
     );
+}
+
+#[test]
+fn a_panic_inside_std_points_at_the_users_call() {
+    assert_eq!(
+        panic_text("print([9223372036854775807, 1].sum())"),
+        "panic[integer_overflow]: [This number got too big for an Int]\n --> test.check:1:7\n"
+    );
+    let text = panic_text("print([1, 0].map(func(x) => 10 / x))");
+    assert!(!text.contains("lib/std"), "{text}");
+}
+
+#[test]
+fn comparison_operators_use_a_users_compare_on_maybe_and_list() {
+    let src = "implement Comparable for Maybe<T> {\n  func compare(other: T?) -> Ordering { Less }\n}\nimplement Comparable for List<T> {\n  func compare(other: List<T>) -> Ordering { this.length().compare(other.length()) }\n}\nlet a: Int? = Some(1)\nprint(a < a)\nprint([1, 2] < [5])\nprint([[1, 2], [3]].sorted())";
+    assert_eq!(output(src), "true\nfalse\n[[3], [1, 2]]");
+}
+
+#[test]
+fn an_implement_bound_must_be_on_a_parameter() {
+    assert_eq!(
+        first_error("implement List<Int: Eq> {\n  func z() -> Int { 1 }\n}"),
+        "bound_on_concrete_type"
+    );
+}
+
+#[test]
+fn a_generic_caller_of_contains_needs_eq() {
+    let has = |bound: &str| {
+        format!(
+            "func has<T{bound}>(xs: List<T>, x: T) -> Bool {{ xs.contains(x) }}\nprint(has([1], 1))"
+        )
+    };
+    assert_eq!(first_error(&has("")), "unmet_constraint");
+    assert_eq!(output(&has(": Eq")), "true");
+}
+
+#[test]
+fn a_method_with_a_std_methods_name_replaces_it_with_a_warning() {
+    let src =
+        "implement List<T> {\n  func push(item: T) { }\n}\nvar xs = [1]\nxs.push(2)\nprint(xs)";
+    assert_eq!(warnings(src), ["replaces_std_method"]);
+    assert_eq!(output(src), "[1]");
 }
