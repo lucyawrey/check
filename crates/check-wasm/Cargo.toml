@@ -1,0 +1,12 @@
+[package]
+name = "check-wasm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wasm-encoder = { version = "0.263.0", features = ["wasmparser"] }
+wasmparser = "0.263.0"
+
+[dev-dependencies]
+wasmtime = "51.0.0"
+wasmtime-wasi = "51.0.0"
