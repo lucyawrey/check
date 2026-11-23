@@ -82,6 +82,8 @@ pub struct ImplementDecl {
     pub target: String,
     /// `Box<T>` or `Box<Int>`; a name that isn't a type introduces a parameter.
     pub target_args: Vec<TypeExpr>,
+    pub bounds: Vec<TypeParam>,
+    pub params: Vec<String>,
     pub interface: Option<TypeExpr>,
     pub span: Span,
     pub members: Members,

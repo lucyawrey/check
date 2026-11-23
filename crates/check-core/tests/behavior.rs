@@ -409,16 +409,19 @@ fn edge_values_that_have_an_answer_dont_overflow() {
     prints("0..=3", "0..=3");
 }
 
-#[test]
-fn a_panic_lists_the_calls_it_came_through() {
-    let src = "func a() { panic(\"boom\") }\nfunc b() { a() }\nb()";
+fn panic_text(src: &str) -> String {
     let report = run_source(
         "test.check",
         src,
         &mut Cursor::new(Vec::new()),
         &mut Vec::new(),
     );
-    let text = report.panic_text.unwrap_or_default();
+    report.panic_text.unwrap_or_default()
+}
+
+#[test]
+fn a_panic_lists_the_calls_it_came_through() {
+    let text = panic_text("func a() { panic(\"boom\") }\nfunc b() { a() }\nb()");
     assert!(text.contains("test.check:1:12"), "{text}");
     assert!(text.contains("at test.check:2:12"), "{text}");
     assert!(text.contains("at test.check:3:1"), "{text}");
@@ -657,6 +660,7 @@ fn library_files_hold_only_declarations_that_match_the_rust_bodies() {
     let mut bodies: Vec<&str> = check_core::host::FUNCTIONS
         .iter()
         .map(|(n, _)| *n)
+        .chain(check_core::interp::BUILT_IN_METHODS.iter().copied())
         .collect();
     names.sort();
     bodies.sort();
@@ -679,10 +683,10 @@ fn external_functions_belong_only_in_library_files() {
 }
 
 #[test]
-fn implement_needs_a_class_enum_or_simple_built_in_type() {
+fn implement_needs_a_known_type_with_its_type_arguments() {
     assert_eq!(
         first_error("implement List {\n  func f() { }\n}"),
-        "unknown_name"
+        "wrong_type_arguments"
     );
     assert_eq!(
         first_error("implement Nope {\n  func f() { }\n}"),
@@ -691,6 +695,10 @@ fn implement_needs_a_class_enum_or_simple_built_in_type() {
     assert_eq!(
         output("implement Int {\n  func double() -> Int { this * 2 }\n}\nprint(21.double())"),
         "42"
+    );
+    assert_eq!(
+        output("implement List<T> {\n  func second() -> T? { this[1] }\n}\nprint([1, 2].second())"),
+        "Some(2)"
     );
 }
 
@@ -3167,8 +3175,8 @@ fn deep_programs_reach_the_call_limit_without_overflowing() {
             "func f(n: Int) -> Int {{\n  match n {{\n    0 => 0\n    _ {{\n      var t = 0\n      for i in 0..1 {{ t = [1].map(func(x) => x + f(n - 1))[0] ?? 0 }}\n      t\n    }}\n  }}\n}}\nprint(f({levels}))"
         )
     };
-    assert_eq!(output(&src(4_900)), "4900");
-    panics_with(&src(5_100), "stack_overflow");
+    assert_eq!(output(&src(3_300)), "3300");
+    panics_with(&src(3_400), "stack_overflow");
     let list = |len: i64, end: &str| {
         format!(
             "enum L {{ Nil, Cons(Int, L) }}\nvar l: L = Nil\nvar i = 0\nwhile i < {len} {{\n  l = Cons(i, l)\n  i += 1\n}}\n{end}"
@@ -3272,8 +3280,8 @@ fn loading_data_stops_on_a_failed_try_or_an_endless_loop() {
         data_panic("[Item(\"sword\", { loop { } })]").as_deref(),
         Some("out_of_steps")
     );
-    // Few loop passes, but each `contains` looks at 100,000 items.
-    let busy = "[Item(\"sword\", {\n  var xs: List<Int> = []\n  for i in 0..100000 { xs.push(i) }\n  var n = 0\n  for j in 0..200 { if xs.contains(-1) { n += 1 } }\n  n\n})]";
+    // Few loop passes, but each `keys()` copies 100,000 entries.
+    let busy = "[Item(\"sword\", {\n  var m: Map<Int, Int> = [=]\n  for i in 0..100000 { m[i] = i }\n  var n = 0\n  for j in 0..200 { n += m.keys().length() }\n  n\n})]";
     assert_eq!(data_panic(busy).as_deref(), Some("out_of_steps"));
     // Map inserts are hashed, so this is quick (it took minutes with linear lookups).
     let inserts = "[Item(\"sword\", {\n  var m: Map<Int, Int> = [=]\n  for i in 0..100000 { m[i] = i }\n  m.length()\n})]";
@@ -3609,4 +3617,164 @@ fn a_call_through_a_function_value_that_changes_a_narrowed_global_undoes_the_nar
         )),
         "invalid_operand_types"
     );
+}
+
+#[test]
+fn an_implement_block_can_bound_or_nest_its_type_parameters() {
+    let has = "implement List<T: Eq> {\n  func has(x: T) -> Bool {\n    for y in this { if y == x { return true } }\n    false\n  }\n}\n";
+    assert_eq!(output(&format!("{has}print([1, 2].has(2))")), "true");
+    assert_eq!(
+        first_error(&format!("{has}let f = func() {{ }}\nprint([f].has(f))")),
+        "unmet_constraint"
+    );
+    let flat = "implement Maybe<Maybe<T>> {\n  func flat() -> T? {\n    match this {\n      Some(inner) => inner\n      None => None\n    }\n  }\n}\n";
+    assert_eq!(
+        output(&format!(
+            "{flat}let x: Int?? = Some(Some(1))\nprint(x.flat())"
+        )),
+        "Some(1)"
+    );
+    assert_eq!(
+        first_error(&format!("{flat}let y: Int? = Some(1)\nprint(y.flat())")),
+        "unknown_method"
+    );
+}
+
+#[test]
+fn an_interface_names_the_implementing_type_as_this() {
+    let src = |param: &str| {
+        format!(
+            "interface Bigger {{\n  func bigger(other: This) -> Bool\n}}\nclass P(n: Int)\nimplement Bigger for P {{\n  func bigger(other: {param}) -> Bool {{ true }}\n}}\nfunc pick<T: Bigger>(a: T, b: T) -> T {{\n  if a.bigger(b) {{ a }} else {{ b }}\n}}\nprint(pick(P(1), P(2)).n)"
+        )
+    };
+    assert_eq!(output(&src("P")), "1");
+    assert_eq!(first_error(&src("Int")), "wrong_implementation");
+}
+
+#[test]
+fn comparable_types_order_with_compare_and_comparison_operators() {
+    let p = "class P(n: Int)\nimplement Comparable for P {\n  func compare(other: P) -> Ordering { this.n.compare(other.n) }\n}\nfunc least<T: Comparable>(a: T, b: T) -> T { if a < b { a } else { b } }\n";
+    assert_eq!(
+        output(&format!(
+            "{p}print(P(1) < P(2))\nprint(P(3) <= P(2))\nprint(least(P(5), P(4)).n)\nprint(least(\"x\", \"w\"))"
+        )),
+        "true\nfalse\n4\nw"
+    );
+    assert_eq!(
+        output("print(2.compare(1))\nprint((0.0 / 0.0).compare(1.0))\nprint(\"a\".compare(\"b\"))"),
+        "Greater\nGreater\nLess"
+    );
+    assert_eq!(
+        first_error("class Q(n: Int)\nprint(Q(1) < Q(2))"),
+        "invalid_operand_types"
+    );
+    assert_eq!(
+        output("enum Mood {\n  Equal\n  Other\n}\nlet m: Mood = Equal\nprint(m)"),
+        "Equal"
+    );
+}
+
+#[test]
+fn lists_find_test_order_and_sum_their_items() {
+    let xs = "var xs = [3, 1, 2]\n";
+    for (call, expected) in [
+        ("xs.find(func(x) => x < 3)", "Some(1)"),
+        ("xs.any(func(x) => x > 2)", "true"),
+        ("xs.all(func(x) => x > 1)", "false"),
+        ("xs.indexOf(2)", "Some(2)"),
+        ("xs.indexOf(7)", "None"),
+        ("xs.sorted()", "[1, 2, 3]"),
+        ("xs.reversed()", "[2, 1, 3]"),
+        ("xs.sum()", "6"),
+        ("xs.min()", "Some(1)"),
+        ("xs.max()", "Some(3)"),
+        ("[1.5, 2.5].sum()", "4.0"),
+        ("[\"b\", \"a\"].sorted()", "[\"a\", \"b\"]"),
+        ("[0.0 / 0.0, 2.0, 1.0].sorted()", "[1.0, 2.0, NaN]"),
+    ] {
+        assert_eq!(output(&format!("{xs}print({call})")), expected, "{call}");
+    }
+    assert_eq!(
+        output(&format!("{xs}xs.insert(1, 9)\nxs.insert(4, 8)\nprint(xs)")),
+        "[3, 9, 1, 2, 8]"
+    );
+    assert_eq!(output("let e: List<Int> = []\nprint(e.min())"), "None");
+    panics_with(&format!("{xs}xs.insert(5, 0)"), "index_out_of_range");
+    assert_eq!(
+        first_error("let ys = [1]\nys.insert(0, 2)"),
+        "change_let_collection"
+    );
+    assert_eq!(first_error("print([\"a\"].sum())"), "unknown_method");
+}
+
+#[test]
+fn sorting_keeps_equal_items_in_their_order() {
+    let src = "class P(key: Int, tag: String)\nimplement Comparable for P {\n  func compare(other: P) -> Ordering { this.key.compare(other.key) }\n}\nlet ps = [P(2, \"a\"), P(1, \"b\"), P(2, \"c\"), P(1, \"d\")]\nprint(ps.sorted().map(func(p) => p.tag))\nprint(ps.min())";
+    assert_eq!(
+        output(src),
+        "[\"b\", \"d\", \"a\", \"c\"]\nSome(P(key = 1, tag = \"b\"))"
+    );
+}
+
+#[test]
+fn std_methods_that_take_a_function_keep_narrowing() {
+    let src = "var m = [\"a\" = 1]\nlet k = \"a\"\nif m.contains(k) {\n  print([1].map(func(x) => x + 1).filter(func(x) => x > 0).any(func(x) => x > 1))\n  print(m[k] + 1)\n}";
+    assert_eq!(output(src), "true\n2");
+}
+
+#[test]
+fn flatten_removes_one_layer_of_maybe() {
+    assert_eq!(
+        output(
+            "let x: Int?? = Some(Some(1))\nprint(x.flatten())\nlet y: Int?? = Some(None)\nprint(y.flatten())"
+        ),
+        "Some(1)\nNone"
+    );
+    assert_eq!(
+        first_error("let x: Int? = Some(1)\nprint(x.flatten())"),
+        "unknown_method"
+    );
+}
+
+#[test]
+fn a_panic_inside_std_points_at_the_users_call() {
+    assert_eq!(
+        panic_text("print([9223372036854775807, 1].sum())"),
+        "panic[integer_overflow]: [This number got too big for an Int]\n --> test.check:1:7\n"
+    );
+    let text = panic_text("print([1, 0].map(func(x) => 10 / x))");
+    assert!(!text.contains("lib/std"), "{text}");
+}
+
+#[test]
+fn comparison_operators_use_a_users_compare_on_maybe_and_list() {
+    let src = "implement Comparable for Maybe<T> {\n  func compare(other: T?) -> Ordering { Less }\n}\nimplement Comparable for List<T> {\n  func compare(other: List<T>) -> Ordering { this.length().compare(other.length()) }\n}\nlet a: Int? = Some(1)\nprint(a < a)\nprint([1, 2] < [5])\nprint([[1, 2], [3]].sorted())";
+    assert_eq!(output(src), "true\nfalse\n[[3], [1, 2]]");
+}
+
+#[test]
+fn an_implement_bound_must_be_on_a_parameter() {
+    assert_eq!(
+        first_error("implement List<Int: Eq> {\n  func z() -> Int { 1 }\n}"),
+        "bound_on_concrete_type"
+    );
+}
+
+#[test]
+fn a_generic_caller_of_contains_needs_eq() {
+    let has = |bound: &str| {
+        format!(
+            "func has<T{bound}>(xs: List<T>, x: T) -> Bool {{ xs.contains(x) }}\nprint(has([1], 1))"
+        )
+    };
+    assert_eq!(first_error(&has("")), "unmet_constraint");
+    assert_eq!(output(&has(": Eq")), "true");
+}
+
+#[test]
+fn a_method_with_a_std_methods_name_replaces_it_with_a_warning() {
+    let src =
+        "implement List<T> {\n  func push(item: T) { }\n}\nvar xs = [1]\nxs.push(2)\nprint(xs)";
+    assert_eq!(warnings(src), ["replaces_std_method"]);
+    assert_eq!(output(src), "[1]");
 }

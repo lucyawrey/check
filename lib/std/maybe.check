@@ -1,0 +1,30 @@
+implement Maybe<T> {
+  external func orPanic(reason: String? = None) -> T
+
+  func orErr<E>(error: E) -> Result<T, E> {
+    match this {
+      Some(value) => Ok(value)
+      None => Err(error)
+    }
+  }
+}
+
+implement Maybe<Maybe<T>> {
+  func flatten() -> T? {
+    match this {
+      Some(inner) => inner
+      None => None
+    }
+  }
+}
+
+implement Result<T, E> {
+  external func orPanic(reason: String? = None) -> T
+
+  func ok() -> T? {
+    match this {
+      Ok(value) => Some(value)
+      Err(_) => None
+    }
+  }
+}

@@ -517,17 +517,19 @@ impl Parser<'_> {
 
     fn implement_decl(&mut self) -> PResult<ImplementDecl> {
         let start = self.advance().span;
-        let mut target = self.type_expr()?;
+        let (mut target, mut target_args, mut bounds, span) = self.implement_target()?;
         let mut interface = None;
         if self.eat_kw("for") {
-            interface = Some(target);
-            target = self.type_expr()?;
+            if !bounds.is_empty() {
+                return self.error(Code::unexpected_token, span);
+            }
+            interface = Some(if target_args.is_empty() {
+                TypeExpr::Name(target, span)
+            } else {
+                TypeExpr::Generic(target, target_args, span)
+            });
+            (target, target_args, bounds, _) = self.implement_target()?;
         }
-        let (target, target_args) = match target {
-            TypeExpr::Name(name, _) => (name, Vec::new()),
-            TypeExpr::Generic(name, args, _) if name != "List" => (name, args),
-            _ => return self.error(Code::unexpected_token, self.prev_span()),
-        };
         let mut members = Members::default();
         let owner = target.clone();
         self.body(|p| {
@@ -539,10 +541,47 @@ impl Parser<'_> {
         Ok(ImplementDecl {
             target,
             target_args,
+            bounds,
+            params: Vec::new(),
             interface,
             span: start.to(self.prev_span()),
             members,
         })
+    }
+
+    fn type_name(&mut self) -> PResult<(String, Span)> {
+        let (mut name, span) = self.ident()?;
+        while self.is_sym(".") && matches!(self.peek_at(1), Tok::Ident(_)) {
+            self.advance();
+            name = format!("{name}.{}", self.ident()?.0);
+        }
+        Ok((name, span))
+    }
+
+    fn implement_target(&mut self) -> PResult<(String, Vec<TypeExpr>, Vec<TypeParam>, Span)> {
+        let (name, start) = self.type_name()?;
+        let mut args = Vec::new();
+        let mut bounds = Vec::new();
+        if self.eat_sym("<") {
+            loop {
+                let arg = self.type_expr()?;
+                if let TypeExpr::Name(n, span) = &arg
+                    && self.eat_sym(":")
+                {
+                    bounds.push(TypeParam {
+                        name: n.clone(),
+                        span: *span,
+                        bounds: self.bounds()?,
+                    });
+                }
+                args.push(arg);
+                if !self.eat_sym(",") {
+                    break;
+                }
+            }
+            self.close_angle()?;
+        }
+        Ok((name, args, bounds, start.to(self.prev_span())))
     }
 
     fn interface_decl(&mut self) -> PResult<InterfaceDecl> {
@@ -1448,11 +1487,7 @@ impl Parser<'_> {
                 TypeExpr::Record(names, types, span)
             }
         } else {
-            let (mut name, span) = self.ident()?;
-            while self.is_sym(".") && matches!(self.peek_at(1), Tok::Ident(_)) {
-                self.advance();
-                name = format!("{name}.{}", self.ident()?.0);
-            }
+            let (name, span) = self.type_name()?;
             if self.eat_sym("<") {
                 let mut args = vec![self.type_expr()?];
                 while self.eat_sym(",") {

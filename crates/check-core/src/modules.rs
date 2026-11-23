@@ -55,6 +55,21 @@ const LIBRARY: &[(usize, &str, &str)] = &[
     ),
     (
         STD,
+        "lib/std/list.check",
+        include_str!("../../../lib/std/list.check"),
+    ),
+    (
+        STD,
+        "lib/std/maybe.check",
+        include_str!("../../../lib/std/maybe.check"),
+    ),
+    (
+        STD,
+        "lib/std/collections.check",
+        include_str!("../../../lib/std/collections.check"),
+    ),
+    (
+        STD,
         "lib/std/package.check",
         include_str!("../../../lib/std/package.check"),
     ),
@@ -64,6 +79,10 @@ const LIBRARY: &[(usize, &str, &str)] = &[
         include_str!("../../../lib/cli/io.check"),
     ),
 ];
+
+pub fn is_std_file(path: &str) -> bool {
+    LIBRARY.iter().any(|(u, p, _)| *u == STD && *p == path)
+}
 
 const MANIFESTS: &[(usize, &str, &str)] = &[
     (

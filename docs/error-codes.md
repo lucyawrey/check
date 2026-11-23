@@ -43,7 +43,6 @@
 - `negative_literal_exponent` a negative literal exponent on an `Int` (`2 ** -1`)
 - `unhandled_maybe` a `T?` used where a `T` is needed
 - `doubled_maybe` a `T?` body in an `if` without `else` or a value loop, where a plain `T?` is expected
-- `flatten_without_nesting` `flatten()` on a `T?` with nothing nested
 - `not_iterable` `for` over something that isn't a list or range
 - `try_outside_failable` `try` in a function that returns neither a `Maybe` nor a `Result` (added by the agent while building, 2026-11-14)
 - `try_result_in_maybe` `try` on a `Result` in a function returning a `Maybe` (suggests `try x.ok()`)
@@ -102,6 +101,7 @@
 - `conflicting_defaults` two interfaces with defaults for the same method, which the type doesn't override
 - `field_requirement_needs_class` an interface that requires fields, implemented by an enum or built-in type
 - `implement_for_specific_arguments` an interface implemented for some of a generic type's arguments (`implement Shape for Box<Int>`), since they're erased at run time
+- `bound_on_concrete_type` a bound on a type rather than a parameter in an `implement` target (`implement List<Int: Eq>`)
 - `list_needs_type` a list of values of different types with no declared element type (`let xs: Shape[] = ...`)
 - `interface_field_extras` an interface field with a default, `private` or `readonly`, which only an implementing class can give it
 - `code_in_pure_data` something other than a literal in a `.con` file (use `.conx` for computed values)
@@ -144,6 +144,7 @@
 - `shared_wraps_shared_class` `Shared` of a `shared class`, which is already shared
 - `ref_param_of_shared_class` a `ref` parameter of a `shared class` type, which is already shared
 - `shadowed_name` a local that shadows a function or type
+- `replaces_std_method` a method an `implement` adds with the same name as a `check:std` method on that type, which replaces it
 - `repeated_namespace` a `namespace` line that only repeats its package's, which the manifest already sets
 - `interpolated_maybe` interpolating a `T?`
 - `nested_maybe` an `if` or loop value that is a `T??`

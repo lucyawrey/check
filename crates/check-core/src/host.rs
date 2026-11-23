@@ -1,9 +1,11 @@
+use std::cmp::Ordering;
 use std::io::{BufRead, Write};
 use std::rc::Rc;
 
+use crate::checker::ORDERING;
 use crate::diag::{Code, Span};
 use crate::interp::{Flow, Panic, panic};
-use crate::value::Value;
+use crate::value::{Record, Value};
 
 pub struct Io<'a> {
     pub input: &'a mut dyn BufRead,
@@ -34,6 +36,9 @@ pub const FUNCTIONS: &[(&str, HostFn)] = &[
         Ok(Value::Bool(text(&a[0]).contains(text(&a[1]))))
     }),
     ("String.split", split),
+    ("Int.compare", compare),
+    ("Float.compare", compare),
+    ("String.compare", compare),
     ("String.replace", replace),
     ("Int.toFloat", |_, a, _| match a[0] {
         Value::Int(n) => Ok(Value::Float(n as f64)),
@@ -56,6 +61,29 @@ pub const FUNCTIONS: &[(&str, HostFn)] = &[
         to_int(&a[0], f64::trunc, span)
     }),
 ];
+
+fn compare(_: &mut Io, a: Vec<Value>, _: Span) -> Result<Value, Flow> {
+    let order = match (&a[0], &a[1]) {
+        (Value::Float(x), Value::Float(y)) => x
+            .partial_cmp(y)
+            .unwrap_or_else(|| x.is_nan().cmp(&y.is_nan())),
+        (x, y) => x
+            .compare(y)
+            .expect("compare is declared on Int, Float and String"),
+    };
+    let name = match order {
+        Ordering::Less => "Less",
+        Ordering::Equal => "Equal",
+        Ordering::Greater => "Greater",
+    };
+    Ok(Value::Variant(Rc::new(Record {
+        name: name.into(),
+        ty: ORDERING.into(),
+        by_fields: false,
+        field_names: None,
+        fields: Vec::new(),
+    })))
+}
 
 pub fn find(name: &str) -> Option<HostFn> {
     FUNCTIONS.iter().find(|(n, _)| *n == name).map(|(_, f)| *f)

@@ -170,7 +170,12 @@ pub fn run_program(
 }
 
 fn panic_text(p: &interp::Panic, sources: &Sources) -> String {
-    let (path, line, col, _) = sources.locate(p.span.start);
+    let mut spans = std::iter::once(&p.span)
+        .chain(&p.stack)
+        .filter(|s| !modules::is_std_file(sources.locate(s.start).0));
+    let at = spans.next().unwrap_or(&p.span);
+    let stack: Vec<_> = spans.collect();
+    let (path, line, col, _) = sources.locate(at.start);
     let reason = p
         .reason
         .as_ref()
@@ -182,10 +187,10 @@ fn panic_text(p: &interp::Panic, sources: &Sources) -> String {
         p.code.message()
     );
     let shown = 10;
-    for (i, call) in p.stack.iter().enumerate() {
-        if p.stack.len() > shown * 2 && i >= shown && i < p.stack.len() - shown {
+    for (i, call) in stack.iter().enumerate() {
+        if stack.len() > shown * 2 && i >= shown && i < stack.len() - shown {
             if i == shown {
-                let left_out = p.stack.len() - shown * 2;
+                let left_out = stack.len() - shown * 2;
                 let line = Text::calls_left_out
                     .get()
                     .replace("{count}", &left_out.to_string());
