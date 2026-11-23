@@ -8,9 +8,10 @@ use wasm_encoder::{
 };
 use wasmparser::{ExternalKind, Parser, Payload};
 
-const RUNTIME: &[u8] = include_bytes!(env!("CHECK_RUNTIME_WASM"));
+pub const RUNTIME: &[u8] = include_bytes!(env!("CHECK_RUNTIME_WASM"));
 
-/// A module that starts as the runtime, so the runtime's imports and indexes stay as they are
+/// A module that starts as a runtime (the built-in `RUNTIME`, or a host's crate built on
+/// `check-runtime`), so the runtime's imports and indexes stay as they are
 /// and the program's types, functions and data go after them.
 pub struct Module {
     types: TypeSection,
@@ -28,7 +29,7 @@ pub struct Module {
 }
 
 impl Module {
-    pub fn new() -> Self {
+    pub fn new(runtime: &[u8]) -> Self {
         let mut m = Module {
             types: TypeSection::new(),
             imports: ImportSection::new(),
@@ -43,13 +44,14 @@ impl Module {
             runtime_funcs: HashMap::new(),
             next_func: 0,
         };
-        m.read_runtime().expect("the built-in runtime is valid");
+        m.read_runtime(runtime)
+            .expect("the runtime is a valid module");
         m
     }
 
-    fn read_runtime(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn read_runtime(&mut self, runtime: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         let mut r = RoundtripReencoder;
-        for payload in Parser::new(0).parse_all(RUNTIME) {
+        for payload in Parser::new(0).parse_all(runtime) {
             match payload? {
                 Payload::TypeSection(s) => r.parse_type_section(&mut self.types, s)?,
                 Payload::ImportSection(s) => {
@@ -143,11 +145,5 @@ impl Module {
             .section(&self.code)
             .section(&self.data);
         module.finish()
-    }
-}
-
-impl Default for Module {
-    fn default() -> Self {
-        Self::new()
     }
 }

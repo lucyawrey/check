@@ -1,4 +1,4 @@
-use check_wasm::{Module, ValType::I32};
+use check_wasm::{Module, RUNTIME, ValType::I32};
 use wasmtime::{Engine, Linker, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
@@ -22,7 +22,7 @@ fn run(wasm: &[u8]) -> String {
 
 #[test]
 fn a_program_calls_the_merged_runtime() {
-    let mut m = Module::new();
+    let mut m = Module::new(RUNTIME);
     let new_string = m.runtime_func("check_new_string");
     let concat = m.runtime_func("check_concat");
     let print = m.runtime_func("check_print");
