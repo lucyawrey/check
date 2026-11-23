@@ -10,9 +10,6 @@ use wasmparser::{ExternalKind, Parser, Payload};
 
 pub const RUNTIME: &[u8] = include_bytes!(env!("CHECK_RUNTIME_WASM"));
 
-/// A module that starts as a runtime (the built-in `RUNTIME`, or a host's crate built on
-/// `check-runtime`), so the runtime's imports and indexes stay as they are
-/// and the program's types, functions and data go after them.
 pub struct Module {
     types: TypeSection,
     imports: ImportSection,
@@ -118,7 +115,6 @@ impl Module {
         self.next_func - 1
     }
 
-    /// Adds a passive data segment, which `memory.init` copies into memory the runtime allocated.
     pub fn passive_data(&mut self, bytes: &[u8]) -> u32 {
         self.data.passive(bytes.iter().copied());
         self.data.len() - 1
