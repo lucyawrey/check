@@ -388,6 +388,11 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         place_root: None,
     };
     checker.program(program, library);
+    for entry in checker.funcs.values() {
+        let params = entry.sig.params.iter().map(|p| p.ty.clone()).collect();
+        let ret = entry.sig.ret.clone().unwrap_or(Ty::Void);
+        (checker.info.types).insert(entry.decl.id, Ty::Func(params, Box::new(ret)));
+    }
     for ty in checker.info.types.values_mut() {
         *ty = checker.subst.resolve(ty);
     }
