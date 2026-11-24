@@ -35,6 +35,7 @@ pub enum ExprKind {
     Str(String),
     Local(LocalId),
     Global(GlobalId),
+    Let(LocalId, Box<Expr>),
     SetLocal(LocalId, Box<Expr>),
     SetGlobal(GlobalId, Box<Expr>),
     ToFloat(Box<Expr>),

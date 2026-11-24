@@ -228,8 +228,15 @@ impl<'a> Lowerer<'a> {
                 ..
             } => {
                 let value = self.expr(value)?;
-                let var = self.declare(name, value.ty.clone());
-                Ok(Self::write(var, value, *span))
+                let kind = match self.declare(name, value.ty.clone()) {
+                    Var::Local(i) => ExprKind::Let(i, Box::new(value)),
+                    Var::Global(i) => ExprKind::SetGlobal(i, Box::new(value)),
+                };
+                Ok(Expr {
+                    ty: Ty::Void,
+                    span: *span,
+                    kind,
+                })
             }
             Stmt::Assign {
                 target,
