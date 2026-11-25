@@ -4,9 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+check-core = { path = "../check-core" }
 wasm-encoder = { version = "0.263.0", features = ["wasmparser"] }
 wasmparser = "0.263.0"
 
 [dev-dependencies]
+check-runtime = { path = "../check-runtime" }
 wasmtime = "51.0.0"
 wasmtime-wasi = "51.0.0"

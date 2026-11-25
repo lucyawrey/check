@@ -134,6 +134,7 @@ dependencies = [
 name = "check-core"
 version = "0.1.0"
 dependencies = [
+ "check-runtime",
  "check-syntax",
  "indexmap",
  "stacker",
@@ -160,6 +161,8 @@ version = "0.1.0"
 name = "check-wasm"
 version = "0.1.0"
 dependencies = [
+ "check-core",
+ "check-runtime",
  "wasm-encoder",
  "wasmparser",
  "wasmtime",

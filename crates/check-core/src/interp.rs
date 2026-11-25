@@ -1233,10 +1233,7 @@ impl Interpreter<'_> {
             ExprKind::Unary(op, operand) => {
                 let v = self.expr(operand)?;
                 match (op, v) {
-                    (UnOp::Neg, Value::Int(n)) => n
-                        .checked_neg()
-                        .map(Value::Int)
-                        .map_or_else(|| panic(Code::integer_overflow, expr.span), Ok),
+                    (UnOp::Neg, Value::Int(n)) => int(check_runtime::neg(n), expr.span),
                     (UnOp::Neg, Value::Float(f)) => Ok(Value::Float(-f)),
                     (UnOp::BitNot, Value::Int(n)) => Ok(Value::Int(!n)),
                     (UnOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
@@ -1952,56 +1949,36 @@ fn object_fields(v: &Value) -> (Rc<str>, Vec<Value>) {
     }
 }
 
-fn floor_div(a: i64, b: i64) -> Option<i64> {
-    let q = a.checked_div(b)?;
-    if a % b != 0 && ((a < 0) != (b < 0)) {
-        Some(q - 1)
-    } else {
-        Some(q)
+pub fn panic_code(p: check_runtime::Panic) -> Code {
+    match p {
+        check_runtime::Panic::IntegerOverflow => Code::integer_overflow,
+        check_runtime::Panic::DivisionByZero => Code::division_by_zero,
+        check_runtime::Panic::NegativeExponent => Code::negative_exponent,
+        check_runtime::Panic::ShiftOutOfRange => Code::shift_out_of_range,
     }
+}
+
+fn int(r: Result<i64, check_runtime::Panic>, span: Span) -> Eval {
+    r.map(Value::Int).or_else(|p| panic(panic_code(p), span))
 }
 
 fn arith(op: BinOp, l: Value, r: Value, span: Span) -> Eval {
     use Value::{Float as F, Int as I};
-    let overflow = |v: Option<i64>| {
-        v.map(I)
-            .map_or_else(|| panic(Code::integer_overflow, span), Ok)
-    };
     let (l, r) = match (l, r) {
         (I(a), F(b)) => (F(a as f64), F(b)),
         (F(a), I(b)) => (F(a), F(b as f64)),
         pair => pair,
     };
     Ok(match (op, l, r) {
-        (BinOp::Add, I(a), I(b)) => return overflow(a.checked_add(b)),
-        (BinOp::Sub, I(a), I(b)) => return overflow(a.checked_sub(b)),
-        (BinOp::Mul, I(a), I(b)) => return overflow(a.checked_mul(b)),
+        (BinOp::Add, I(a), I(b)) => return int(check_runtime::add(a, b), span),
+        (BinOp::Sub, I(a), I(b)) => return int(check_runtime::sub(a, b), span),
+        (BinOp::Mul, I(a), I(b)) => return int(check_runtime::mul(a, b), span),
         (BinOp::Div, I(a), I(b)) => {
-            if b == 0 {
-                return panic(Code::division_by_zero, span);
-            }
-            F(a as f64 / b as f64)
+            return (check_runtime::div(a, b).map(F)).or_else(|p| panic(panic_code(p), span));
         }
-        (BinOp::IntDiv | BinOp::Mod, I(_), I(0)) => return panic(Code::division_by_zero, span),
-        (BinOp::IntDiv, I(a), I(b)) => return overflow(floor_div(a, b)),
-        (BinOp::Mod, I(_), I(-1)) => I(0),
-        (BinOp::Mod, I(a), I(b)) => {
-            return overflow(
-                floor_div(a, b)
-                    .and_then(|q| q.checked_mul(b))
-                    .and_then(|m| a.checked_sub(m)),
-            );
-        }
-        (BinOp::Pow, I(a), I(b)) => {
-            if b < 0 {
-                return panic(Code::negative_exponent, span);
-            }
-            return match a {
-                0 | 1 => Ok(I(if b == 0 { 1 } else { a })),
-                -1 => Ok(I(if b % 2 == 0 { 1 } else { -1 })),
-                _ => overflow(u32::try_from(b).ok().and_then(|e| a.checked_pow(e))),
-            };
-        }
+        (BinOp::IntDiv, I(a), I(b)) => return int(check_runtime::floor_div(a, b), span),
+        (BinOp::Mod, I(a), I(b)) => return int(check_runtime::modulo(a, b), span),
+        (BinOp::Pow, I(a), I(b)) => return int(check_runtime::pow(a, b), span),
         (BinOp::Add, F(a), F(b)) => F(a + b),
         (BinOp::Sub, F(a), F(b)) => F(a - b),
         (BinOp::Mul, F(a), F(b)) => F(a * b),
@@ -2010,11 +1987,8 @@ fn arith(op: BinOp, l: Value, r: Value, span: Span) -> Eval {
         (BinOp::BitAnd, I(a), I(b)) => I(a & b),
         (BinOp::BitOr, I(a), I(b)) => I(a | b),
         (BinOp::BitXor, I(a), I(b)) => I(a ^ b),
-        (BinOp::Shl | BinOp::Shr, I(_), I(b)) if !(0..64).contains(&b) => {
-            return panic(Code::shift_out_of_range, span);
-        }
-        (BinOp::Shl, I(a), I(b)) => I(a.wrapping_shl(b as u32)),
-        (BinOp::Shr, I(a), I(b)) => I(a >> b),
+        (BinOp::Shl, I(a), I(b)) => return int(check_runtime::shl(a, b), span),
+        (BinOp::Shr, I(a), I(b)) => return int(check_runtime::shr(a, b), span),
         (BinOp::Range, I(a), I(b)) => Value::Range(a, b, false),
         (BinOp::RangeIncl, I(a), I(b)) => Value::Range(a, b, true),
         (BinOp::Add, Value::Str(a), Value::Str(b)) => Value::Str(format!("{a}{b}").into()),

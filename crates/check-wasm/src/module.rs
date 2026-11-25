@@ -2,9 +2,9 @@ use std::collections::HashMap;
 
 use wasm_encoder::reencode::{Reencode, RoundtripReencoder};
 use wasm_encoder::{
-    CodeSection, DataCountSection, DataSection, ElementSection, ExportKind, ExportSection,
-    Function, FunctionSection, GlobalSection, ImportSection, InstructionSink, MemorySection,
-    TableSection, TypeSection, ValType,
+    CodeSection, ConstExpr, DataCountSection, DataSection, ElementSection, ExportKind,
+    ExportSection, Function, FunctionSection, GlobalSection, GlobalType, ImportSection,
+    MemorySection, TableSection, TypeSection, ValType,
 };
 use wasmparser::{ExternalKind, Parser, Payload};
 
@@ -23,6 +23,7 @@ pub struct Module {
     data: DataSection,
     runtime_funcs: HashMap<String, u32>,
     next_func: u32,
+    next_global: u32,
 }
 
 impl Module {
@@ -40,6 +41,7 @@ impl Module {
             data: DataSection::new(),
             runtime_funcs: HashMap::new(),
             next_func: 0,
+            next_global: 0,
         };
         m.read_runtime(runtime)
             .expect("the runtime is a valid module");
@@ -53,8 +55,10 @@ impl Module {
                 Payload::TypeSection(s) => r.parse_type_section(&mut self.types, s)?,
                 Payload::ImportSection(s) => {
                     for import in s.clone().into_imports() {
-                        if matches!(import?.ty, wasmparser::TypeRef::Func(_)) {
-                            self.next_func += 1;
+                        match import?.ty {
+                            wasmparser::TypeRef::Func(_) => self.next_func += 1,
+                            wasmparser::TypeRef::Global(_) => self.next_global += 1,
+                            _ => {}
                         }
                     }
                     r.parse_import_section(&mut self.imports, s)?;
@@ -65,7 +69,10 @@ impl Module {
                 }
                 Payload::TableSection(s) => r.parse_table_section(&mut self.tables, s)?,
                 Payload::MemorySection(s) => r.parse_memory_section(&mut self.memories, s)?,
-                Payload::GlobalSection(s) => r.parse_global_section(&mut self.globals, s)?,
+                Payload::GlobalSection(s) => {
+                    self.next_global += s.count();
+                    r.parse_global_section(&mut self.globals, s)?;
+                }
                 Payload::ExportSection(s) => {
                     for export in s {
                         let export = export?;
@@ -91,8 +98,28 @@ impl Module {
         Ok(())
     }
 
-    pub fn runtime_func(&self, name: &str) -> u32 {
-        self.runtime_funcs[name]
+    pub fn runtime_func(&self, name: &str) -> Option<u32> {
+        self.runtime_funcs.get(name).copied()
+    }
+
+    pub fn next_func(&self) -> u32 {
+        self.next_func
+    }
+
+    pub fn global(&mut self, ty: ValType) -> u32 {
+        let zero = match ty {
+            ValType::I64 => ConstExpr::i64_const(0),
+            ValType::F64 => ConstExpr::f64_const(0.0.into()),
+            _ => ConstExpr::i32_const(0),
+        };
+        let global = GlobalType {
+            val_type: ty,
+            mutable: true,
+            shared: false,
+        };
+        self.globals.global(global, &zero);
+        self.next_global += 1;
+        self.next_global - 1
     }
 
     pub fn func(
@@ -100,7 +127,7 @@ impl Module {
         params: &[ValType],
         results: &[ValType],
         locals: &[ValType],
-        body: impl FnOnce(&mut InstructionSink),
+        body: &[u8],
     ) -> u32 {
         let ty = self.types.len();
         self.types
@@ -108,7 +135,7 @@ impl Module {
             .function(params.iter().copied(), results.iter().copied());
         self.functions.function(ty);
         let mut f = Function::new_with_locals_types(locals.iter().copied());
-        body(&mut f.instructions());
+        f.raw(body.iter().copied());
         f.instructions().end();
         self.code.function(&f);
         self.next_func += 1;
