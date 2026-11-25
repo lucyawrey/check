@@ -156,6 +156,10 @@ impl Markup<'_> {
                     i += rest.find('\n')?;
                     continue;
                 }
+                b'r' if rest.starts_with("r\"") && !rest.starts_with("r\"\"\"") => {
+                    i += 2 + rest[2..].find('"')? + 1;
+                    continue;
+                }
                 b'"' if rest.starts_with("\"\"\"") => {
                     i += 3 + rest[3..].find("\"\"\"")? + 3;
                     continue;
@@ -180,8 +184,7 @@ impl Markup<'_> {
         let mut segs: Vec<StrSeg> = Vec::new();
         let mut text_start = None;
         let mut text_end = self.pos;
-        let top_level = closing.is_none();
-        let mut line_blank = top_level;
+        let mut line_blank = true;
         loop {
             let at = self.pos;
             if at >= self.src.len() {
@@ -203,7 +206,7 @@ impl Markup<'_> {
                     Some(Item::Field(f)) => content.fields.push(f),
                     None => {}
                 }
-                line_blank = top_level;
+                line_blank = true;
                 continue;
             }
             if line_blank && self.rest().starts_with("//") {
@@ -250,7 +253,7 @@ impl Markup<'_> {
         self.pos += 1;
         let ch = self.rest().chars().next().unwrap_or_default();
         self.pos += ch.len_utf8();
-        if !matches!(ch, '<' | '{' | '\\') {
+        if !matches!(ch, '<' | '{' | '\\' | '/') {
             self.error(Code::unknown_escape, self.span(start, self.pos));
         }
         ch
@@ -266,6 +269,10 @@ impl Markup<'_> {
         };
         let start = self.pos;
         self.pos = end + 1;
+        if self.src[start..end].trim().is_empty() {
+            self.error(Code::unclosed_interpolation, self.span(open, end + 1));
+            return None;
+        }
         let tokens = self.tokens(start, end);
         let src = &self.src[start..end];
         let expr = parser::parse_expr(tokens, src, self.base + start, self.next_id, self.diags);
@@ -308,7 +315,8 @@ impl Markup<'_> {
         self.pos += 1;
         let name_start = self.pos;
         let mut name = self.name().to_string();
-        if self.peek(0) == b'=' {
+        let spaces = self.rest().len() - self.rest().trim_start_matches([' ', '\t']).len();
+        if self.peek(spaces) == b'=' {
             self.pos = name_start;
             name.clear();
         } else if name.is_empty() && self.peek(0) != b'>' {

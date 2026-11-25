@@ -9,12 +9,12 @@
 	],
 	"repository": {
 		"comment": {
-			"match": "^\\s*(//.*)$",
+			"match": "(?:^|(?<=>))\\s*(//.*)$",
 			"captures": { "1": { "name": "comment.line.double-slash.cml" } }
 		},
 		"escape": {
 			"name": "constant.character.escape.cml",
-			"match": "\\\\[<{\\\\]"
+			"match": "\\\\[<{\\\\/]"
 		},
 		"closing-tag": {
 			"match": "(</)(?:([A-Za-z_]\\w*(?:\\.[A-Za-z_]\\w*)+|[A-Z]\\w*)|([a-z_]\\w*))?\\s*(>)",

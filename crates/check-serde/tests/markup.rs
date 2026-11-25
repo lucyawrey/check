@@ -197,6 +197,7 @@ fn a_nameless_tag_is_a_record() {
         }]
     );
     same::<Settings>("<volume=0.5/>", "volume = 0.5", "ui.Settings");
+    same::<Settings>("<volume = 0.5 />", "volume = 0.5", "ui.Settings");
 }
 
 #[test]
@@ -215,6 +216,37 @@ fn text_collapses_whitespace_and_takes_backslash_escapes() {
     );
     assert_eq!(el, text("a < b c { \\"));
     check_error("page.cml", "<Text>\\q</Text>", "unknown_escape");
+}
+
+#[test]
+fn a_comment_can_follow_a_tag_and_slashes_can_be_escaped() {
+    same::<El>(
+        "<Panel> // the menu\n  <Text>a</Text> // first\n</Panel>",
+        "Panel(children = [Text(text = \"a\")])",
+        "ui.Panel",
+    );
+    let el: El = read("page.cml", "<Text>\\// not a comment</Text>", "ui.Text").unwrap();
+    assert_eq!(el, text("// not a comment"));
+}
+
+#[test]
+fn a_raw_string_attribute_can_end_in_a_backslash() {
+    let el: El = read(
+        "page.cml",
+        "<Panel title=r\"C:\\dir\\\"><Text>x</Text></Panel>",
+        "ui.Panel",
+    )
+    .unwrap();
+    let El::Panel { title, .. } = el else {
+        panic!("{el:?}")
+    };
+    assert_eq!(title, "C:\\dir\\");
+}
+
+#[test]
+fn an_empty_interpolation_is_one_error() {
+    let error = check_error("page.cmlx", "<Text>{}</Text>", "unclosed_interpolation");
+    assert!(!error.contains("unclosed_bracket"), "{error}");
 }
 
 #[test]
