@@ -1,0 +1,33 @@
+enum Dyn {
+  Bool(Bool)
+  Int(Int)
+  Float(Float)
+  String(String)
+  List(Dyn[])
+  Object(Map<String, Dyn>)
+}
+
+implement Dyn {
+  func hasKey(key: String) -> Bool {
+    match this {
+      Object(fields) => fields.contains(key)
+      _ => false
+    }
+  }
+}
+
+class ShapeError(path: String, expected: String)
+
+class ParseError(line: Int, column: Int)
+
+class Json {}
+
+implement Json {
+  external static func parse(text: String) -> Result<Dyn, ParseError>
+}
+
+class Data {}
+
+implement Data {
+  external static func parse(text: String) -> Result<Dyn, ParseError>
+}

@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use crate::checker::ORDERING;
 use crate::diag::{Code, Span};
+use crate::dynamic;
 use crate::interp::{Flow, Panic, panic};
 use crate::value::{Record, Value};
 
@@ -53,6 +54,12 @@ pub const FUNCTIONS: &[(&str, HostFn)] = &[
         Ok(maybe(
             text(&a[0]).trim().parse::<f64>().ok().map(Value::Float),
         ))
+    }),
+    ("check.std.Json.parse", |_, a, _| {
+        Ok(dynamic::parse_json(text(&a[0])))
+    }),
+    ("check.std.Data.parse", |_, a, _| {
+        Ok(dynamic::parse_data(text(&a[0])))
     }),
     ("Float.round", |_, a, span| to_int(&a[0], f64::round, span)),
     ("Float.floor", |_, a, span| to_int(&a[0], f64::floor, span)),

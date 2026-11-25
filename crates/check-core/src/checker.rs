@@ -342,6 +342,8 @@ pub(crate) const RESULT: &str = "check.std.Result";
 pub(crate) const PRINTABLE: &str = "check.std.Printable";
 pub(crate) const EQ: &str = "check.std.Eq";
 pub(crate) const ORDERING: &str = "check.std.Ordering";
+pub(crate) const DYN: &str = "check.std.Dyn";
+pub(crate) const PARSE_ERROR: &str = "check.std.ParseError";
 const COMPARABLE: &str = "check.std.Comparable";
 
 pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Vec<Diagnostic>) {
