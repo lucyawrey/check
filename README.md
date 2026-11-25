@@ -41,7 +41,7 @@ Run language tests:
 cargo run -q -p check-cli -- test silver_tests/
 ```
 
-`test --wasm` also runs each test through WebAssembly, skipping those that use something not compiled yet.
+`test --wasm` runs them through WebAssembly instead. A test whose folder has a `wasm_unsupported` file is skipped, since it uses something not compiled yet.
 
 ## Install
 

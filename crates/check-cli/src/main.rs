@@ -32,14 +32,6 @@ enum Backend {
 }
 
 impl Backend {
-    fn label(self) -> &'static str {
-        match self {
-            Backend::Interpreter => "",
-            #[cfg(feature = "wasm")]
-            Backend::Wasm => " (wasm)",
-        }
-    }
-
     fn unsupported_marker(self) -> Option<&'static str> {
         match self {
             Backend::Interpreter => None,
@@ -54,10 +46,10 @@ fn dispatch(args: &[String]) -> ExitCode {
         [cmd, path] if cmd == "run" => run(path, Backend::Interpreter),
         #[cfg(feature = "wasm")]
         [cmd, flag, path] if cmd == "run" && flag == "--wasm" => run(path, Backend::Wasm),
-        [cmd, path] if cmd == "test" => test(Path::new(path), &[Backend::Interpreter]),
+        [cmd, path] if cmd == "test" => test(Path::new(path), Backend::Interpreter),
         #[cfg(feature = "wasm")]
         [cmd, flag, path] if cmd == "test" && flag == "--wasm" => {
-            test(Path::new(path), &[Backend::Interpreter, Backend::Wasm])
+            test(Path::new(path), Backend::Wasm)
         }
         [cmd, path, flags @ ..] if cmd == "tidy" => match tidy_options(flags) {
             Some((levels, dry_run)) => tidy(path, &levels, dry_run),
@@ -405,7 +397,7 @@ fn diff(expected: &str, actual: &str) -> String {
     out
 }
 
-fn test(root: &Path, backends: &[Backend]) -> ExitCode {
+fn test(root: &Path, backend: Backend) -> ExitCode {
     let mut dirs: Vec<PathBuf> = match fs::read_dir(root) {
         Ok(entries) => entries
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -419,25 +411,22 @@ fn test(root: &Path, backends: &[Backend]) -> ExitCode {
     dirs.sort();
     let (mut passed, mut failed, mut skipped) = (0, 0, 0);
     for dir in &dirs {
-        let dir_name = dir
+        let name = dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        for &backend in backends {
-            let name = format!("{dir_name}{}", backend.label());
-            match run_test(dir, backend) {
-                Ok(Tested::Passed) => {
-                    passed += 1;
-                    println!("ok    {name}");
-                }
-                Ok(Tested::Skipped(note)) => {
-                    skipped += 1;
-                    println!("skip  {name}\n{note}");
-                }
-                Err(problems) => {
-                    failed += 1;
-                    println!("FAIL  {name}\n{problems}");
-                }
+        match run_test(dir, backend) {
+            Ok(Tested::Passed) => {
+                passed += 1;
+                println!("ok    {name}");
+            }
+            Ok(Tested::Skipped(note)) => {
+                skipped += 1;
+                println!("skip  {name}\n{note}");
+            }
+            Err(problems) => {
+                failed += 1;
+                println!("FAIL  {name}\n{problems}");
             }
         }
     }
