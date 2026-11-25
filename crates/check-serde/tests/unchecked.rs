@@ -98,3 +98,19 @@ fn empty_fields_leave_optional_fields_unset() {
         assert_eq!(options.name, None);
     }
 }
+
+#[derive(Deserialize, Debug, PartialEq)]
+struct Versioned {
+    version: String,
+}
+
+#[test]
+fn reads_a_json_file_with_serde_json() {
+    let v: Versioned =
+        from_str_unchecked("place.json", "{\"version\": \"0.2.0\", \"scene\": 3}").unwrap();
+    assert_eq!(v.version, "0.2.0");
+    match from_str_unchecked::<Versioned>("place.json", "{\"version\": }") {
+        Err(Error::Value(e)) => assert!(e.to_string().contains("line 1"), "{e}"),
+        _ => panic!("expected a value error"),
+    }
+}
