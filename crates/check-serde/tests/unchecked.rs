@@ -62,6 +62,8 @@ fn matches_variants_by_name_as_written() {
     };
     assert_eq!(kind("Gallery"), Kind::Gallery);
     assert_eq!(kind("Link(\"x\")"), Kind::Link("x".to_string()));
+    assert_eq!(kind("place.Link(\"x\")"), Kind::Link("x".to_string()));
+    assert_eq!(kind("place.Kind.Gallery"), Kind::Gallery);
 }
 
 #[test]
@@ -77,10 +79,9 @@ fn refuses_code_mixed_fields_and_files_that_arent_con() {
     check_error("p.con", "title = \"a\" + \"b\"", "code_in_pure_data");
     check_error("p.con", "kind = Game(8, maxPlayers = 8)", "mixed_fields");
     check_error("p.conx", "title = \"a\"", "not_pure_data");
+    check_error("p.con", "kind = list().Link(\"x\")", "code_in_pure_data");
     for text in [
         "title = foo",
-        "kind = Kind.Link.Game",
-        "kind = list.Link(\"x\")",
         "title = Set(\"x\")",
     ] {
         check_error("p.con", text, "code_in_pure_data");

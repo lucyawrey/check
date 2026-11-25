@@ -1451,6 +1451,52 @@ fn a_conx_file_can_compute_its_value_from_its_unit() {
 }
 
 #[test]
+fn a_units_cml_file_is_checked_against_its_classes() {
+    let code = (
+        "ui/ui.check",
+        "interface Element {}
+class Text: Element {
+  let text: String
+  let size: Int = 16
+}
+class Panel: Element {
+  let children: Element[] = []
+}",
+    );
+    let menu = (
+        "ui/menu.cml",
+        "<Panel>\n  <Text>Play</Text>\n  <Text size=32>Quit</Text>\n</Panel>",
+    );
+    let main = ("main.check", "import \"ui/\"\nprint(menu)");
+    assert_eq!(
+        files_output(&[main, code, menu]),
+        "Panel(children = [Text(text = \"Play\", size = 16), Text(text = \"Quit\", size = 32)])"
+    );
+    let bad = (
+        "ui/menu.cml",
+        "<Panel><Text size=\"big\">Play</Text></Panel>",
+    );
+    assert_eq!(files_error(&[main, code, bad]), "type_mismatch");
+}
+
+#[test]
+fn a_cmlx_file_computes_its_values_from_its_unit() {
+    let code = (
+        "ui/ui.check",
+        "class Text(text: String, size: Int = 16)\nfunc big() -> Int { 32 }",
+    );
+    let title = (
+        "ui/title.cmlx",
+        "<Text size={big()}>{big() div 2} apples</Text>",
+    );
+    let main = (
+        "main.check",
+        "import \"ui/\"\nprint(\"{title.text} {title.size}\")",
+    );
+    assert_eq!(files_output(&[main, code, title]), "16 apples 32");
+}
+
+#[test]
 fn data_values_cant_depend_on_each_other_in_a_loop() {
     let code = ("game/blocks.check", "func f() -> Int { a }");
     let a = ("game/a.conx", "b + 1");

@@ -197,10 +197,14 @@ pub fn load_data(
     };
     let id = data.value.id;
     let is_call = matches!(data.value.kind, ExprKind::Call(..) | ExprKind::Method(..));
-    if !path.ends_with(".con") && !is_json {
-        loader.error(Code::not_pure_data, data.value.span, None);
-        return (loader.finish(), id, is_call);
-    }
+    let is_pure = match data_file_name(path) {
+        Some((_, is_pure)) => is_pure,
+        None if is_json => true,
+        None => {
+            loader.error(Code::not_pure_data, data.value.span, None);
+            return (loader.finish(), id, is_call);
+        }
+    };
     if let Some(unit) = loader.import("", schema, data.value.span) {
         loader.grant(ENTRY, unit, false);
     }
@@ -209,13 +213,25 @@ pub fn load_data(
         span: data.value.span,
         ty: Some(TypeExpr::Name(expected_type.to_string(), data.value.span)),
         value: data.value,
-        is_pure: true,
+        is_pure,
         is_json,
         is_private: false,
     };
     let namespace = data.namespace.map(|(n, _)| n).unwrap_or_default();
     loader.push(ENTRY, namespace, vec![Stmt::Data(decl)]);
     (loader.finish(), id, is_call)
+}
+
+/// A data file's name without its extension, and whether it's pure (`.con` or `.cml`).
+fn data_file_name(name: &str) -> Option<(&str, bool)> {
+    [
+        (".con", true),
+        (".cml", true),
+        (".conx", false),
+        (".cmlx", false),
+    ]
+    .into_iter()
+    .find_map(|(ext, pure)| name.strip_suffix(ext).map(|stem| (stem, pure)))
 }
 
 /// The fields of a `package.con` the loader needs before checking, with their spans. Values
@@ -362,8 +378,7 @@ impl<'a> Loader<'a> {
 
     fn parse_data(&mut self, path: &str, text: &str) -> DataFile {
         let base = self.sources.add(path, text);
-        let tokens = lexer::lex(text, base, path.ends_with(".con"), &mut self.diags);
-        parser::parse_data(tokens, text, base, &mut self.next_id, &mut self.diags)
+        parser::parse_data_file(path, text, base, &mut self.next_id, &mut self.diags)
     }
 
     fn push(&mut self, unit: usize, namespace: String, stmts: Vec<Stmt>) {
@@ -572,13 +587,9 @@ impl<'a> Loader<'a> {
             return false;
         }
         let text = self.files.read(path).unwrap_or_default();
-        let (namespace, stmts) = if path.ends_with(".con") || path.ends_with(".conx") {
+        let file_name = path.rsplit('/').next().unwrap_or(path);
+        let (namespace, stmts) = if let Some((stem, is_pure)) = data_file_name(file_name) {
             let data = self.parse_data(path, &text);
-            let file_name = path.rsplit('/').next().unwrap_or(path);
-            let (stem, is_pure) = match file_name.strip_suffix(".con") {
-                Some(stem) => (stem, true),
-                None => (file_name.trim_end_matches(".conx"), false),
-            };
             if !is_name(stem) {
                 self.error(Code::bad_data_name, data.value.span, None);
             }
@@ -647,7 +658,7 @@ impl<'a> Loader<'a> {
             if name.ends_with(".check") {
                 has_code = true;
                 paths.push(format!("{folder}{name}"));
-            } else if name.ends_with(".con") && name != MANIFEST || name.ends_with(".conx") {
+            } else if data_file_name(name).is_some() && name != MANIFEST {
                 has_data = true;
                 paths.push(format!("{folder}{name}"));
             } else if deep && name.ends_with('/') {

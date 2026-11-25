@@ -1502,7 +1502,10 @@ impl Interpreter<'_> {
                 }
             },
             ExprKind::Spread(inner) => self.expr(inner),
-            ExprKind::List(items) => {
+            ExprKind::FieldTag(items) if self.info.single_field_tags.contains(&expr.id) => {
+                self.expr(&items[0])
+            }
+            ExprKind::List(items) | ExprKind::FieldTag(items) => {
                 let mut values = Vec::with_capacity(items.len());
                 for item in items {
                     values.push(self.expr(item)?);

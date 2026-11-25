@@ -9,6 +9,9 @@
 - `malformed_number` any other malformed number (`.5`, `0XFF`, `1E3`, `0b12`)
 - `unexpected_token` an unexpected token (the general syntax error)
 - `unclosed_bracket` a bracket or brace that never closes
+- `unclosed_tag` a markup tag with no `>` or no closing tag
+- `mismatched_closing_tag` a closing tag whose name isn't the tag it closes (`<Panel></Button>`)
+- `mixed_text_and_children` a markup element holding both text and child elements
 - `trailing_separator` a `,` or `;` at a line end or before `]`, `)` or `}`
 - `else_on_new_line` `else` on the line after `}`
 - `foreign_operator` an operator from another language (`%`, `&&`, `||`, `!`)
@@ -105,10 +108,11 @@
 - `implement_for_specific_arguments` an interface implemented for some of a generic type's arguments (`implement Shape for Box<Int>`), since they're erased at run time
 - `bound_on_concrete_type` a bound on a type rather than a parameter in an `implement` target (`implement List<Int: Eq>`)
 - `list_needs_type` a list of values of different types with no declared element type (`let xs: Shape[] = ...`)
+- `field_tag_needs_one` a markup field tag for a field that isn't a list, holding no element or more than one
 - `interface_field_extras` an interface field with a default, `private` or `readonly`, which only an implementing class can give it
-- `code_in_pure_data` something other than a literal in a `.con` file (use `.conx` for computed values)
+- `code_in_pure_data` something other than a literal in a `.con` or `.cml` file (use `.conx` or `.cmlx` for computed values)
 - `bad_data_name` a data file whose name isn't a valid name, or is a keyword or reserved name (`class.con`, `Ok.con`)
-- `not_pure_data` a data file a host reads that isn't a `.con` or `.json` file
+- `not_pure_data` a data file a host reads that isn't a data file, or that runs code (`.conx`, `.cmlx`) when read without a Check class
 - `json_syntax` a `.json` data file that isn't valid JSON
 - `unknown_variant` a JSON string or `type` key that names no variant of the expected enum
 - `missing_tag` a JSON object read as an enum with no string `type` key

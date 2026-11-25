@@ -11,6 +11,9 @@ pub enum Data {
     Map(Vec<(Data, Data)>),
     Some(Box<Data>),
     None,
+    /// A markup field tag's elements, read as a list or, where one value is expected, its one
+    /// element.
+    FieldTag(Vec<Data>),
     /// A class value, record or variant. `name` is the class or variant, if written.
     Named {
         name: Option<String>,
@@ -51,10 +54,10 @@ impl From<check_core::value::Value> for Data {
             Value::Some(v) => Data::Some(Box::new((*v).clone().into())),
             Value::None => Data::None,
             Value::Record(r) => named(&r, None, false),
-            Value::Object(r) => named(&r, Some(r.name.to_string()), false),
+            Value::Object(r) => named(&r, Some(short_name(&r.name)), false),
             Value::Shared(r) => {
                 let r = r.borrow();
-                named(&r, Some(r.name.to_string()), false)
+                named(&r, Some(short_name(&r.name)), false)
             }
             Value::Variant(r) => named(&r, Some(r.name.to_string()), true),
             Value::Cell(v) => v.borrow().clone().into(),
@@ -85,6 +88,7 @@ impl Data {
                 _ => code(e, diags),
             },
             ExprKind::List(items) => Data::List(items.iter().map(read).collect()),
+            ExprKind::FieldTag(items) => Data::FieldTag(items.iter().map(read).collect()),
             ExprKind::Map(entries) => {
                 Data::Map(entries.iter().map(|(k, v)| (read(k), read(v))).collect())
             }
@@ -115,10 +119,7 @@ impl Data {
                     _ => code(e, diags),
                 },
             },
-            ExprKind::Method(base, n, args)
-                if is_type_name(n)
-                    && matches!(&base.kind, ExprKind::Name(t) if is_type_name(t)) =>
-            {
+            ExprKind::Method(base, n, args) if is_type_name(n) && is_path(base) => {
                 named(Some(n.clone()), args, diags)
             }
             _ => code(e, diags),
@@ -145,17 +146,28 @@ fn named(name: Option<String>, args: &[Arg], diags: &mut Vec<Diagnostic>) -> Dat
     }
 }
 
-/// A class or variant named as a literal can: `Name`, or `Type.Variant`.
+/// A class or variant named as a literal can: `Name`, `Type.Variant`, or either after a
+/// namespace (`ui.Button`).
 fn type_name(e: &Expr) -> Option<&String> {
     match &e.kind {
         ExprKind::Name(n) if is_type_name(n) => Some(n),
-        ExprKind::Field(base, n)
-            if is_type_name(n) && matches!(&base.kind, ExprKind::Name(t) if is_type_name(t)) =>
-        {
-            Some(n)
-        }
+        ExprKind::Field(base, n) if is_type_name(n) && is_path(base) => Some(n),
         _ => None,
     }
+}
+
+fn is_path(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Name(_) => true,
+        ExprKind::Field(base, _) => is_path(base),
+        _ => false,
+    }
+}
+
+/// `Panel` for `ui.Panel`, as a serde enum names its variants.
+#[cfg(feature = "check")]
+fn short_name(name: &str) -> String {
+    name.rsplit('.').next().unwrap_or(name).to_string()
 }
 
 fn is_type_name(name: &str) -> bool {

@@ -289,6 +289,8 @@ pub enum ExprKind {
     /// `[k = v, ...]`, or `[=]` with no entries.
     Map(Vec<(Expr, Expr)>),
     Record(Vec<Arg>),
+    /// A markup field tag's elements: a list for a list field, else its one element.
+    FieldTag(Vec<Expr>),
     Spread(Box<Expr>),
     /// `shared x`: the box behind a shared local, parameter or field.
     SharedOf(Box<Expr>),
