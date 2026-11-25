@@ -125,6 +125,7 @@ name = "check-cli"
 version = "0.1.0"
 dependencies = [
  "check-core",
+ "check-wasm",
  "lsp-server",
  "lsp-types",
  "serde_json",
@@ -163,6 +164,7 @@ version = "0.1.0"
 dependencies = [
  "check-core",
  "check-runtime",
+ "check-wasm",
  "wasm-encoder",
  "wasmparser",
  "wasmtime",

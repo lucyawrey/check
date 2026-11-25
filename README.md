@@ -4,9 +4,14 @@ A rust hosted, beginner friendly programming language that checks your work. Com
 
 ## Build
 
+The WASM runtime needs Rust's `wasm32-unknown-unknown` target:
+
 ```
+rustup target add wasm32-unknown-unknown
 cargo build
 ```
+
+To build without running WASM (and without `wasmtime`), use `cargo build --no-default-features -p check-cli`.
 
 ## Run
 
@@ -15,6 +20,8 @@ Run a program:
 ```
 cargo run -q -p check-cli -- run <file>
 ```
+
+`run --wasm <file>` compiles it to WebAssembly and runs that instead. Only part of the language compiles so far.
 
 Check a program:
 
@@ -33,6 +40,8 @@ Run language tests:
 ```
 cargo run -q -p check-cli -- test silver_tests/
 ```
+
+`test --wasm` also runs each test through WebAssembly, skipping those that use something not compiled yet.
 
 ## Install
 

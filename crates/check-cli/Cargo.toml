@@ -5,9 +5,14 @@ edition = "2024"
 
 [dependencies]
 check-core = { path = "../check-core" }
+check-wasm = { path = "../check-wasm", features = ["run"], optional = true }
 lsp-server = "0.10.0"
 lsp-types = "0.97.0"
 serde_json = "1.0.154"
+
+[features]
+default = ["wasm"]
+wasm = ["dep:check-wasm"]
 
 [[bin]]
 name = "check"

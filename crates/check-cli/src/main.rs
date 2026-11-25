@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use check_core::copy::Text;
-use check_core::diag::Severity;
+use check_core::diag::{Code, Severity};
 use check_core::modules::entry_of;
 use check_core::{Files, Outcome, Report, check_program, run_program};
 
@@ -24,10 +24,33 @@ fn main() -> ExitCode {
         .unwrap_or(ExitCode::FAILURE)
 }
 
+#[derive(Clone, Copy)]
+enum Backend {
+    Interpreter,
+    #[cfg(feature = "wasm")]
+    Wasm,
+}
+
+impl Backend {
+    fn label(self) -> &'static str {
+        match self {
+            Backend::Interpreter => "",
+            #[cfg(feature = "wasm")]
+            Backend::Wasm => " (wasm)",
+        }
+    }
+}
+
 fn dispatch(args: &[String]) -> ExitCode {
     match args {
-        [cmd, path] if cmd == "run" => run(path),
-        [cmd, path] if cmd == "test" => test(Path::new(path)),
+        [cmd, path] if cmd == "run" => run(path, Backend::Interpreter),
+        #[cfg(feature = "wasm")]
+        [cmd, flag, path] if cmd == "run" && flag == "--wasm" => run(path, Backend::Wasm),
+        [cmd, path] if cmd == "test" => test(Path::new(path), &[Backend::Interpreter]),
+        #[cfg(feature = "wasm")]
+        [cmd, flag, path] if cmd == "test" && flag == "--wasm" => {
+            test(Path::new(path), &[Backend::Interpreter, Backend::Wasm])
+        }
         [cmd, path, flags @ ..] if cmd == "tidy" => match tidy_options(flags) {
             Some((levels, dry_run)) => tidy(path, &levels, dry_run),
             None => usage(),
@@ -40,7 +63,7 @@ fn dispatch(args: &[String]) -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: check <path> | check run <path> | check test <folder> | check tidy <path> [--only style,error] [--dry-run] | check lsp"
+        "usage: check <path> | check run [--wasm] <path> | check test [--wasm] <folder> | check tidy <path> [--only style,error] [--dry-run] | check lsp"
     );
     ExitCode::from(2)
 }
@@ -112,14 +135,18 @@ fn render(report: &Report, errors_only: bool, color: bool) -> String {
     out
 }
 
-fn run(path: &str) -> ExitCode {
+fn run(path: &str, backend: Backend) -> ExitCode {
     let Some(path) = entry(path) else {
         return ExitCode::FAILURE;
     };
-    let stdin = io::stdin();
-    let mut input = stdin.lock();
-    let mut output = io::stdout();
-    let report = run_program(&path, &Disk, false, &mut input, &mut output);
+    let report = match backend {
+        Backend::Interpreter => {
+            let mut input = io::stdin().lock();
+            run_program(&path, &Disk, false, &mut input, &mut io::stdout())
+        }
+        #[cfg(feature = "wasm")]
+        Backend::Wasm => check_wasm::run_program(&path, &Disk, false, io::stdout()),
+    };
     eprint!("{}", render(&report, false, color()));
     match report.outcome {
         Outcome::Finished => ExitCode::SUCCESS,
@@ -269,19 +296,42 @@ fn strip_final_break(text: &str) -> &str {
     text.strip_suffix('\n').unwrap_or(text)
 }
 
-fn run_test(dir: &Path) -> Result<(), String> {
+enum Tested {
+    Passed,
+    Skipped(String),
+}
+
+fn run_test(dir: &Path, backend: Backend) -> Result<Tested, String> {
     let file = test_file(dir)?;
-    let input = fs::read_to_string(dir.join("input.txt")).unwrap_or_default();
-    let mut reader = BufReader::new(Cursor::new(input.into_bytes()));
-    let mut output = Vec::new();
     let path = file.display().to_string();
-    let report = run_program(&path, &Disk, true, &mut reader, &mut output);
-    let stdout = String::from_utf8_lossy(&output).to_string();
+    let (report, stdout) = match backend {
+        Backend::Interpreter => {
+            let input = fs::read_to_string(dir.join("input.txt")).unwrap_or_default();
+            let mut reader = BufReader::new(Cursor::new(input.into_bytes()));
+            let mut output = Vec::new();
+            let report = run_program(&path, &Disk, true, &mut reader, &mut output);
+            (report, String::from_utf8_lossy(&output).to_string())
+        }
+        #[cfg(feature = "wasm")]
+        Backend::Wasm => {
+            let output = check_wasm::MemoryOutputPipe::new(usize::MAX);
+            let report = check_wasm::run_program(&path, &Disk, true, output.clone());
+            (
+                report,
+                String::from_utf8_lossy(&output.contents()).to_string(),
+            )
+        }
+    };
     let first_error = report
         .diagnostics
         .iter()
-        .find(|d| d.severity == Severity::Error)
-        .map(|d| d.code.to_string());
+        .find(|d| d.severity == Severity::Error);
+    if let Some(d) = first_error
+        && d.code == Code::wasm_unsupported
+    {
+        return Ok(Tested::Skipped(d.render(&report.sources, false)));
+    }
+    let first_error = first_error.map(|d| d.code.to_string());
     let error_code = match report.outcome {
         Outcome::Finished => None,
         Outcome::Stopped => Some("try_stopped".to_string()),
@@ -291,7 +341,7 @@ fn run_test(dir: &Path) -> Result<(), String> {
     if let Ok(expected) = fs::read_to_string(dir.join("expected_error.txt")) {
         let expected = expected.trim();
         return match error_code {
-            Some(code) if code == expected => Ok(()),
+            Some(code) if code == expected => Ok(Tested::Passed),
             Some(code) => Err(format!(
                 "expected error {expected}, got {code}\n{}",
                 render(&report, true, false)
@@ -312,7 +362,7 @@ fn run_test(dir: &Path) -> Result<(), String> {
         ));
     }
     if problems.is_empty() {
-        Ok(())
+        Ok(Tested::Passed)
     } else {
         Err(problems)
     }
@@ -338,7 +388,7 @@ fn diff(expected: &str, actual: &str) -> String {
     out
 }
 
-fn test(root: &Path) -> ExitCode {
+fn test(root: &Path, backends: &[Backend]) -> ExitCode {
     let mut dirs: Vec<PathBuf> = match fs::read_dir(root) {
         Ok(entries) => entries
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -350,21 +400,31 @@ fn test(root: &Path) -> ExitCode {
         }
     };
     dirs.sort();
-    let mut failed = 0;
+    let (mut passed, mut failed, mut skipped) = (0, 0, 0);
     for dir in &dirs {
-        let name = dir
+        let dir_name = dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        match run_test(dir) {
-            Ok(()) => println!("ok    {name}"),
-            Err(problems) => {
-                failed += 1;
-                println!("FAIL  {name}\n{problems}");
+        for &backend in backends {
+            let name = format!("{dir_name}{}", backend.label());
+            match run_test(dir, backend) {
+                Ok(Tested::Passed) => {
+                    passed += 1;
+                    println!("ok    {name}");
+                }
+                Ok(Tested::Skipped(note)) => {
+                    skipped += 1;
+                    println!("skip  {name}\n{note}");
+                }
+                Err(problems) => {
+                    failed += 1;
+                    println!("FAIL  {name}\n{problems}");
+                }
             }
         }
     }
-    println!("{} passed, {failed} failed", dirs.len() - failed);
+    println!("{passed} passed, {failed} failed, {skipped} skipped");
     if failed == 0 {
         ExitCode::SUCCESS
     } else {

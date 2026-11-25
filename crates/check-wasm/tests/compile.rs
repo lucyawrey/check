@@ -1,95 +1,42 @@
-use check_core::diag::{Code, Severity};
-use check_core::interp::panic_code;
-use check_core::{Outcome, check_source, lower::lower, run_source};
-use check_runtime::Panic;
-use check_wasm::{RUNTIME, compile};
-use wasmtime::{Engine, Linker, Store, Trap};
-use wasmtime_wasi::WasiCtxBuilder;
-use wasmtime_wasi::p1::{self, WasiP1Ctx};
-use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
+use std::collections::HashMap;
 
-#[derive(Debug)]
-struct HostPanic(u32, u32);
+use check_core::modules::MemFiles;
+use check_core::{Outcome, Report, check_source, lower::lower, run_source};
+use check_wasm::{MemoryOutputPipe, RUNTIME, compile, execute, run_program};
 
-impl std::fmt::Display for HostPanic {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "panic {} at {}", self.0, self.1)
-    }
+fn output(pipe: &MemoryOutputPipe) -> String {
+    String::from_utf8(pipe.contents().to_vec()).unwrap()
 }
 
-impl std::error::Error for HostPanic {}
-
-struct Run {
-    output: String,
-    panic: Option<(Code, Option<usize>)>,
-    pages: u64,
-}
-
-fn run_wasm(src: &str) -> Run {
-    let checked = check_source("test.check", src);
-    let errors: Vec<String> = (checked.diagnostics.iter())
-        .filter(|d| d.severity == Severity::Error)
-        .map(|d| format!("{:?} at {:?}", d.code, checked.sources.text(d.span)))
-        .collect();
-    assert!(errors.is_empty(), "{src}\nhas errors: {errors:?}");
-    let program = lower(&checked.program, &checked.library, &checked.info).expect("lowers");
-    let wasm = compile(&program, RUNTIME).expect("compiles");
-    let engine = Engine::default();
-    let module = wasmtime::Module::new(&engine, &wasm).expect("a valid module");
-    let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
-    p1::add_to_linker_sync(&mut linker, |ctx| ctx).unwrap();
-    linker
-        .func_wrap(
-            "check",
-            "panic",
-            |code: u32, at: u32| -> wasmtime::Result<()> {
-                Err(wasmtime::Error::new(HostPanic(code, at)))
-            },
-        )
-        .unwrap();
+fn run_wasm(src: &str) -> (Report, String) {
+    let files = MemFiles(HashMap::from([("test.check".to_string(), src.to_string())]));
     let stdout = MemoryOutputPipe::new(1 << 20);
-    let ctx = WasiCtxBuilder::new().stdout(stdout.clone()).build_p1();
-    let mut store = Store::new(&engine, ctx);
-    let instance = linker.instantiate(&mut store, &module).unwrap();
-    let start = instance
-        .get_typed_func::<(), ()>(&mut store, "_start")
-        .unwrap();
-    let panic = start.call(&mut store, ()).err().map(|e| {
-        if let Some(HostPanic(code, at)) = e.downcast_ref() {
-            (panic_code(Panic::ALL[*code as usize]), Some(*at as usize))
-        } else if e.downcast_ref::<Trap>() == Some(&Trap::StackOverflow) {
-            (Code::stack_overflow, None)
-        } else {
-            panic!("{src} trapped: {e:?}")
-        }
-    });
-    let memory = instance.get_memory(&mut store, "memory").unwrap();
-    Run {
-        output: String::from_utf8(stdout.contents().to_vec()).unwrap(),
-        panic,
-        pages: memory.size(&store),
+    let report = run_program("test.check", &files, false, stdout.clone());
+    if let Outcome::CheckFailed = report.outcome {
+        let errors: String = (report.diagnostics.iter())
+            .map(|d| d.render(&report.sources, false))
+            .collect();
+        panic!("{src}\ndoesn't compile:\n{errors}");
     }
+    (report, output(&stdout))
 }
 
 fn same(src: &str) {
-    let mut output = Vec::new();
-    let report = run_source("test.check", src, &mut std::io::empty(), &mut output);
-    let wasm = run_wasm(src);
-    assert_eq!(wasm.output, String::from_utf8(output).unwrap(), "{src}");
-    match (report.outcome, wasm.panic) {
-        (Outcome::Finished, None) => {}
-        (Outcome::Panicked(code), Some((wasm_code, at))) => {
-            assert_eq!(wasm_code, code, "{src}");
-            if let Some(at) = at {
-                let (path, line, col, _) = report.sources.locate(at);
-                let text = report.panic_text.expect("a panic's text");
-                assert!(
-                    text.contains(&format!("{path}:{line}:{col}")),
-                    "{src}: {text}"
-                );
-            }
-        }
-        (_, panic) => panic!("{src}: the interpreter and WASM differ, WASM gave {panic:?}"),
+    let mut interpreted = Vec::new();
+    let report = run_source("test.check", src, &mut std::io::empty(), &mut interpreted);
+    let (wasm, wasm_output) = run_wasm(src);
+    assert_eq!(
+        wasm_output,
+        String::from_utf8(interpreted).unwrap(),
+        "{src}"
+    );
+    match (report.panic_text, wasm.panic_text) {
+        (None, None) => {}
+        (Some(expected), Some(text)) => assert!(
+            expected.starts_with(&text),
+            "{src}\nthe interpreter gave:\n{expected}WASM gave:\n{text}"
+        ),
+        (expected, text) => panic!("{src}\nthe interpreter gave {expected:?}, WASM {text:?}"),
     }
 }
 
@@ -169,9 +116,11 @@ for j in high..2 { print(j) }\n\
 
 #[test]
 fn memory_stays_bounded_while_strings_come_and_go() {
-    let run = run_wasm(
-        "var keep = \"\"\nfor i in 0..200000 {\n  let s = \"item {i} \" + \"and more text\"\n  keep = s\n}\nprint(keep)",
-    );
-    assert_eq!(run.output, "item 199999 and more text\n");
+    let src = "var keep = \"\"\nfor i in 0..200000 {\n  let s = \"item {i} \" + \"and more text\"\n  keep = s\n}\nprint(keep)";
+    let checked = check_source("test.check", src);
+    let program = lower(&checked.program, &checked.library, &checked.info).unwrap();
+    let stdout = MemoryOutputPipe::new(1 << 10);
+    let run = execute(&compile(&program, RUNTIME).unwrap(), stdout.clone()).unwrap();
+    assert_eq!(output(&stdout), "item 199999 and more text\n");
     assert!(run.pages < 40, "memory grew to {} pages", run.pages);
 }
