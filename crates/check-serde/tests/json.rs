@@ -82,7 +82,6 @@ fn place(fields: &str) -> Place {
     read("place.json", &text).unwrap()
 }
 
-/// The rendered check error, which must have `code`.
 fn check_error(text: &str, code: &str) -> String {
     match read("place.json", text) {
         Err(e @ Error::Check { .. }) => {
@@ -151,7 +150,13 @@ fn a_type_error_names_the_values_path() {
 
 #[test]
 fn unknown_names_and_variants_are_errors() {
-    field_error(", \"colour\": 1", "wrong_arguments");
+    let error = field_error(", \"colour\": 1", "wrong_arguments");
+    assert!(error.contains("--> place.json: colour\n"), "{error}");
+    let error = field_error(
+        ", \"spawn\": {\"center\": [0, 1, 0], \"bad\": 1}",
+        "wrong_arguments",
+    );
+    assert!(error.contains("--> place.json: spawn.bad\n"), "{error}");
     let error = field_error(", \"sky\": \"Night\"", "unknown_variant");
     assert!(error.contains("--> place.json: sky\n"), "{error}");
     let error = field_error(", \"shape\": {\"type\": \"Hexagon\"}", "unknown_variant");

@@ -314,7 +314,6 @@ pub struct Source {
     pub text: String,
     /// The offset of the file's first byte in spans.
     pub base: usize,
-    /// For a JSON file, the path of each value, which has its own offset after the text.
     pub value_paths: Vec<String>,
 }
 
@@ -348,7 +347,6 @@ impl Sources {
         base
     }
 
-    /// Gives a value in the last file added its own offset, which errors show as `path`.
     pub fn add_value_path(&mut self, path: String) -> usize {
         let file = self.files.last_mut().expect("a file");
         file.value_paths.push(path);

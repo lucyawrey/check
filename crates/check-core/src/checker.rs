@@ -7,7 +7,6 @@ use crate::types::{Show, Subst, Ty};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Coercion {
-    /// A JSON array read as a tuple.
     pub list_to_record: bool,
     pub to_float: bool,
     pub maybe_to_float: bool,
@@ -269,7 +268,6 @@ pub struct Checker<'s> {
     flow: Flow,
     body_writes: HashSet<String>,
     in_try: bool,
-    /// Checking a `.json` data file's value.
     json: bool,
     try_points: usize,
     without_value: HashMap<Span, usize>,
@@ -3042,7 +3040,6 @@ impl Checker<'_> {
         Ty::Record(names, fields)
     }
 
-    /// A JSON string is a `String`, or the unit variant it names where an enum is expected.
     fn json_string(&mut self, expr: &Expr, segs: &[StrSeg], expected: Option<&Ty>) -> Ty {
         let enum_name = match expected.map(|e| self.subst.shallow(e)) {
             Some(Ty::Maybe(inner)) => self.subst.shallow(&inner),
@@ -3089,7 +3086,6 @@ impl Checker<'_> {
         Ty::Record(Vec::new(), fields)
     }
 
-    /// A JSON object where an enum is expected is the data variant its `type` key names.
     fn json_tagged(
         &mut self,
         expr: &Expr,
@@ -3979,7 +3975,12 @@ impl Checker<'_> {
                 }
                 _ => {
                     self.skip_arg(source);
-                    ok = false;
+                    match source {
+                        ArgSource::Expr(e) if self.json => {
+                            self.error(Code::wrong_arguments, e.span);
+                        }
+                        _ => ok = false,
+                    }
                 }
             }
         }

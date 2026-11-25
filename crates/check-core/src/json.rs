@@ -2,8 +2,6 @@ use crate::ast::{Arg, Expr, ExprKind, NodeId, StrSeg};
 use crate::diag::{Code, Diagnostic, Sources, Span};
 use serde_json::Value;
 
-/// The JSON text of the file last added to `sources` as the data tree a `.con` file parses
-/// to, or `None` after a syntax error. A `null` is the name `None`.
 pub fn parse(
     text: &str,
     sources: &mut Sources,
@@ -69,7 +67,6 @@ fn to_expr(value: Value, path: String, sources: &mut Sources, next_id: &mut Node
     }
 }
 
-/// The byte offset of serde_json's 1-based line and column.
 fn offset(text: &str, line: usize, column: usize) -> usize {
     let line_start: usize = text
         .split_inclusive('\n')

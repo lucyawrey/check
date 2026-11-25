@@ -537,7 +537,6 @@ impl Interpreter<'_> {
                 let mut fields = vec![Value::Void; variant.map_or(0, |v| v.fields.len())];
                 for (k, arg) in args.iter().enumerate() {
                     let i = match &arg.name {
-                        // Only a JSON object's `type` key names no field.
                         Some(n) => {
                             match names.as_ref().and_then(|ns| ns.iter().position(|f| f == n)) {
                                 Some(i) => i,
