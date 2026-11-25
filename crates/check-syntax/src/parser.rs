@@ -1807,11 +1807,20 @@ impl Parser<'_> {
     fn postfix(&mut self) -> PResult<Expr> {
         let mut expr = self.primary()?;
         loop {
+            let optional_dot = self.eat_sym("?.");
+            let optional_index = !optional_dot
+                && self.is_sym("?")
+                && matches!(self.peek_at(1), Tok::Sym("["))
+                && self.tokens[self.pos + 1].span.start == self.span().end;
+            if optional_index {
+                self.advance();
+            }
             if self.eat_sym("(") {
                 let args = self.args()?;
                 let span = expr.span.to(self.prev_span());
                 expr = self.expr_node(span, ExprKind::Call(Box::new(expr), args));
-            } else if self.eat_sym(".") {
+            } else if optional_dot || self.eat_sym(".") {
+                let start = expr.span;
                 let name = match self.peek().clone() {
                     Tok::Int(n) => {
                         self.advance();
@@ -1819,14 +1828,13 @@ impl Parser<'_> {
                     }
                     _ => self.field_name()?.0,
                 };
-                if !self.eat_sym("(") {
-                    let span = expr.span.to(self.prev_span());
-                    expr = self.expr_node(span, ExprKind::Field(Box::new(expr), name));
-                    continue;
-                }
-                let args = self.args()?;
-                let span = expr.span.to(self.prev_span());
-                expr = self.expr_node(span, ExprKind::Method(Box::new(expr), name, args));
+                let kind = if self.eat_sym("(") {
+                    ExprKind::Method(Box::new(expr), name, self.args()?)
+                } else {
+                    ExprKind::Field(Box::new(expr), name)
+                };
+                let span = start.to(self.prev_span());
+                expr = self.expr_node(span, kind);
             } else if self.eat_sym("[") {
                 self.skip_newlines();
                 let index = self.expr()?;
@@ -1836,6 +1844,9 @@ impl Parser<'_> {
                 expr = self.expr_node(span, ExprKind::Index(Box::new(expr), Box::new(index)));
             } else {
                 return Ok(expr);
+            }
+            if optional_dot || optional_index {
+                expr = self.expr_node(expr.span, ExprKind::Opt(Box::new(expr)));
             }
         }
     }

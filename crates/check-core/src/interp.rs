@@ -80,6 +80,7 @@ pub struct Interpreter<'a> {
     depth: usize,
     /// The `shared class` objects being printed, by address, to stop at a cycle.
     printing: Vec<usize>,
+    unwrapped: HashMap<NodeId, Value>,
     /// Steps left before evaluation stops with `out_of_steps`; `None` is no limit.
     budget: Option<u64>,
     input: &'a mut dyn BufRead,
@@ -184,6 +185,7 @@ fn start<'a>(
         frames: vec![Frame::default()],
         depth: 0,
         printing: Vec::new(),
+        unwrapped: HashMap::new(),
         budget: Some(DATA_BUDGET),
         input,
         output,
@@ -1112,6 +1114,9 @@ impl Interpreter<'_> {
     }
 
     fn expr(&mut self, expr: &Expr) -> Eval {
+        if let Some(value) = self.unwrapped.remove(&expr.id) {
+            return Ok(value);
+        }
         let mut value = grow(|| self.raw(expr))?;
         if self.info.try_unwraps.contains_key(&expr.id) {
             value = self.unwrap_or_return(value, expr.span)?;
@@ -1168,6 +1173,24 @@ impl Interpreter<'_> {
                 None => internal(&format!("no variable `{name}`"), expr.span),
             },
             ExprKind::SharedOf(x) => self.shared_of(x),
+            ExprKind::Opt(access) => {
+                let (ExprKind::Field(base, _)
+                | ExprKind::Method(base, ..)
+                | ExprKind::Index(base, _)) = &access.kind
+                else {
+                    unreachable!("the parser wraps only a field, method or index access")
+                };
+                let Value::Some(inner) = self.expr(base)? else {
+                    return Ok(Value::None);
+                };
+                self.unwrapped.insert(base.id, (*inner).clone());
+                let value = self.expr(access)?;
+                Ok(if self.info.optional_wraps.contains(&expr.id) {
+                    Value::Some(Rc::new(value))
+                } else {
+                    value
+                })
+            }
             ExprKind::This => match self.lookup("this") {
                 Some(v) => Ok(v),
                 None => internal("no `this`", expr.span),

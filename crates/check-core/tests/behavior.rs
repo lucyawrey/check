@@ -3784,3 +3784,21 @@ fn a_method_with_a_std_methods_name_replaces_it_with_a_warning() {
     assert_eq!(warnings(src), ["replaces_std_method"]);
     assert_eq!(output(src), "[1]");
 }
+
+#[test]
+fn optional_chaining_reads_through_some_and_stops_at_none() {
+    let src = "class Tag(name: String)\nclass Item(tag: Tag?)\nlet items = [Item(Some(Tag(\"a\"))), Item(None)]\nprint(items.first()?.tag?.name)\nprint(items.last()?.tag?.name)\nlet none: Item? = None\nprint(none?.tag?.name)\nlet words: String[]? = Some([\"x\", \"y\"])\nprint(words?[1])\nprint(words?.length())";
+    assert_eq!(output(src), "Some(\"a\")\nNone\nNone\nSome(\"y\")\nSome(2)");
+}
+
+#[test]
+fn optional_chaining_needs_a_maybe_and_cant_call_a_changing_method() {
+    assert_eq!(
+        first_error("let n = 1\nprint(n?.toFloat())"),
+        "type_mismatch"
+    );
+    assert_eq!(
+        first_error("var xs: Int[]? = Some([])\nxs?.push(1)"),
+        "optional_changing_call"
+    );
+}

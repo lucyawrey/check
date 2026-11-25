@@ -717,6 +717,7 @@ impl Resolver<'_> {
                 self.args(args);
             }
             ExprKind::Spread(x)
+            | ExprKind::Opt(x)
             | ExprKind::SharedOf(x)
             | ExprKind::Unary(_, x)
             | ExprKind::Loop(x) => self.expr(x),

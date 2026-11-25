@@ -53,6 +53,7 @@ pub struct Info {
     pub ref_args: HashMap<NodeId, Span>,
     /// Shared names passed to a `shared` parameter or field, which pass their box.
     pub shared_args: HashMap<NodeId, Span>,
+    pub optional_wraps: HashSet<NodeId>,
 }
 
 #[derive(Clone)]
@@ -269,6 +270,7 @@ pub struct Checker<'s> {
     body_writes: HashSet<String>,
     in_try: bool,
     json: bool,
+    unwrapped: HashMap<NodeId, Ty>,
     try_points: usize,
     without_value: HashMap<Span, usize>,
     map_writes: HashSet<NodeId>,
@@ -356,6 +358,7 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         body_writes: HashSet::new(),
         in_try: false,
         json: false,
+        unwrapped: HashMap::new(),
         try_points: 0,
         without_value: HashMap::new(),
         map_writes: HashSet::new(),
@@ -2685,6 +2688,9 @@ impl Checker<'_> {
     }
 
     pub fn expr(&mut self, expr: &Expr, expected: Option<&Ty>) -> Ty {
+        if let Some(ty) = self.unwrapped.get(&expr.id) {
+            return ty.clone();
+        }
         let ty = self.expr_type(expr, expected);
         self.info.types.insert(expr.id, ty.clone());
         ty
@@ -2693,6 +2699,7 @@ impl Checker<'_> {
     fn expr_type(&mut self, expr: &Expr, expected: Option<&Ty>) -> Ty {
         match &expr.kind {
             ExprKind::SharedOf(x) => self.shared_of(x),
+            ExprKind::Opt(access) => self.optional_access(expr, access),
             ExprKind::Int(_) => Ty::Int,
             ExprKind::Float(_) => Ty::Float,
             ExprKind::Bool(_) => Ty::Bool,
@@ -3108,6 +3115,36 @@ impl Checker<'_> {
         }
         let fields: Vec<Arg> = args.iter().filter(|a| !is_tag(a)).cloned().collect();
         self.variant_call(expr.id, enum_name, name, &fields, expr.span, expected)
+    }
+
+    fn optional_access(&mut self, expr: &Expr, access: &Expr) -> Ty {
+        let (ExprKind::Field(base, _) | ExprKind::Method(base, ..) | ExprKind::Index(base, _)) =
+            &access.kind
+        else {
+            unreachable!("the parser wraps only a field, method or index access")
+        };
+        let t = self.expr(base, None);
+        let inner = match self.subst.shallow(&t) {
+            Ty::Maybe(inner) => self.subst.shallow(&inner),
+            Ty::Error => return Ty::Error,
+            Ty::Var(_) => return self.error(Code::type_needed, base.span),
+            _ => return self.error(Code::type_mismatch, base.span),
+        };
+        if let ExprKind::Method(_, name, _) = &access.kind
+            && (MUTATING.contains(&name.as_str()) || self.changing_method(&inner, name))
+        {
+            return self.error(Code::optional_changing_call, access.span);
+        }
+        self.unwrapped.insert(base.id, inner);
+        let t = self.expr(access, None);
+        self.unwrapped.remove(&base.id);
+        match self.subst.shallow(&t) {
+            Ty::Maybe(_) | Ty::Error => t,
+            _ => {
+                self.info.optional_wraps.insert(expr.id);
+                Ty::maybe(t)
+            }
+        }
     }
 
     fn record_copy(&mut self, original: &Expr, changes: &[Arg]) -> Ty {
