@@ -594,6 +594,12 @@ fn a_comparison_gives_a_bare_variant_the_other_sides_type() {
 }
 
 #[test]
+fn a_bare_none_is_the_expected_enums_variant_before_maybes() {
+    let src = "enum Sky { Atmosphere\n None }\nlet sky: Sky = None\nlet maybe: Sky? = None\nprint(sky)\nprint(maybe ?? Sky.Atmosphere)";
+    assert_eq!(output(src), "None\nAtmosphere");
+}
+
+#[test]
 fn equality_never_compares_shared_classes_even_inside_other_values() {
     for src in ["[a] == [a]", "Some(a) == Some(a)", "W(a) == W(a)"] {
         assert_eq!(

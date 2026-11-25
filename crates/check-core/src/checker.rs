@@ -3151,7 +3151,12 @@ impl Checker<'_> {
             return Ty::Func(params, Box::new(ret));
         }
         if name == "None" {
-            return Ty::maybe(self.subst.fresh());
+            return match expected.map(|e| self.subst.shallow(e)) {
+                Some(Ty::Named(e, _)) if self.variant(&e, name).is_some() => {
+                    self.unit_variant(id, &e, name, span)
+                }
+                _ => Ty::maybe(self.subst.fresh()),
+            };
         }
         if let Some(owner) = &self.current_type {
             let key = format!("{owner}.{name}");
