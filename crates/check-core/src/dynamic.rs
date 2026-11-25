@@ -130,6 +130,44 @@ fn object(fields: impl Iterator<Item = (String, Option<Value>)>) -> Value {
     variant("Object", Value::Map(Rc::new(entries)))
 }
 
+pub fn from_value(value: &Value) -> Option<Value> {
+    Some(match value {
+        Value::Int(n) => variant("Int", Value::Int(*n)),
+        Value::Float(x) => variant("Float", Value::Float(*x)),
+        Value::Bool(b) => variant("Bool", Value::Bool(*b)),
+        Value::Str(s) => string(s),
+        Value::List(items) => list(items.iter().map(from_value)),
+        Value::Set(items) => list(items.iter().map(from_value)),
+        Value::Map(entries) => object(entries.iter().map(|(k, v)| (k.display(), from_value(v)))),
+        Value::Some(v) => return from_value(v),
+        Value::Cell(v) | Value::SharedBox(v) => return from_value(&v.borrow()),
+        Value::Variant(r) if &*r.ty == DYN => value.clone(),
+        Value::Variant(r) if r.fields.is_empty() => string(&r.name),
+        Value::Variant(r) => {
+            let mut fields = present_fields(r);
+            fields.insert(0, ("type".to_string(), Some(string(&r.name))));
+            object(fields.into_iter())
+        }
+        Value::Object(r) | Value::Record(r) if r.field_names.is_some() => {
+            object(present_fields(r).into_iter())
+        }
+        Value::Record(r) => list(r.fields.iter().map(from_value)),
+        _ => return None,
+    })
+}
+
+fn present_fields(r: &Record) -> Vec<(String, Option<Value>)> {
+    (r.fields.iter().enumerate())
+        .filter_map(|(i, v)| {
+            let name = match &r.field_names {
+                Some(names) => names[i].to_string(),
+                None => i.to_string(),
+            };
+            Some((name, Some(from_value(v)?)))
+        })
+        .collect()
+}
+
 fn from_json(json: serde_json::Value) -> Option<Value> {
     use serde_json::Value as Json;
     Some(match json {

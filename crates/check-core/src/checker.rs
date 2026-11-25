@@ -8,6 +8,7 @@ use crate::types::{Shape, Show, Subst, Ty};
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Coercion {
     pub list_to_record: bool,
+    pub to_dyn: bool,
     pub to_float: bool,
     pub maybe_to_float: bool,
     pub wraps: usize,
@@ -1626,6 +1627,12 @@ impl Checker<'_> {
                 true
             }
             (Ty::Maybe(_), Ty::Maybe(_)) => self.conforms(&a, &e),
+            (_, Ty::Named(n, _))
+                if n == DYN && a != e && self.converts_to_dyn(&a, &mut HashSet::new()) =>
+            {
+                self.info.coercions.entry(id).or_default().to_dyn = true;
+                true
+            }
             (_, Ty::Maybe(inner)) => {
                 let inner = (**inner).clone();
                 if self.subsume(id, &a, &inner) {
@@ -3146,6 +3153,30 @@ impl Checker<'_> {
             )
         } else {
             Ty::maybe(target)
+        }
+    }
+
+    fn converts_to_dyn(&self, ty: &Ty, seen: &mut HashSet<String>) -> bool {
+        match self.subst.shallow(ty) {
+            Ty::Int | Ty::Float | Ty::Bool | Ty::Str => true,
+            Ty::List(e) => self.converts_to_dyn(&e, seen),
+            Ty::Maybe(e) => !matches!(*e, Ty::Maybe(_)) && self.converts_to_dyn(&e, seen),
+            Ty::Record(_, fields) => fields.iter().all(|f| self.converts_to_dyn(f, seen)),
+            Ty::Named(n, args) if n == MAP => {
+                self.subst.shallow(&args[0]) == Ty::Str && self.converts_to_dyn(&args[1], seen)
+            }
+            Ty::Named(n, args) if n == SET => self.converts_to_dyn(&args[0], seen),
+            Ty::Named(n, _) if n == DYN || !seen.insert(n.clone()) => true,
+            Ty::Named(n, args) => {
+                let map = self.args_map(&n, &args);
+                let fields: Vec<&ParamSig> = match self.types.get(&n) {
+                    Some(TypeDef::Class(c)) if !c.is_shared => c.fields.iter().collect(),
+                    Some(TypeDef::Enum(vs)) => vs.iter().flat_map(|v| &v.fields).collect(),
+                    _ => return false,
+                };
+                (fields.iter()).all(|f| self.converts_to_dyn(&f.ty.substitute(&map), seen))
+            }
+            _ => false,
         }
     }
 

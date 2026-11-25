@@ -267,6 +267,9 @@ fn coerce(info: &Info, id: NodeId, mut value: Value) -> Value {
         {
             value = Value::Record(Rc::new(Record::unnamed(None, items.to_vec())));
         }
+        if c.to_dyn {
+            value = dynamic::from_value(&value).unwrap_or(value);
+        }
         if c.to_float
             && let Value::Int(n) = value
         {
