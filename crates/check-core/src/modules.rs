@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::ast::{DataDecl, DataFile, Expr, ExprKind, File, NodeId, Stmt, StrSeg, TypeExpr};
 use crate::diag::{Code, Diagnostic, Edit, Sources, Span};
 use crate::resolve::{SourceFile, resolve};
-use crate::{lexer, parser};
+use crate::{json, lexer, parser};
 
 pub trait Files {
     fn read(&self, path: &str) -> Option<String>;
@@ -172,10 +172,27 @@ pub fn load_data(
     expected_type: &str,
 ) -> (Loaded, NodeId, bool) {
     let mut loader = Loader::new(path, files);
-    let data = loader.parse_data(path, text);
+    let is_json = path.ends_with(".json");
+    let data = if is_json {
+        loader.sources.add(path, text);
+        match json::parse(
+            text,
+            &mut loader.sources,
+            &mut loader.next_id,
+            &mut loader.diags,
+        ) {
+            Some(value) => DataFile {
+                namespace: None,
+                value,
+            },
+            None => return (loader.finish(), 0, false),
+        }
+    } else {
+        loader.parse_data(path, text)
+    };
     let id = data.value.id;
     let is_call = matches!(data.value.kind, ExprKind::Call(..) | ExprKind::Method(..));
-    if !path.ends_with(".con") {
+    if !path.ends_with(".con") && !is_json {
         loader.error(Code::not_pure_data, data.value.span, None);
         return (loader.finish(), id, is_call);
     }
@@ -188,6 +205,7 @@ pub fn load_data(
         ty: Some(TypeExpr::Name(expected_type.to_string(), data.value.span)),
         value: data.value,
         is_pure: true,
+        is_json,
         is_private: false,
     };
     let namespace = data.namespace.map(|(n, _)| n).unwrap_or_default();
@@ -495,6 +513,7 @@ impl<'a> Loader<'a> {
             )),
             value: data.value,
             is_pure: true,
+            is_json: false,
             is_private: namespace.is_empty(),
         };
         self.push(unit, namespace.clone(), vec![Stmt::Data(package)]);
@@ -564,6 +583,7 @@ impl<'a> Loader<'a> {
                 ty: None,
                 value: data.value,
                 is_pure,
+                is_json: false,
                 is_private: false,
             };
             (data.namespace, vec![Stmt::Data(decl)])

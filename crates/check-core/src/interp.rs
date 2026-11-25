@@ -258,6 +258,11 @@ pub(crate) fn panic<T>(code: Code, span: Span) -> Result<T, Flow> {
 
 fn coerce(info: &Info, id: NodeId, mut value: Value) -> Value {
     if let Some(c) = info.coercions.get(&id) {
+        if c.list_to_record
+            && let Value::List(items) = value
+        {
+            value = Value::Record(Rc::new(Record::unnamed(None, items.to_vec())));
+        }
         if c.to_float
             && let Value::Int(n) = value
         {
@@ -531,12 +536,17 @@ impl Interpreter<'_> {
                 let names = variant.and_then(|v| v.field_names.clone());
                 let mut fields = vec![Value::Void; variant.map_or(0, |v| v.fields.len())];
                 for (k, arg) in args.iter().enumerate() {
-                    let v = self.expr(&arg.value)?;
-                    let i = match (&arg.name, &names) {
-                        (Some(n), Some(names)) => names.iter().position(|f| f == n).unwrap_or(k),
-                        _ => k,
+                    let i = match &arg.name {
+                        // Only a JSON object's `type` key names no field.
+                        Some(n) => {
+                            match names.as_ref().and_then(|ns| ns.iter().position(|f| f == n)) {
+                                Some(i) => i,
+                                None => continue,
+                            }
+                        }
+                        None => k,
                     };
-                    fields[i] = v;
+                    fields[i] = self.expr(&arg.value)?;
                 }
                 Ok(Value::Variant(Rc::new(Record {
                     name: name.as_str().into(),
@@ -1128,7 +1138,9 @@ impl Interpreter<'_> {
         let info = self.info;
         if let Some(r) = info.resolved.get(&expr.id) {
             match &expr.kind {
-                ExprKind::Name(_) | ExprKind::Field(..) => return self.resolved(r, &[], expr.span),
+                ExprKind::Name(_) | ExprKind::Field(..) | ExprKind::Str(_) => {
+                    return self.resolved(r, &[], expr.span);
+                }
                 ExprKind::Call(_, args) | ExprKind::Record(args) => {
                     return self.resolved(r, args, expr.span);
                 }

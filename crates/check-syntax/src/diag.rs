@@ -159,6 +159,9 @@ codes! {
     data_folder,
     bad_data_name,
     not_pure_data,
+    json_syntax,
+    unknown_variant,
+    missing_tag,
     namespace_outside_package,
     misplaced_namespace,
     external_outside_library,
@@ -258,13 +261,6 @@ impl Diagnostic {
 
     /// `color` adds ANSI colors in rustc's scheme.
     pub fn render(&self, sources: &Sources, color: bool) -> String {
-        let (path, line, col, text) = sources.locate(self.span.start);
-        let width = (self
-            .span
-            .end
-            .min(self.span.start + text.len().saturating_sub(col - 1)))
-        .saturating_sub(self.span.start)
-        .max(1);
         let (kind, style) = match self.severity {
             Severity::Error => ("error", "1;31"),
             Severity::Warning => ("warning", "1;33"),
@@ -276,16 +272,33 @@ impl Diagnostic {
                 s
             }
         };
-        let gutter = " ".repeat(line.to_string().len());
         let detail = self
             .detail
             .as_ref()
             .map(|d| format!(": {d}"))
             .unwrap_or_default();
+        let head = paint(style, format!("{kind}[{}]", self.code));
+        let message = paint("1", format!(": {}{detail}", self.code.message()));
+        let file = sources.file(self.span.start);
+        if let Some(value) = file.value_path(self.span.start) {
+            let at = if value.is_empty() {
+                String::new()
+            } else {
+                format!(": {value}")
+            };
+            let arrow = paint("1;34", "-->".to_string());
+            return format!("{head}{message}\n{arrow} {}{at}\n", file.path);
+        }
+        let (path, line, col, text) = sources.locate(self.span.start);
+        let width = (self
+            .span
+            .end
+            .min(self.span.start + text.len().saturating_sub(col - 1)))
+        .saturating_sub(self.span.start)
+        .max(1);
+        let gutter = " ".repeat(line.to_string().len());
         format!(
             "{head}{message}\n{arrow} {path}:{line}:{col}\n{empty}\n{number} {text}\n{bar} {pad}{marks}\n",
-            head = paint(style, format!("{kind}[{}]", self.code)),
-            message = paint("1", format!(": {}{detail}", self.code.message())),
             arrow = paint("1;34", format!("{gutter}-->")),
             empty = paint("1;34", format!("{gutter} |")),
             number = paint("1;34", format!("{line} |")),
@@ -301,6 +314,19 @@ pub struct Source {
     pub text: String,
     /// The offset of the file's first byte in spans.
     pub base: usize,
+    /// For a JSON file, the path of each value, which has its own offset after the text.
+    pub value_paths: Vec<String>,
+}
+
+impl Source {
+    fn end(&self) -> usize {
+        self.base + self.text.len() + self.value_paths.len()
+    }
+
+    pub fn value_path(&self, offset: usize) -> Option<&str> {
+        let i = offset.checked_sub(self.base + self.text.len() + 1)?;
+        self.value_paths.get(i).map(String::as_str)
+    }
 }
 
 /// Every file gets its own range of offsets, so a span alone says which file it's in.
@@ -312,13 +338,21 @@ pub struct Sources {
 impl Sources {
     /// Returns the base offset to lex the file at.
     pub fn add(&mut self, path: &str, text: &str) -> usize {
-        let base = self.files.last().map_or(0, |f| f.base + f.text.len() + 1);
+        let base = self.files.last().map_or(0, |f| f.end() + 1);
         self.files.push(Source {
             path: path.to_string(),
             text: text.to_string(),
             base,
+            value_paths: Vec::new(),
         });
         base
+    }
+
+    /// Gives a value in the last file added its own offset, which errors show as `path`.
+    pub fn add_value_path(&mut self, path: String) -> usize {
+        let file = self.files.last_mut().expect("a file");
+        file.value_paths.push(path);
+        file.end()
     }
 
     pub fn files(&self) -> &[Source] {

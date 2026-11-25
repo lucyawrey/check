@@ -7,6 +7,8 @@ use crate::types::{Show, Subst, Ty};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Coercion {
+    /// A JSON array read as a tuple.
+    pub list_to_record: bool,
     pub to_float: bool,
     pub maybe_to_float: bool,
     pub wraps: usize,
@@ -143,6 +145,7 @@ struct ConstEntry {
     owner: Option<String>,
     /// For a data file, whether it's a `.con` file, which holds only literals.
     pure: bool,
+    json: bool,
     ty: Ty,
     state: FuncState,
 }
@@ -266,6 +269,8 @@ pub struct Checker<'s> {
     flow: Flow,
     body_writes: HashSet<String>,
     in_try: bool,
+    /// Checking a `.json` data file's value.
+    json: bool,
     try_points: usize,
     without_value: HashMap<Span, usize>,
     map_writes: HashSet<NodeId>,
@@ -352,6 +357,7 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         flow: Flow::default(),
         body_writes: HashSet::new(),
         in_try: false,
+        json: false,
         try_points: 0,
         without_value: HashMap::new(),
         map_writes: HashSet::new(),
@@ -836,6 +842,7 @@ impl Checker<'_> {
                     decl: c.clone(),
                     owner: Some(owner.to_string()),
                     pure: false,
+                    json: false,
                     ty: Ty::Error,
                     state: FuncState::Unchecked,
                 },
@@ -944,6 +951,7 @@ impl Checker<'_> {
             FuncState::Unchecked => entry.state = FuncState::InProgress,
         }
         let (decl, owner, pure) = (entry.decl.clone(), entry.owner.clone(), entry.pure);
+        let saved_json = std::mem::replace(&mut self.json, entry.json);
         if let Some(owner) = &owner
             && let Some(bad) = self.non_constant(&decl.value, owner)
         {
@@ -962,6 +970,7 @@ impl Checker<'_> {
         };
         self.scopes = saved_scopes;
         self.current_type = saved_type;
+        self.json = saved_json;
         // Runs after typing, which records what each call and name resolved to.
         if pure && let Some(bad) = self.non_literal(&decl.value) {
             self.error(Code::code_in_pure_data, bad.span);
@@ -993,6 +1002,7 @@ impl Checker<'_> {
                 decl,
                 owner: None,
                 pure: d.is_pure,
+                json: d.is_json,
                 ty: Ty::Error,
                 state: FuncState::Unchecked,
             },
@@ -2688,6 +2698,7 @@ impl Checker<'_> {
             ExprKind::Int(_) => Ty::Int,
             ExprKind::Float(_) => Ty::Float,
             ExprKind::Bool(_) => Ty::Bool,
+            ExprKind::Str(segs) if self.json => self.json_string(expr, segs, expected),
             ExprKind::Str(segs) => {
                 for seg in segs {
                     if let StrSeg::Expr(e) = seg {
@@ -2733,6 +2744,12 @@ impl Checker<'_> {
                 self.pattern(pattern, &t, &mut binds);
                 self.is_bindings.insert(expr.id, binds);
                 Ty::Bool
+            }
+            ExprKind::List(items)
+                if self.json
+                    && let Some(tuple) = self.expected_tuple(expected) =>
+            {
+                self.json_tuple(expr, items, tuple)
             }
             ExprKind::List(items) => {
                 let expected = match expected.map(|e| self.subst.shallow(e)) {
@@ -2985,6 +3002,12 @@ impl Checker<'_> {
         {
             return self.construct(expr.id, class, args, expr.span);
         }
+        if self.json
+            && let Some(Ty::Named(enum_name, _)) = &expected
+            && matches!(self.types.get(enum_name), Some(TypeDef::Enum(_)))
+        {
+            return self.json_tagged(expr, enum_name, args, expected.as_ref());
+        }
         if args.is_empty() {
             return self.error(Code::type_needed, expr.span);
         }
@@ -3017,6 +3040,78 @@ impl Checker<'_> {
             return self.error(Code::mixed_fields, expr.span);
         }
         Ty::Record(names, fields)
+    }
+
+    /// A JSON string is a `String`, or the unit variant it names where an enum is expected.
+    fn json_string(&mut self, expr: &Expr, segs: &[StrSeg], expected: Option<&Ty>) -> Ty {
+        let enum_name = match expected.map(|e| self.subst.shallow(e)) {
+            Some(Ty::Maybe(inner)) => self.subst.shallow(&inner),
+            Some(e) => e,
+            None => return Ty::Str,
+        };
+        let Ty::Named(enum_name, _) = enum_name else {
+            return Ty::Str;
+        };
+        let (Some(TypeDef::Enum(_)), [StrSeg::Text(name)]) = (self.types.get(&enum_name), segs)
+        else {
+            return Ty::Str;
+        };
+        if self.variant(&enum_name, name).is_none() {
+            return self.error(Code::unknown_variant, expr.span);
+        }
+        self.unit_variant(expr.id, &enum_name, name, expr.span)
+    }
+
+    fn expected_tuple(&self, expected: Option<&Ty>) -> Option<Vec<Ty>> {
+        let expected = match self.subst.shallow(expected?) {
+            Ty::Maybe(inner) => self.subst.shallow(&inner),
+            e => e,
+        };
+        match expected {
+            Ty::Record(names, fields) if names.is_empty() => Some(fields),
+            _ => None,
+        }
+    }
+
+    fn json_tuple(&mut self, expr: &Expr, items: &[Expr], fields: Vec<Ty>) -> Ty {
+        if items.len() != fields.len() {
+            return self.error(Code::type_mismatch, expr.span);
+        }
+        for (item, ty) in items.iter().zip(&fields) {
+            let t = self.expr(item, Some(ty));
+            self.expect(item, &t, ty);
+        }
+        self.info
+            .coercions
+            .entry(expr.id)
+            .or_default()
+            .list_to_record = true;
+        Ty::Record(Vec::new(), fields)
+    }
+
+    /// A JSON object where an enum is expected is the data variant its `type` key names.
+    fn json_tagged(
+        &mut self,
+        expr: &Expr,
+        enum_name: &str,
+        args: &[Arg],
+        expected: Option<&Ty>,
+    ) -> Ty {
+        let is_tag = |a: &Arg| a.name.as_deref() == Some("type");
+        let Some(tag) = args.iter().find(|a| is_tag(a)) else {
+            return self.error(Code::missing_tag, expr.span);
+        };
+        let ExprKind::Str(segs) = &tag.value.kind else {
+            return self.error(Code::missing_tag, tag.value.span);
+        };
+        let [StrSeg::Text(name)] = &segs[..] else {
+            unreachable!("a JSON string is one text segment")
+        };
+        if self.variant(enum_name, name).is_none() {
+            return self.error(Code::unknown_variant, tag.value.span);
+        }
+        let fields: Vec<Arg> = args.iter().filter(|a| !is_tag(a)).cloned().collect();
+        self.variant_call(expr.id, enum_name, name, &fields, expr.span, expected)
     }
 
     fn record_copy(&mut self, original: &Expr, changes: &[Arg]) -> Ty {
@@ -3152,7 +3247,7 @@ impl Checker<'_> {
         }
         if name == "None" {
             return match expected.map(|e| self.subst.shallow(e)) {
-                Some(Ty::Named(e, _)) if self.variant(&e, name).is_some() => {
+                Some(Ty::Named(e, _)) if !self.json && self.variant(&e, name).is_some() => {
                     self.unit_variant(id, &e, name, span)
                 }
                 _ => Ty::maybe(self.subst.fresh()),
