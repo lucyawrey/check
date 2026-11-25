@@ -1,0 +1,48 @@
+{
+	"$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+	"name": "Check Markup",
+	"patterns": [
+		{ "include": "#comment" },
+		{ "include": "#closing-tag" },
+		{ "include": "#tag" },
+		{ "include": "#escape" }
+	],
+	"repository": {
+		"comment": {
+			"match": "^\\s*(//.*)$",
+			"captures": { "1": { "name": "comment.line.double-slash.cml" } }
+		},
+		"escape": {
+			"name": "constant.character.escape.cml",
+			"match": "\\\\[<{\\\\]"
+		},
+		"closing-tag": {
+			"match": "(</)(?:([A-Za-z_]\\w*(?:\\.[A-Za-z_]\\w*)+|[A-Z]\\w*)|([a-z_]\\w*))?\\s*(>)",
+			"captures": {
+				"1": { "name": "punctuation.definition.tag.begin.cml" },
+				"2": { "name": "entity.name.type.cml" },
+				"3": { "name": "variable.other.property.cml" },
+				"4": { "name": "punctuation.definition.tag.end.cml" }
+			}
+		},
+		"tag": {
+			"begin": "(<)(?:([A-Za-z_]\\w*(?:\\.[A-Za-z_]\\w*)+|[A-Z]\\w*)(?![\\w.]|=)|([a-z_]\\w*)(?![\\w.]|=))?",
+			"beginCaptures": {
+				"1": { "name": "punctuation.definition.tag.begin.cml" },
+				"2": { "name": "entity.name.type.cml" },
+				"3": { "name": "variable.other.property.cml" }
+			},
+			"end": "/?>",
+			"endCaptures": { "0": { "name": "punctuation.definition.tag.end.cml" } },
+			"patterns": [
+				{ "name": "comment.line.double-slash.cml", "match": "//.*$" },
+				{
+					"match": "\\b([A-Za-z_]\\w*)\\s*(?==(?!=))",
+					"captures": { "1": { "name": "entity.other.attribute-name.cml" } }
+				},
+				{ "include": "source.con" }
+			]
+		}
+	},
+	"scopeName": "source.cml"
+}
