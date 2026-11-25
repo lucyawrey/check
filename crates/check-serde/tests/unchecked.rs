@@ -80,10 +80,7 @@ fn refuses_code_mixed_fields_and_files_that_arent_con() {
     check_error("p.con", "kind = Game(8, maxPlayers = 8)", "mixed_fields");
     check_error("p.conx", "title = \"a\"", "not_pure_data");
     check_error("p.con", "kind = list().Link(\"x\")", "code_in_pure_data");
-    for text in [
-        "title = foo",
-        "title = Set(\"x\")",
-    ] {
+    for text in ["title = foo", "title = Set(\"x\")"] {
         check_error("p.con", text, "code_in_pure_data");
     }
 }
