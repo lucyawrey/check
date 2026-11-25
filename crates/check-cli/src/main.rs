@@ -39,6 +39,14 @@ impl Backend {
             Backend::Wasm => " (wasm)",
         }
     }
+
+    fn unsupported_marker(self) -> Option<&'static str> {
+        match self {
+            Backend::Interpreter => None,
+            #[cfg(feature = "wasm")]
+            Backend::Wasm => Some("wasm_unsupported"),
+        }
+    }
 }
 
 fn dispatch(args: &[String]) -> ExitCode {
@@ -326,10 +334,19 @@ fn run_test(dir: &Path, backend: Backend) -> Result<Tested, String> {
         .diagnostics
         .iter()
         .find(|d| d.severity == Severity::Error);
-    if let Some(d) = first_error
-        && d.code == Code::wasm_unsupported
-    {
-        return Ok(Tested::Skipped(d.render(&report.sources, false)));
+    let marked = (backend.unsupported_marker()).is_some_and(|m| dir.join(m).exists());
+    let unsupported = first_error.filter(|d| d.code == Code::wasm_unsupported);
+    match (unsupported, marked) {
+        (Some(d), true) => return Ok(Tested::Skipped(d.render(&report.sources, false))),
+        (Some(d), false) => {
+            let note = "[a test without the wasm_unsupported marker reaches something unsupported]";
+            return Err(format!("{note}\n{}", d.render(&report.sources, false)));
+        }
+        (None, true) => {
+            let note = "[a test with the wasm_unsupported marker compiles, so the marker can go]";
+            return Err(note.to_string());
+        }
+        (None, false) => {}
     }
     let first_error = first_error.map(|d| d.code.to_string());
     let error_code = match report.outcome {
