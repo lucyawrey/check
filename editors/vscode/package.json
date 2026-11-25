@@ -21,7 +21,17 @@
     }, {
       "id": "con",
       "aliases": ["Check Object Notation", "con"],
-      "extensions": [".con"],
+      "extensions": [".con", ".conx"],
+      "configuration": "./language-configuration.json"
+    }, {
+      "id": "cml",
+      "aliases": ["Check Markup", "cml"],
+      "extensions": [".cml"],
+      "configuration": "./language-configuration.json"
+    }, {
+      "id": "cmlx",
+      "aliases": ["Check Markup with expressions", "cmlx"],
+      "extensions": [".cmlx"],
       "configuration": "./language-configuration.json"
     }],
     "grammars": [{
@@ -32,6 +42,14 @@
       "language": "con",
       "scopeName": "source.con",
       "path": "./syntaxes/check-object-notation.tmLanguage.json"
+    }, {
+      "language": "cml",
+      "scopeName": "source.cml",
+      "path": "./syntaxes/check-markup.tmLanguage.json"
+    }, {
+      "language": "cmlx",
+      "scopeName": "source.cmlx",
+      "path": "./syntaxes/check-markup-expressions.tmLanguage.json"
     }],
     "configuration": {
       "properties": {

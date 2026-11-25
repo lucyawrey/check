@@ -4,7 +4,7 @@ mod de;
 use std::fmt;
 
 use check_syntax::diag::{Code, Diagnostic, Severity, Sources};
-use check_syntax::{lexer, parser};
+use check_syntax::parser;
 use serde::de::DeserializeOwned;
 
 use data::Data;
@@ -51,7 +51,7 @@ fn deserialize<T: DeserializeOwned>(data: Data) -> Result<T, Error> {
     T::deserialize(de::ValueDe(data)).map_err(Error::Value)
 }
 
-/// Reads a `.con` or `.json` file into `T`, checking it as `check_core::check_data` does.
+/// Reads a `.con`, `.conx`, `.cml`, `.cmlx` or `.json` file into `T`, checking it as `check_core::check_data` does.
 #[cfg(feature = "check")]
 pub fn from_str<T: DeserializeOwned>(
     files: &dyn check_core::Files,
@@ -84,9 +84,9 @@ pub fn from_str_with_class<T: DeserializeOwned>(
     Ok((deserialize(value.into())?, class))
 }
 
-/// Reads a `.con` file into `T` without a Check class: no defaults, `init` or type checks,
-/// a constructor's class name is ignored, and variants match by name as written. A `.json`
-/// file is read by `serde_json`.
+/// Reads a `.con` or `.cml` file into `T` without a Check class: no defaults, `init` or type
+/// checks. A constructor's name is kept only for a Rust enum, which takes it as the variant,
+/// and variants match by name as written. A `.json` file is read by `serde_json`.
 pub fn from_str_unchecked<T: DeserializeOwned>(path: &str, text: &str) -> Result<T, Error> {
     if path.ends_with(".json") {
         return serde_json::from_str(text).map_err(|e| Error::Value(serde::de::Error::custom(e)));
@@ -94,9 +94,8 @@ pub fn from_str_unchecked<T: DeserializeOwned>(path: &str, text: &str) -> Result
     let mut sources = Sources::default();
     let mut diagnostics = Vec::new();
     let base = sources.add(path, text);
-    let tokens = lexer::lex(text, base, true, &mut diagnostics);
-    let file = parser::parse_data(tokens, text, base, &mut 0, &mut diagnostics);
-    if !path.ends_with(".con") {
+    let file = parser::parse_data_file(path, text, base, &mut 0, &mut diagnostics);
+    if !path.ends_with(".con") && !path.ends_with(".cml") {
         diagnostics.push(Diagnostic::error(Code::not_pure_data, file.value.span));
     }
     let data = Data::from_expr(&file.value, &mut diagnostics);

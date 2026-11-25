@@ -54,6 +54,10 @@ impl<'de> de::Deserializer<'de> for ValueDe {
             Data::Map(entries) => visitor.visit_map(MapDe::new(entries, false)),
             Data::Some(v) => visitor.visit_some(ValueDe(*v)),
             Data::None => visitor.visit_none(),
+            Data::FieldTag(mut items) if items.len() == 1 => {
+                ValueDe(items.remove(0)).deserialize_any(visitor)
+            }
+            Data::FieldTag(items) => visitor.visit_seq(SeqDe::new(items)),
             Data::Named {
                 name: Some(name),
                 is_variant: true,
@@ -85,11 +89,14 @@ impl<'de> de::Deserializer<'de> for ValueDe {
     /// Without the checker, `Name(...)` could be a class or a variant; an enum takes it as a variant.
     fn deserialize_enum<V: Visitor<'de>>(
         self,
-        _name: &'static str,
-        _variants: &'static [&'static str],
+        name: &'static str,
+        variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
         match self.0 {
+            Data::FieldTag(mut items) if items.len() == 1 => {
+                ValueDe(items.remove(0)).deserialize_enum(name, variants, visitor)
+            }
             Data::Named {
                 name: Some(name),
                 field_names,
@@ -112,13 +119,20 @@ impl<'de> de::Deserializer<'de> for ValueDe {
         visitor.visit_newtype_struct(self)
     }
 
+    fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        match self.0 {
+            Data::FieldTag(items) => visitor.visit_seq(SeqDe::new(items)),
+            data => ValueDe(data).deserialize_any(visitor),
+        }
+    }
+
     fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         visitor.visit_unit()
     }
 
     serde::forward_to_deserialize_any! {
         bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
-        unit unit_struct seq tuple tuple_struct map struct identifier
+        unit unit_struct tuple tuple_struct map struct identifier
     }
 }
 

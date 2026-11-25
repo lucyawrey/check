@@ -22,15 +22,88 @@ pub fn parse_data(
     next_id: &mut NodeId,
     diags: &mut Vec<Diagnostic>,
 ) -> DataFile {
-    let mut parser = Parser {
-        tokens,
-        src,
-        base,
-        pos: 0,
-        next_id,
-        diags,
-    };
-    parser.data_file()
+    Parser::new(tokens, src, base, next_id, diags).data_file()
+}
+
+/// Parses a data file by its extension: `.cml` and `.cmlx` as markup, anything else as
+/// object notation, with `{` plain text in the strings of `.con` and `.cml` files.
+pub fn parse_data_file(
+    path: &str,
+    text: &str,
+    base: usize,
+    next_id: &mut NodeId,
+    diags: &mut Vec<Diagnostic>,
+) -> DataFile {
+    let pure = path.ends_with(".con") || path.ends_with(".cml");
+    if path.ends_with(".cml") || path.ends_with(".cmlx") {
+        return crate::markup::parse_markup(text, base, pure, next_id, diags);
+    }
+    let tokens = crate::lexer::lex(text, base, pure, diags);
+    parse_data(tokens, text, base, next_id, diags)
+}
+
+/// The `name = value` pairs inside a markup tag, separated by spaces or line breaks.
+pub fn parse_attributes(
+    tokens: Vec<Token>,
+    src: &str,
+    base: usize,
+    next_id: &mut NodeId,
+    diags: &mut Vec<Diagnostic>,
+) -> Vec<Arg> {
+    let mut parser = Parser::new(tokens, src, base, next_id, diags);
+    let mut args = Vec::new();
+    loop {
+        parser.skip_newlines();
+        if *parser.peek() == Tok::Eof {
+            return args;
+        }
+        let Ok(arg) = parser.attribute() else {
+            return args;
+        };
+        args.push(arg);
+    }
+}
+
+/// One expression filling the whole of `tokens`, as inside a markup `{}`.
+pub fn parse_expr(
+    tokens: Vec<Token>,
+    src: &str,
+    base: usize,
+    next_id: &mut NodeId,
+    diags: &mut Vec<Diagnostic>,
+) -> Option<Expr> {
+    let mut parser = Parser::new(tokens, src, base, next_id, diags);
+    parser.skip_newlines();
+    let expr = parser.expr().ok()?;
+    parser.skip_newlines();
+    if *parser.peek() != Tok::Eof {
+        parser
+            .diags
+            .push(Diagnostic::error(Code::unexpected_token, parser.span()));
+    }
+    Some(expr)
+}
+
+/// The `namespace` line at the top of a data file, if `tokens` hold one.
+pub fn parse_namespace(
+    tokens: Vec<Token>,
+    src: &str,
+    base: usize,
+    next_id: &mut NodeId,
+    diags: &mut Vec<Diagnostic>,
+) -> Option<(String, Span)> {
+    let mut parser = Parser::new(tokens, src, base, next_id, diags);
+    parser.skip_newlines();
+    let span = parser.span();
+    let name = parser.namespace().ok()?;
+    let namespace = (name, span.to(parser.prev_span()));
+    parser.skip_newlines();
+    if *parser.peek() != Tok::Eof {
+        parser
+            .diags
+            .push(Diagnostic::error(Code::unexpected_token, parser.span()));
+    }
+    Some(namespace)
 }
 
 pub fn parse_program(
@@ -40,18 +113,27 @@ pub fn parse_program(
     next_id: &mut NodeId,
     diags: &mut Vec<Diagnostic>,
 ) -> File {
-    let mut parser = Parser {
-        tokens,
-        src,
-        base,
-        pos: 0,
-        next_id,
-        diags,
-    };
-    parser.program()
+    Parser::new(tokens, src, base, next_id, diags).program()
 }
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
+    fn new(
+        tokens: Vec<Token>,
+        src: &'a str,
+        base: usize,
+        next_id: &'a mut NodeId,
+        diags: &'a mut Vec<Diagnostic>,
+    ) -> Self {
+        Parser {
+            tokens,
+            src,
+            base,
+            pos: 0,
+            next_id,
+            diags,
+        }
+    }
+
     fn peek(&self) -> &Tok {
         &self.tokens[self.pos].tok
     }
@@ -255,6 +337,15 @@ impl Parser<'_> {
             self.skip_newlines();
         }
         Ok(self.expr_node(start.to(self.prev_span()), ExprKind::Record(args)))
+    }
+
+    fn attribute(&mut self) -> PResult<Arg> {
+        let (name, _) = self.field_name()?;
+        self.expect_sym("=")?;
+        Ok(Arg {
+            name: Some(name),
+            value: self.expr()?,
+        })
     }
 
     fn namespace(&mut self) -> PResult<String> {

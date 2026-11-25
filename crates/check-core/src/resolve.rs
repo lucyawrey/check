@@ -700,7 +700,7 @@ impl Resolver<'_> {
                     }
                 }
             }
-            ExprKind::List(items) => {
+            ExprKind::List(items) | ExprKind::FieldTag(items) => {
                 for x in items {
                     self.expr(x);
                 }

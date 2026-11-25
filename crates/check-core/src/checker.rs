@@ -57,6 +57,8 @@ pub struct Info {
     pub optional_wraps: HashSet<NodeId>,
     pub casts: HashMap<NodeId, Ty>,
     pub shapes: HashMap<String, Shape>,
+    /// Markup field tags filling a field that isn't a list, so they hold their one element.
+    pub single_field_tags: HashSet<NodeId>,
 }
 
 #[derive(Clone)]
@@ -1034,7 +1036,9 @@ impl Checker<'_> {
             {
                 None
             }
-            ExprKind::List(items) => items.iter().find_map(|x| self.non_literal(x)),
+            ExprKind::List(items) | ExprKind::FieldTag(items) => {
+                items.iter().find_map(|x| self.non_literal(x))
+            }
             ExprKind::Map(entries) => entries
                 .iter()
                 .find_map(|(k, v)| self.non_literal(k).or_else(|| self.non_literal(v))),
@@ -1058,7 +1062,9 @@ impl Checker<'_> {
                 StrSeg::Expr(x) => self.non_constant(x, owner),
                 StrSeg::Text(_) => None,
             }),
-            ExprKind::List(items) => items.iter().find_map(|x| self.non_constant(x, owner)),
+            ExprKind::List(items) | ExprKind::FieldTag(items) => {
+                items.iter().find_map(|x| self.non_constant(x, owner))
+            }
             ExprKind::Map(entries) => entries.iter().find_map(|(k, v)| {
                 self.non_constant(k, owner)
                     .or_else(|| self.non_constant(v, owner))
@@ -2730,6 +2736,56 @@ impl Checker<'_> {
         ty
     }
 
+    fn list(&mut self, items: &[Expr], expected: Option<&Ty>) -> Ty {
+        let expected = match expected.map(|e| self.subst.shallow(e)) {
+            Some(Ty::Maybe(inner)) => Some(self.subst.shallow(&inner)),
+            e => e,
+        };
+        let (mut elem, declared) = match expected {
+            Some(Ty::List(e)) => (*e, true),
+            _ => (self.subst.fresh(), false),
+        };
+        let mut typed = Vec::new();
+        for item in items {
+            let t = self.expr(item, Some(&elem));
+            if !declared && matches!(self.subst.shallow(&elem), Ty::Var(_)) {
+                self.subst.unify(&elem, &t);
+            } else if !declared && let Some(widened) = self.widen_to_maybe(&elem, &t) {
+                elem = widened;
+            }
+            typed.push((item, t));
+        }
+        for (item, t) in typed {
+            let different_types = !declared
+                && matches!(
+                    (self.subst.shallow(&t), self.subst.shallow(&elem)),
+                    (Ty::Named(a, _), Ty::Named(b, _)) if a != b
+                );
+            if different_types {
+                self.error(Code::list_needs_type, item.span);
+            } else {
+                self.expect(item, &t, &elem);
+            }
+        }
+        Ty::list(elem)
+    }
+
+    fn field_tag(&mut self, expr: &Expr, items: &[Expr], expected: Option<&Ty>) -> Ty {
+        let is_list = match expected.map(|e| self.subst.shallow(e)) {
+            None | Some(Ty::List(_)) => true,
+            Some(Ty::Maybe(inner)) => matches!(self.subst.shallow(&inner), Ty::List(_)),
+            Some(_) => false,
+        };
+        if is_list {
+            return self.list(items, expected);
+        }
+        self.info.single_field_tags.insert(expr.id);
+        match items {
+            [item] => self.expr(item, expected),
+            _ => self.error(Code::field_tag_needs_one, expr.span),
+        }
+    }
+
     fn expr_type(&mut self, expr: &Expr, expected: Option<&Ty>) -> Ty {
         match &expr.kind {
             ExprKind::SharedOf(x) => self.shared_of(x),
@@ -2791,39 +2847,8 @@ impl Checker<'_> {
             {
                 self.json_tuple(expr, items, tuple)
             }
-            ExprKind::List(items) => {
-                let expected = match expected.map(|e| self.subst.shallow(e)) {
-                    Some(Ty::Maybe(inner)) => Some(self.subst.shallow(&inner)),
-                    e => e,
-                };
-                let (mut elem, declared) = match expected {
-                    Some(Ty::List(e)) => (*e, true),
-                    _ => (self.subst.fresh(), false),
-                };
-                let mut typed = Vec::new();
-                for item in items {
-                    let t = self.expr(item, Some(&elem));
-                    if !declared && matches!(self.subst.shallow(&elem), Ty::Var(_)) {
-                        self.subst.unify(&elem, &t);
-                    } else if !declared && let Some(widened) = self.widen_to_maybe(&elem, &t) {
-                        elem = widened;
-                    }
-                    typed.push((item, t));
-                }
-                for (item, t) in typed {
-                    let different_types = !declared
-                        && matches!(
-                            (self.subst.shallow(&t), self.subst.shallow(&elem)),
-                            (Ty::Named(a, _), Ty::Named(b, _)) if a != b
-                        );
-                    if different_types {
-                        self.error(Code::list_needs_type, item.span);
-                    } else {
-                        self.expect(item, &t, &elem);
-                    }
-                }
-                Ty::list(elem)
-            }
+            ExprKind::List(items) => self.list(items, expected),
+            ExprKind::FieldTag(items) => self.field_tag(expr, items, expected),
             ExprKind::Map(entries) => {
                 let expected = match expected.map(|e| self.subst.shallow(e)) {
                     Some(Ty::Maybe(inner)) => Some(self.subst.shallow(&inner)),
@@ -5641,7 +5666,7 @@ fn find_expr<'a>(e: &'a Expr, hit: &mut dyn FnMut(&Expr, bool) -> bool) -> Optio
             StrSeg::Expr(x) => Some(x),
             _ => None,
         })),
-        ExprKind::List(items) => kids.extend(items),
+        ExprKind::List(items) | ExprKind::FieldTag(items) => kids.extend(items),
         ExprKind::Map(entries) => {
             for (k, v) in entries {
                 kids.push(k);

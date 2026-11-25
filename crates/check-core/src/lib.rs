@@ -75,10 +75,10 @@ pub(crate) fn check_loaded(loaded: Loaded) -> Checked {
     checked
 }
 
-/// Reads the `.con` or `.json` file at `path`, with contents `text`, as the const `name` of type
-/// `expected_type`, which is named as code importing the unit at `schema` in `files` names it.
-/// Also returns the class the file's value is written as, resolved (`place.Place` for
-/// `Place(...)`), or `None` when it's a plain record or other value.
+/// Reads the `.con`, `.conx`, `.cml`, `.cmlx` or `.json` file at `path`, with contents `text`,
+/// as the const `name` of type `expected_type`, which is named as code importing the unit at
+/// `schema` in `files` names it. Also returns the class the file's value is written as,
+/// resolved (`place.Place` for `Place(...)`), or `None` when it's a plain record or other value.
 pub fn check_data(
     files: &dyn Files,
     schema: &str,

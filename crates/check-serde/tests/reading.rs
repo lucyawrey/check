@@ -198,10 +198,10 @@ fn a_constructor_of_the_wrong_class_is_a_check_error() {
 }
 
 #[test]
-fn refuses_code_and_files_that_arent_con() {
+fn refuses_code_in_pure_files_and_files_that_arent_data() {
     check_error("place.con", "title = \"a\" + \"b\"", "code_in_pure_data");
-    let error = check_error("place.conx", "title = \"a\"", "not_pure_data");
-    assert!(error.contains("--> place.conx:1"), "{error}");
+    let error = check_error("place.txt", "title = \"a\"", "not_pure_data");
+    assert!(error.contains("--> place.txt:1"), "{error}");
 }
 
 #[test]
