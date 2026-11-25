@@ -3,6 +3,8 @@ pub use check_syntax::{ast, copy, diag, lexer, parser};
 pub mod checker;
 pub mod host;
 pub mod interp;
+pub mod ir;
+pub mod lower;
 pub mod modules;
 pub mod resolve;
 pub mod tidy;
@@ -169,7 +171,7 @@ pub fn run_program(
     }
 }
 
-fn panic_text(p: &interp::Panic, sources: &Sources) -> String {
+pub fn panic_text(p: &interp::Panic, sources: &Sources) -> String {
     let mut spans = std::iter::once(&p.span)
         .chain(&p.stack)
         .filter(|s| !modules::is_std_file(sources.locate(s.start).0));

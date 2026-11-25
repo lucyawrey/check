@@ -284,7 +284,7 @@ impl Value {
         };
         crate::interp::grow(|| match self {
             Value::Int(n) => out.push_str(&n.to_string()),
-            Value::Float(f) => out.push_str(&float_text(*f)),
+            Value::Float(f) => out.push_str(&check_runtime::float_text(*f)),
             Value::Bool(b) => out.push_str(&b.to_string()),
             Value::Str(s) => out.push_str(&quote(s)),
             Value::List(items) => done(write_items(out, "[", items.iter(), "]", field)),
@@ -362,25 +362,6 @@ pub fn write_map<'v, E>(
     }
     out.push(']');
     Ok(())
-}
-
-pub fn float_text(f: f64) -> String {
-    if f.is_nan() {
-        return "NaN".to_string();
-    }
-    if f.is_infinite() {
-        return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
-    }
-    let abs = f.abs();
-    if abs != 0.0 && !(1e-6..1e21).contains(&abs) {
-        return format!("{f:e}");
-    }
-    let text = f.to_string();
-    if text.contains('.') {
-        text
-    } else {
-        format!("{text}.0")
-    }
 }
 
 fn quote(s: &str) -> String {

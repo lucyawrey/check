@@ -154,6 +154,7 @@ codes! {
     misplaced_host_import,
     unknown_host,
     unsupported_import,
+    wasm_unsupported,
     import_cycle,
     data_folder,
     bad_data_name,

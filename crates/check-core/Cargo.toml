@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+check-runtime = { path = "../check-runtime" }
 check-syntax = { path = "../check-syntax" }
 indexmap = "2.14.2"
 stacker = "0.1.25"

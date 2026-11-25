@@ -111,6 +111,7 @@
 - `namespace_outside_package` a file's namespace that doesn't start with its package's
 - `import_cycle` units whose manifests import each other in a loop
 - `unsupported_import` a `pkg:` or URL import, which isn't supported yet
+- `wasm_unsupported` a feature `--wasm` can't compile yet, found before anything runs
 - `unknown_host` a host other than `check:cli`, in `hostImport` or `import host`
 - `misplaced_host_import` `import host` written twice, or in an entry file beside a `package.con`
 - `missing_manifest` a folder run with no `package.con`

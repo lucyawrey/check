@@ -27,6 +27,7 @@ pub enum Resolved {
 
 #[derive(Default)]
 pub struct Info {
+    pub types: HashMap<NodeId, Ty>,
     pub coercions: HashMap<NodeId, Coercion>,
     pub try_unwraps: HashMap<NodeId, Span>,
     pub plain_tries: HashSet<NodeId>,
@@ -387,6 +388,14 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         place_root: None,
     };
     checker.program(program, library);
+    for entry in checker.funcs.values() {
+        let params = entry.sig.params.iter().map(|p| p.ty.clone()).collect();
+        let ret = entry.sig.ret.clone().unwrap_or(Ty::Void);
+        (checker.info.types).insert(entry.decl.id, Ty::Func(params, Box::new(ret)));
+    }
+    for ty in checker.info.types.values_mut() {
+        *ty = checker.subst.resolve(ty);
+    }
     (checker.info, checker.diags)
 }
 
@@ -2635,6 +2644,7 @@ impl Checker<'_> {
 
     // Branches whose value is never used don't need matching types (design.md, Syntax).
     fn unused(&mut self, expr: &Expr) -> Ty {
+        self.info.types.insert(expr.id, Ty::Void);
         match &expr.kind {
             ExprKind::Block(stmts) => {
                 self.scopes.push(HashMap::new());
@@ -2667,6 +2677,12 @@ impl Checker<'_> {
     }
 
     pub fn expr(&mut self, expr: &Expr, expected: Option<&Ty>) -> Ty {
+        let ty = self.expr_type(expr, expected);
+        self.info.types.insert(expr.id, ty.clone());
+        ty
+    }
+
+    fn expr_type(&mut self, expr: &Expr, expected: Option<&Ty>) -> Ty {
         match &expr.kind {
             ExprKind::SharedOf(x) => self.shared_of(x),
             ExprKind::Int(_) => Ty::Int,
