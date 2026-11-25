@@ -10,7 +10,15 @@ fn main() {
     println!("cargo::rerun-if-changed={}", runtime.display());
     let target_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("runtime");
     let output = Command::new(env::var("CARGO").unwrap())
-        .args(["build", "--release", "--target", TARGET, "--manifest-path"])
+        .args([
+            "build",
+            "--release",
+            "--features",
+            "exports",
+            "--target",
+            TARGET,
+        ])
+        .arg("--manifest-path")
         .arg(runtime.join("Cargo.toml"))
         .arg("--target-dir")
         .arg(&target_dir)

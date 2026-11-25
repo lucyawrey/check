@@ -114,13 +114,43 @@ for j in high..2 { print(j) }\n\
     );
 }
 
-#[test]
-fn memory_stays_bounded_while_strings_come_and_go() {
-    let src = "var keep = \"\"\nfor i in 0..200000 {\n  let s = \"item {i} \" + \"and more text\"\n  keep = s\n}\nprint(keep)";
+fn stays_bounded(src: &str) {
+    let mut interpreted = Vec::new();
+    run_source("test.check", src, &mut std::io::empty(), &mut interpreted);
     let checked = check_source("test.check", src);
     let program = lower(&checked.program, &checked.library, &checked.info).unwrap();
     let stdout = MemoryOutputPipe::new(1 << 10);
     let run = execute(&compile(&program, RUNTIME).unwrap(), stdout.clone()).unwrap();
-    assert_eq!(output(&stdout), "item 199999 and more text\n");
+    assert_eq!(output(&stdout), String::from_utf8(interpreted).unwrap());
     assert!(run.pages < 40, "memory grew to {} pages", run.pages);
+}
+
+#[test]
+fn memory_stays_bounded_while_strings_come_and_go() {
+    stays_bounded(
+        "var keep = \"\"\nfor i in 0..200000 {\n  let s = \"item {i} \" + \"and more text\"\n  keep = s\n}\nprint(keep)",
+    );
+}
+
+#[test]
+fn memory_stays_bounded_through_parameters_and_discarded_results() {
+    stays_bounded(
+        "func echo(s: String) -> String { s }\nfunc ignore(s: String) { }\n\
+         var keep = \"\"\nfor i in 0..200000 {\n  ignore(\"ignored {i}\")\n  echo(\"dropped {i}\")\n  keep = echo(\"kept {i}\")\n}\nprint(keep)",
+    );
+}
+
+#[test]
+fn memory_stays_bounded_through_early_exits() {
+    stays_bounded(
+        "func first(n: Int) -> String {\n  for i in 0..3 {\n    let s = \"n{n} i{i}\"\n    if i == 1 { return s }\n  }\n  \"none\"\n}\n\
+         var keep = \"\"\nfor i in 0..200000 {\n  let a = \"a{i}\"\n  if i mod 2 == 0 { continue }\n  keep = first(i)\n  while true {\n    let b = \"b{i}\"\n    break\n  }\n}\nprint(keep)",
+    );
+}
+
+#[test]
+fn memory_stays_bounded_while_comparing_strings() {
+    stays_bounded(
+        "var n = 0\nfor i in 0..200000 {\n  if \"k{i}\" == \"k5\" or \"a{i}\" < \"b\" { n += 1 }\n}\nprint(n)",
+    );
 }

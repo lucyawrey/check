@@ -228,6 +228,9 @@ impl<'a> Lowerer<'a> {
                 ..
             } => {
                 let value = self.expr(value)?;
+                if matches!(value.ty, Ty::Void | Ty::Never) {
+                    return unsupported(value.span);
+                }
                 let kind = match self.declare(name, value.ty.clone()) {
                     Var::Local(i) => ExprKind::Let(i, Box::new(value)),
                     Var::Global(i) => ExprKind::SetGlobal(i, Box::new(value)),

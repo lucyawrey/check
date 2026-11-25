@@ -62,8 +62,13 @@ fn dispatch(args: &[String]) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
+    let wasm = if cfg!(feature = "wasm") {
+        "[--wasm] "
+    } else {
+        ""
+    };
     eprintln!(
-        "usage: check <path> | check run [--wasm] <path> | check test [--wasm] <folder> | check tidy <path> [--only style,error] [--dry-run] | check lsp"
+        "usage: check <path> | check run {wasm}<path> | check test {wasm}<folder> | check tidy <path> [--only style,error] [--dry-run] | check lsp"
     );
     ExitCode::from(2)
 }

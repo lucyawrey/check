@@ -35,4 +35,9 @@ fn points_at_the_first_unsupported_expression() {
         unsupported_text("func f(ref n: Int) { n += 1 }\nvar a = 1\nf(a)"),
         "f"
     );
+    assert_eq!(unsupported_text("let v = print(\"hi\")"), "print(\"hi\")");
+    assert_eq!(
+        unsupported_text("func f() -> Int {\n  let x = return 1\n  2\n}\nprint(f())"),
+        "return 1"
+    );
 }

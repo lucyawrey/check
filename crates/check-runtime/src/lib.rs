@@ -1,4 +1,4 @@
-#[cfg(target_arch = "wasm32")]
+#[cfg(feature = "exports")]
 mod wasm;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
