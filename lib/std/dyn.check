@@ -4,7 +4,7 @@ enum Dyn {
   Float(Float)
   String(String)
   List(Dyn[])
-  Object(Map<String, Dyn>)
+  Object(Map<String, Dyn?>)
 }
 
 implement Dyn {

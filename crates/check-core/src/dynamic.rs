@@ -57,6 +57,23 @@ fn result(parsed: Parsed) -> Value {
     }))
 }
 
+fn maybe(v: Option<Value>) -> Value {
+    v.map_or(Value::None, |v| Value::Some(Rc::new(v)))
+}
+
+pub fn get(dyn_value: &Value, key: &Value) -> Value {
+    let Value::Variant(r) = dyn_value else {
+        return Value::None;
+    };
+    match (&r.fields[0], key) {
+        (Value::List(items), Value::Int(i)) => {
+            maybe(usize::try_from(*i).ok().and_then(|i| items.get(i).cloned()))
+        }
+        (Value::Map(fields), key) => fields.get(key).cloned().unwrap_or(Value::None),
+        _ => Value::None,
+    }
+}
+
 pub fn variant(name: &str, value: Value) -> Value {
     Value::Variant(Rc::new(Record {
         name: name.into(),
@@ -77,7 +94,7 @@ fn list(items: impl Iterator<Item = Option<Value>>) -> Value {
 
 fn object(fields: impl Iterator<Item = (String, Option<Value>)>) -> Value {
     let entries: IndexMap<Value, Value> = fields
-        .filter_map(|(k, v)| Some((Value::Str(k.into()), v?)))
+        .map(|(k, v)| (Value::Str(k.into()), maybe(v)))
         .collect();
     variant("Object", Value::Map(Rc::new(entries)))
 }

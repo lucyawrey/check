@@ -7,6 +7,7 @@ use std::rc::Rc;
 use crate::ast::*;
 use crate::checker::{EQ, Info, PRINTABLE, RESULT, Resolved, SET};
 use crate::diag::{Code, Span};
+use crate::dynamic;
 use crate::host::{self, Io};
 use indexmap::{IndexMap, IndexSet};
 
@@ -1196,6 +1197,9 @@ impl Interpreter<'_> {
                 None => internal("no `this`", expr.span),
             },
             ExprKind::Field(base, name) => match self.expr(base)? {
+                v @ Value::Variant(_) if v.is_dyn() => {
+                    Ok(dynamic::get(&v, &Value::Str(name.as_str().into())))
+                }
                 Value::SharedBox(v) if name == "value" => Ok(v.borrow().clone()),
                 Value::SharedBox(v) => field(&v.borrow(), name, expr.span),
                 v => field(&v, name, expr.span),
@@ -1282,6 +1286,9 @@ impl Interpreter<'_> {
             ExprKind::Index(list, index) => {
                 let l = deref(self.expr(list)?);
                 let i = self.expr(index)?;
+                if l.is_dyn() {
+                    return Ok(dynamic::get(&l, &i));
+                }
                 let is_map = matches!(l, Value::Map(_));
                 let found = match (l, i) {
                     (Value::List(items), Value::Int(i)) => {

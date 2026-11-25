@@ -3240,6 +3240,7 @@ impl Checker<'_> {
                     None => self.error(Code::unknown_field, span),
                 }
             }
+            Ty::Named(n, _) if n == DYN => Ty::maybe(Ty::Named(n, Vec::new())),
             Ty::Named(class, args) => match self.visible_field(&class, &args, name, span) {
                 Some(f) => {
                     if f.boxed {
@@ -4140,6 +4141,13 @@ impl Checker<'_> {
     fn index(&mut self, id: NodeId, list: &Expr, index: &Expr, span: Span) -> Ty {
         let lt = self.expr(list, None);
         let lt = self.unref(&lt);
+        if matches!(&lt, Ty::Named(n, _) if n == DYN) {
+            let it = self.expr(index, None);
+            if !matches!(self.subst.shallow(&it), Ty::Int | Ty::Str | Ty::Error) {
+                self.error(Code::type_mismatch, index.span);
+            }
+            return Ty::maybe(lt);
+        }
         let key = match &lt {
             Ty::Named(n, a) if n == MAP => a[0].clone(),
             _ => Ty::Int,
