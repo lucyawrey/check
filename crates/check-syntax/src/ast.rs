@@ -137,6 +137,7 @@ pub struct DataDecl {
     pub value: Expr,
     /// A `.con` file, which holds only literals.
     pub is_pure: bool,
+    pub is_json: bool,
     pub is_private: bool,
 }
 

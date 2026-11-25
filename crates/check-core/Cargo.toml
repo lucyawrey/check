@@ -7,4 +7,5 @@ edition = "2024"
 check-runtime = { path = "../check-runtime" }
 check-syntax = { path = "../check-syntax" }
 indexmap = "2.14.2"
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
 stacker = "0.1.25"

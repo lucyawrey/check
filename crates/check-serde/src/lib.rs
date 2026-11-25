@@ -51,7 +51,7 @@ fn deserialize<T: DeserializeOwned>(data: Data) -> Result<T, Error> {
     T::deserialize(de::ValueDe(data)).map_err(Error::Value)
 }
 
-/// Reads a `.con` file into `T`, checking it as `check_core::check_data` does.
+/// Reads a `.con` or `.json` file into `T`, checking it as `check_core::check_data` does.
 #[cfg(feature = "check")]
 pub fn from_str<T: DeserializeOwned>(
     files: &dyn check_core::Files,

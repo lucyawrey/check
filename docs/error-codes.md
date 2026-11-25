@@ -106,7 +106,10 @@
 - `interface_field_extras` an interface field with a default, `private` or `readonly`, which only an implementing class can give it
 - `code_in_pure_data` something other than a literal in a `.con` file (use `.conx` for computed values)
 - `bad_data_name` a data file whose name isn't a valid name, or is a keyword or reserved name (`class.con`, `Ok.con`)
-- `not_pure_data` a data file a host reads that isn't a `.con` file
+- `not_pure_data` a data file a host reads that isn't a `.con` file, or a `.json` file read against a class
+- `json_syntax` a `.json` data file that isn't valid JSON
+- `unknown_variant` a JSON string or `type` key that names no variant of the expected enum
+- `missing_tag` a JSON object read as an enum with no string `type` key
 - `data_folder` a folder of data files with no code, which will be one map once `Map` exists
 - `namespace_outside_package` a file's namespace that doesn't start with its package's
 - `import_cycle` units whose manifests import each other in a loop
