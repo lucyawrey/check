@@ -69,6 +69,7 @@ changed_in_for_ref = "[This changes the list that the `for ref` loop is going th
 assign_to_parameter = "[This parameter can't be changed: write it as `var`]"
 change_let_collection = "[This list, map or set is a `let`, so it can't be changed]"
 optional_changing_call = "[A method that changes its value can't be called through `?.`]"
+optional_assignment = "[Something can't be assigned through `?.` or `?[...]`]"
 changes_let = "[This method changes its value, which is a `let`]"
 missing_shared = "[This parameter is `shared`, so it needs a `shared` value]"
 not_shared = "[`shared` goes before a shared local, parameter or field]"

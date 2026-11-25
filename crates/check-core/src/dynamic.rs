@@ -82,8 +82,12 @@ fn object_of(class: &str, names: &[&str], fields: Vec<Value>) -> Value {
 }
 
 pub fn entry<'v>(fields: &'v IndexMap<Value, Value>, key: &str) -> Option<&'v Value> {
-    match fields.get(&Value::Str(key.into())) {
-        Some(Value::Some(v)) => Some(v),
+    fields.get(&Value::Str(key.into())).and_then(present)
+}
+
+pub fn present(item: &Value) -> Option<&Value> {
+    match item {
+        Value::Some(v) => Some(v),
         _ => None,
     }
 }
@@ -98,7 +102,7 @@ pub fn get(dyn_value: &Value, key: &Value) -> Value {
     };
     match (&r.fields[0], key) {
         (Value::List(items), Value::Int(i)) => {
-            maybe(usize::try_from(*i).ok().and_then(|i| items.get(i).cloned()))
+            (usize::try_from(*i).ok().and_then(|i| items.get(i).cloned())).unwrap_or(Value::None)
         }
         (Value::Map(fields), key) => fields.get(key).cloned().unwrap_or(Value::None),
         _ => Value::None,
@@ -120,7 +124,7 @@ fn string(s: &str) -> Value {
 }
 
 fn list(items: impl Iterator<Item = Option<Value>>) -> Value {
-    variant("List", Value::List(Rc::new(items.flatten().collect())))
+    variant("List", Value::List(Rc::new(items.map(maybe).collect())))
 }
 
 fn object(fields: impl Iterator<Item = (String, Option<Value>)>) -> Value {

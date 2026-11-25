@@ -105,6 +105,7 @@ codes! {
     change_let_collection,
     changes_let,
     optional_changing_call,
+    optional_assignment,
     missing_shared,
     not_shared,
     ref_binding_overlap,

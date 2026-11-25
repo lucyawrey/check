@@ -3,7 +3,7 @@ enum Dyn {
   Int(Int)
   Float(Float)
   String(String)
-  List(Dyn[])
+  List(Dyn?[])
   Object(Map<String, Dyn?>)
 }
 

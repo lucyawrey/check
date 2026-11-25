@@ -58,6 +58,7 @@
 - `assign_to_parameter` assigning to a parameter not written `var`
 - `change_let_collection` changing a `let` list, map or set (`push`, `pop`, `removeAt`, `add`, `remove`)
 - `optional_changing_call` calling a method that changes its value through `?.` (`xs?.push(1)`)
+- `optional_assignment` assigning through `?.` or `?[...]` (`p?.n = 2`) (added by the agent while building, 2026-11-25)
 - `changes_let` calling a method that changes its value on a `let`, a parameter or a temporary (`k.bump()`)
 - `missing_shared` a plain value for a `shared` parameter (pass `shared x` or a `Shared<T>`)
 - `not_shared` `shared` before something that isn't a shared local, parameter or field

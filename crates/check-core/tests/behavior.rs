@@ -3792,7 +3792,7 @@ fn optional_chaining_reads_through_some_and_stops_at_none() {
 }
 
 #[test]
-fn optional_chaining_needs_a_maybe_and_cant_call_a_changing_method() {
+fn optional_chaining_needs_a_maybe_and_cant_change_its_value() {
     assert_eq!(
         first_error("let n = 1\nprint(n?.toFloat())"),
         "type_mismatch"
@@ -3800,6 +3800,14 @@ fn optional_chaining_needs_a_maybe_and_cant_call_a_changing_method() {
     assert_eq!(
         first_error("var xs: Int[]? = Some([])\nxs?.push(1)"),
         "optional_changing_call"
+    );
+    assert_eq!(
+        first_error("class P(n: Int)\nvar p: P? = Some(P(1))\np?.n = 2"),
+        "optional_assignment"
+    );
+    assert_eq!(
+        first_error("var xs: Int[]? = Some([1])\nxs?[0] += 1"),
+        "optional_assignment"
     );
 }
 
@@ -3810,7 +3818,7 @@ fn optional_chaining_never_doubles_a_maybe() {
 }
 
 #[test]
-fn json_parses_into_dyn_keeping_null_keys_and_dropping_null_items() {
+fn json_parses_into_dyn_keeping_nulls_as_none() {
     let src = r#"let d = Json.parse(r"""
   {"n": 1, "x": 1.5, "items": [1, null, "a", true], "gone": null}
   """).orPanic()
@@ -3822,7 +3830,7 @@ print(d.hasKey("gone"))
 print(d.hasKey("other"))"#;
     assert_eq!(
         output(src),
-        "Some(Int(1))\nSome(Float(1.5))\nSome(List([Int(1), String(\"a\"), Bool(true)]))\nNone\ntrue\nfalse"
+        "Some(Int(1))\nSome(Float(1.5))\nSome(List([Some(Int(1)), None, Some(String(\"a\")), Some(Bool(true))]))\nNone\ntrue\nfalse"
     );
 }
 
@@ -3861,8 +3869,8 @@ print(d.hasKey("label"))"#;
             "Some(Object([\"type\" = Some(String(\"Kind.Game\")), \"maxPlayers\" = Some(Int(8))]))",
             "Some(Object([\"type\" = Some(String(\"Link\")), \"0\" = Some(String(\"x\"))]))",
             "Some(String(\"None\"))",
-            "Some(Object([\"type\" = Some(String(\"place.Place\")), \"size\" = Some(List([Int(4), Int(-2)]))]))",
-            "Some(List([Int(1), String(\"a\")]))",
+            "Some(Object([\"type\" = Some(String(\"place.Place\")), \"size\" = Some(List([Some(Int(4)), Some(Int(-2))]))]))",
+            "Some(List([Some(Int(1)), Some(String(\"a\")), None]))",
             "true",
         ]
         .join("\n")
@@ -3951,11 +3959,13 @@ fn a_type_key_is_a_field_for_a_class_and_a_tag_for_an_enum() {
   """).orPanic()
 print(d as Typed)
 print(d as Shape)
-print(Data.parse("x = Web(\"u\")").orPanic().x as Link)"#
+print(Data.parse("x = Web(\"u\")").orPanic().x as Link)
+print(Data.parse("x = Typed(\"t\")").orPanic().x as Typed)
+print(Json.parse(r"""{{"type": "Other.Circle", "radius": 1}}""").orPanic() as Shape)"#
     );
     assert_eq!(
         output(&src),
-        "Some(Typed(type = \"Circle\"))\nSome(Circle(radius = 1.0))\nSome(Web(\"u\"))"
+        "Some(Typed(type = \"Circle\"))\nSome(Circle(radius = 1.0))\nSome(Web(\"u\"))\nSome(Typed(type = \"t\"))\nNone"
     );
 }
 
@@ -3968,11 +3978,16 @@ print(d as? Item)
 let r: Dyn = (name = "x", tags = ["a"])
 print(r.tags?[0])
 let scores: Dyn = ["ana" = 3]
-print(scores.ana as Int)"#
+print(scores.ana as Int)
+let xs: Int?[] = [1, None]
+let l: Dyn = xs
+print(l as Int?[])
+let first: Dyn? = xs[0]
+print(first)"#
     );
     assert_eq!(
         output(&src),
-        "Ok(Item(name = \"a\", size = (1, 2), shape = Circle(radius = 2.0), link = Web(\"u\")))\nSome(String(\"a\"))\nSome(3)"
+        "Ok(Item(name = \"a\", size = (1, 2), shape = Circle(radius = 2.0), link = Web(\"u\")))\nSome(String(\"a\"))\nSome(3)\nSome([Some(1), None])\nSome(Int(1))"
     );
 }
 
@@ -3987,6 +4002,18 @@ fn dyn_needs_a_check_before_use() {
         "type_mismatch"
     );
     assert_eq!(first_error("let n = 1\nprint(n as Int)"), "type_mismatch");
+    assert_eq!(
+        first_error("let xs: Int[] = []\nlet d: Dyn = xs.first()"),
+        "unhandled_maybe"
+    );
+    assert_eq!(
+        first_error("let d = Json.parse(\"1\").orPanic()\nprint(d == d)"),
+        "invalid_operand_types"
+    );
+    assert_eq!(
+        first_error("let d = Json.parse(\"1\").orPanic()\nprint(d as? Map<Int, Int>)"),
+        "type_mismatch"
+    );
     let src = "let d = Json.parse(\"3\").orPanic()\nmatch d {\n  Int(n) => print(n + 1)\n  _ => print(\"other\")\n}";
     assert_eq!(output(src), "4");
 }

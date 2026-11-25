@@ -268,7 +268,12 @@ fn coerce(info: &Info, id: NodeId, mut value: Value) -> Value {
             value = Value::Record(Rc::new(Record::unnamed(None, items.to_vec())));
         }
         if c.to_dyn {
-            value = dynamic::from_value(&value).unwrap_or(value);
+            value = match value {
+                Value::Some(v) => Value::Some(Rc::new(
+                    dynamic::from_value(&v).unwrap_or_else(|| (*v).clone()),
+                )),
+                v => dynamic::from_value(&v).unwrap_or(v),
+            };
         }
         if c.to_float
             && let Value::Int(n) = value
@@ -787,8 +792,9 @@ impl Interpreter<'_> {
                         .zip(args.iter().cloned())
                         .collect();
                     let mut given = HashMap::new();
-                    for f in &shape.variants[0].1 {
-                        let value = dynamic::entry(m, &f.name);
+                    for (i, f) in shape.variants[0].1.iter().enumerate() {
+                        let value = dynamic::entry(m, &i.to_string())
+                            .or_else(|| dynamic::entry(m, &f.name));
                         if value.is_none() && f.has_default {
                             continue;
                         }
@@ -815,7 +821,8 @@ impl Interpreter<'_> {
     ) -> Result<Vec<Value>, Mismatch> {
         let mut values = Vec::with_capacity(items.len());
         for (i, item) in items.iter().enumerate() {
-            values.push(self.decode(Some(item), ty(i), &format!("{path}[{i}]"), span)?);
+            let item = dynamic::present(item);
+            values.push(self.decode(item, ty(i), &format!("{path}[{i}]"), span)?);
         }
         Ok(values)
     }
@@ -846,7 +853,14 @@ impl Interpreter<'_> {
             },
             _ => return Err(mismatch()),
         };
-        let name = tag.rsplit('.').next().unwrap_or(&tag);
+        let (qualifier, name) = match tag.rsplit_once('.') {
+            Some((q, n)) => (Some(q), n),
+            None => (None, &tag[..]),
+        };
+        let short = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
+        if qualifier.is_some_and(|q| short(q) != short(enum_name)) {
+            return Err(mismatch());
+        }
         let Some((name, variant)) = shape.variants.iter().find(|(v, _)| v == name) else {
             return Err(mismatch());
         };

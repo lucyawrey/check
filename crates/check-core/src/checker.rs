@@ -1626,9 +1626,20 @@ impl Checker<'_> {
                 self.info.coercions.entry(id).or_default().maybe_to_float = true;
                 true
             }
+            (Ty::Maybe(x), Ty::Maybe(y))
+                if is_dyn(&self.subst.shallow(y))
+                    && !is_dyn(&self.subst.shallow(x))
+                    && self.converts_to_dyn(x, &mut HashSet::new()) =>
+            {
+                self.info.coercions.entry(id).or_default().to_dyn = true;
+                true
+            }
             (Ty::Maybe(_), Ty::Maybe(_)) => self.conforms(&a, &e),
             (_, Ty::Named(n, _))
-                if n == DYN && a != e && self.converts_to_dyn(&a, &mut HashSet::new()) =>
+                if n == DYN
+                    && a != e
+                    && !matches!(a, Ty::Maybe(_))
+                    && self.converts_to_dyn(&a, &mut HashSet::new()) =>
             {
                 self.info.coercions.entry(id).or_default().to_dyn = true;
                 true
@@ -2306,6 +2317,16 @@ impl Checker<'_> {
                     Ty::Var(_) => (self.error(Code::type_needed, list.span), None),
                     _ => (self.error(Code::invalid_operand_types, target.span), None),
                 }
+            }
+            ExprKind::Opt(access) => {
+                let (ExprKind::Field(base, _)
+                | ExprKind::Method(base, ..)
+                | ExprKind::Index(base, _)) = &access.kind
+                else {
+                    unreachable!("the parser wraps only a field, method or index access")
+                };
+                self.place_path(base);
+                (Ty::Error, Some(Code::optional_assignment))
             }
             _ => (self.expr(target, None), Some(Code::assign_to_let)),
         }
@@ -3707,7 +3728,7 @@ impl Checker<'_> {
                 }
             }
             BinOp::Eq | BinOp::Ne => {
-                if self.lacks_eq(&a, &mut HashSet::new()) {
+                if is_dyn(&a) || is_dyn(&b) || self.lacks_eq(&a, &mut HashSet::new()) {
                     return self.error(Code::invalid_operand_types, span);
                 }
                 if numeric {
@@ -5853,10 +5874,15 @@ fn index_exprs<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
+fn is_dyn(ty: &Ty) -> bool {
+    matches!(ty, Ty::Named(n, _) if n == DYN)
+}
+
 fn decodable(ty: &Ty) -> bool {
     match ty {
         Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Error => true,
         Ty::List(e) | Ty::Maybe(e) => decodable(e),
+        Ty::Named(n, args) if n == MAP => args[0] == Ty::Str && decodable(&args[1]),
         Ty::Named(_, args) | Ty::Record(_, args) => args.iter().all(decodable),
         _ => false,
     }
