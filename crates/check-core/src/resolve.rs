@@ -764,6 +764,10 @@ impl Resolver<'_> {
                     });
                 }
             }
+            ExprKind::As(x, ty, _) => {
+                self.expr(x);
+                self.type_expr(ty);
+            }
             ExprKind::Is(x, pat) => {
                 self.expr(x);
                 self.bind_pattern(pat);

@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::ast::*;
 use crate::copy::Text;
 use crate::diag::{Code, Diagnostic, Edit, Severity, Sources, Span};
-use crate::types::{Show, Subst, Ty};
+use crate::types::{Shape, Show, Subst, Ty};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Coercion {
@@ -54,6 +54,8 @@ pub struct Info {
     /// Shared names passed to a `shared` parameter or field, which pass their box.
     pub shared_args: HashMap<NodeId, Span>,
     pub optional_wraps: HashSet<NodeId>,
+    pub casts: HashMap<NodeId, Ty>,
+    pub shapes: HashMap<String, Shape>,
 }
 
 #[derive(Clone)]
@@ -344,6 +346,7 @@ pub(crate) const EQ: &str = "check.std.Eq";
 pub(crate) const ORDERING: &str = "check.std.Ordering";
 pub(crate) const DYN: &str = "check.std.Dyn";
 pub(crate) const PARSE_ERROR: &str = "check.std.ParseError";
+pub(crate) const SHAPE_ERROR: &str = "check.std.ShapeError";
 const COMPARABLE: &str = "check.std.Comparable";
 
 pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Vec<Diagnostic>) {
@@ -502,6 +505,7 @@ impl Checker<'_> {
             self.ensure_checked(&name, Span::default());
         }
         self.report_changes(interface_methods);
+        self.info.shapes = self.shapes();
         self.changed_copies(program);
         let consts: Vec<String> = self.consts.keys().cloned().collect();
         for key in consts {
@@ -2702,6 +2706,7 @@ impl Checker<'_> {
         match &expr.kind {
             ExprKind::SharedOf(x) => self.shared_of(x),
             ExprKind::Opt(access) => self.optional_access(expr, access),
+            ExprKind::As(value, target, is_result) => self.cast(expr, value, target, *is_result),
             ExprKind::Int(_) => Ty::Int,
             ExprKind::Float(_) => Ty::Float,
             ExprKind::Bool(_) => Ty::Bool,
@@ -3117,6 +3122,59 @@ impl Checker<'_> {
         }
         let fields: Vec<Arg> = args.iter().filter(|a| !is_tag(a)).cloned().collect();
         self.variant_call(expr.id, enum_name, name, &fields, expr.span, expected)
+    }
+
+    fn cast(&mut self, expr: &Expr, value: &Expr, target: &TypeExpr, is_result: bool) -> Ty {
+        let t = self.expr(value, None);
+        let base = match self.subst.shallow(&t) {
+            Ty::Maybe(inner) => self.subst.shallow(&inner),
+            t => t,
+        };
+        if !matches!(&base, Ty::Error) && !matches!(&base, Ty::Named(n, _) if n == DYN) {
+            self.error(Code::type_mismatch, value.span);
+        }
+        let span = type_span(target);
+        let target = self.type_from(target);
+        if !decodable(&target) {
+            self.error(Code::type_mismatch, span);
+        }
+        self.info.casts.insert(expr.id, target.clone());
+        if is_result {
+            Ty::Named(
+                RESULT.to_string(),
+                vec![target, Ty::Named(SHAPE_ERROR.to_string(), Vec::new())],
+            )
+        } else {
+            Ty::maybe(target)
+        }
+    }
+
+    fn shapes(&self) -> HashMap<String, Shape> {
+        let fields = |fields: &[ParamSig]| -> Vec<(String, Ty, bool)> {
+            (fields.iter())
+                .map(|f| (f.name.clone(), f.ty.clone(), f.has_default))
+                .collect()
+        };
+        (self.types.iter())
+            .map(|(name, def)| {
+                let (is_enum, variants) = match def {
+                    TypeDef::Class(c) => (false, vec![(name.clone(), fields(&c.fields))]),
+                    TypeDef::Enum(vs) => (
+                        true,
+                        vs.iter()
+                            .map(|v| (v.name.clone(), fields(&v.fields)))
+                            .collect(),
+                    ),
+                };
+                let params = self.generics.get(name).cloned().unwrap_or_default();
+                let shape = Shape {
+                    params,
+                    is_enum,
+                    variants,
+                };
+                (name.clone(), shape)
+            })
+            .collect()
     }
 
     fn optional_access(&mut self, expr: &Expr, access: &Expr) -> Ty {
@@ -5538,6 +5596,8 @@ fn find_expr<'a>(e: &'a Expr, hit: &mut dyn FnMut(&Expr, bool) -> bool) -> Optio
         | ExprKind::Loop(x)
         | ExprKind::Field(x, _)
         | ExprKind::Is(x, _)
+        | ExprKind::Opt(x)
+        | ExprKind::As(x, ..)
         | ExprKind::SharedOf(x)
         | ExprKind::Spread(x) => kids.push(x),
         ExprKind::Lambda(_, _, x) => kids.push(x),
@@ -5755,6 +5815,15 @@ fn index_exprs<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
             index_exprs(base, out);
         }
         _ => {}
+    }
+}
+
+fn decodable(ty: &Ty) -> bool {
+    match ty {
+        Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Error => true,
+        Ty::List(e) | Ty::Maybe(e) => decodable(e),
+        Ty::Named(_, args) | Ty::Record(_, args) => args.iter().all(decodable),
+        _ => false,
     }
 }
 

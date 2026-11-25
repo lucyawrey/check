@@ -3,7 +3,7 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 
 use crate::ast::{Arg, Expr, ExprKind, StrSeg, UnOp};
-use crate::checker::{DYN, PARSE_ERROR, RESULT};
+use crate::checker::{DYN, PARSE_ERROR, RESULT, SHAPE_ERROR};
 use crate::diag::{Severity, Sources, Span};
 use crate::value::{Record, Value};
 use crate::{lexer, parser};
@@ -35,19 +35,25 @@ pub fn parse_data(text: &str) -> Value {
 }
 
 fn result(parsed: Parsed) -> Value {
-    let (name, value) = match parsed {
-        Ok(value) => ("Ok", value),
-        Err((line, column)) => (
-            "Err",
-            Value::Object(Rc::new(Record {
-                name: PARSE_ERROR.into(),
-                ty: PARSE_ERROR.into(),
-                by_fields: false,
-                field_names: Some(["line".into(), "column".into()].into()),
-                fields: vec![Value::Int(line as i64), Value::Int(column as i64)],
-            })),
-        ),
-    };
+    match parsed {
+        Ok(value) => ok(value),
+        Err((line, column)) => err(object_of(
+            PARSE_ERROR,
+            &["line", "column"],
+            vec![Value::Int(line as i64), Value::Int(column as i64)],
+        )),
+    }
+}
+
+pub fn ok(value: Value) -> Value {
+    result_variant("Ok", value)
+}
+
+pub fn err(value: Value) -> Value {
+    result_variant("Err", value)
+}
+
+fn result_variant(name: &str, value: Value) -> Value {
     Value::Variant(Rc::new(Record {
         name: name.into(),
         ty: RESULT.into(),
@@ -55,6 +61,31 @@ fn result(parsed: Parsed) -> Value {
         field_names: None,
         fields: vec![value],
     }))
+}
+
+pub fn shape_error(path: String, expected: String) -> Value {
+    object_of(
+        SHAPE_ERROR,
+        &["path", "expected"],
+        vec![Value::Str(path.into()), Value::Str(expected.into())],
+    )
+}
+
+fn object_of(class: &str, names: &[&str], fields: Vec<Value>) -> Value {
+    Value::Object(Rc::new(Record {
+        name: class.into(),
+        ty: class.into(),
+        by_fields: false,
+        field_names: Some(names.iter().map(|&n| n.into()).collect()),
+        fields,
+    }))
+}
+
+pub fn entry<'v>(fields: &'v IndexMap<Value, Value>, key: &str) -> Option<&'v Value> {
+    match fields.get(&Value::Str(key.into())) {
+        Some(Value::Some(v)) => Some(v),
+        _ => None,
+    }
 }
 
 fn maybe(v: Option<Value>) -> Value {

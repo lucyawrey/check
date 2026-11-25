@@ -56,6 +56,12 @@ impl Ty {
     }
 }
 
+pub struct Shape {
+    pub params: Vec<String>,
+    pub is_enum: bool,
+    pub variants: Vec<(String, Vec<(String, Ty, bool)>)>,
+}
+
 #[derive(Default)]
 pub struct Subst {
     bindings: Vec<Option<Ty>>,

@@ -1712,7 +1712,7 @@ impl Parser<'_> {
     }
 
     fn multiplicative(&mut self) -> PResult<Expr> {
-        let mut lhs = self.unary()?;
+        let mut lhs = self.cast()?;
         loop {
             let op = match self.peek() {
                 Tok::Sym("*") => BinOp::Mul,
@@ -1723,9 +1723,25 @@ impl Parser<'_> {
                 _ => return Ok(lhs),
             };
             self.advance();
-            let rhs = self.unary()?;
+            let rhs = self.cast()?;
             lhs = self.binary(op, lhs, rhs);
         }
+    }
+
+    fn cast(&mut self) -> PResult<Expr> {
+        let mut expr = self.unary()?;
+        while self.is_kw("as") {
+            let as_end = self.span().end;
+            self.advance();
+            let is_result = self.is_sym("?") && self.span().start == as_end;
+            if is_result {
+                self.advance();
+            }
+            let ty = self.type_expr()?;
+            let span = expr.span.to(self.prev_span());
+            expr = self.expr_node(span, ExprKind::As(Box::new(expr), ty, is_result));
+        }
+        Ok(expr)
     }
 
     fn unary(&mut self) -> PResult<Expr> {
