@@ -85,8 +85,12 @@ pub fn from_str_with_class<T: DeserializeOwned>(
 }
 
 /// Reads a `.con` file into `T` without a Check class: no defaults, `init` or type checks,
-/// a constructor's class name is ignored, and variants match by name as written.
+/// a constructor's class name is ignored, and variants match by name as written. A `.json`
+/// file is read by `serde_json`.
 pub fn from_str_unchecked<T: DeserializeOwned>(path: &str, text: &str) -> Result<T, Error> {
+    if path.ends_with(".json") {
+        return serde_json::from_str(text).map_err(|e| Error::Value(serde::de::Error::custom(e)));
+    }
     let mut sources = Sources::default();
     let mut diagnostics = Vec::new();
     let base = sources.add(path, text);

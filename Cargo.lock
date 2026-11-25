@@ -153,6 +153,7 @@ dependencies = [
  "check-core",
  "check-syntax",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
