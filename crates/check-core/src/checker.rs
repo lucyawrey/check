@@ -3,11 +3,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::ast::*;
 use crate::copy::Text;
 use crate::diag::{Code, Diagnostic, Edit, Severity, Sources, Span};
-use crate::types::{Show, Subst, Ty};
+use crate::types::{FieldShape, Shape, Show, Subst, Ty};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Coercion {
     pub list_to_record: bool,
+    pub to_dyn: bool,
     pub to_float: bool,
     pub maybe_to_float: bool,
     pub wraps: usize,
@@ -53,6 +54,9 @@ pub struct Info {
     pub ref_args: HashMap<NodeId, Span>,
     /// Shared names passed to a `shared` parameter or field, which pass their box.
     pub shared_args: HashMap<NodeId, Span>,
+    pub optional_wraps: HashSet<NodeId>,
+    pub casts: HashMap<NodeId, Ty>,
+    pub shapes: HashMap<String, Shape>,
 }
 
 #[derive(Clone)]
@@ -269,6 +273,7 @@ pub struct Checker<'s> {
     body_writes: HashSet<String>,
     in_try: bool,
     json: bool,
+    unwrapped: HashMap<NodeId, Ty>,
     try_points: usize,
     without_value: HashMap<Span, usize>,
     map_writes: HashSet<NodeId>,
@@ -340,6 +345,9 @@ pub(crate) const RESULT: &str = "check.std.Result";
 pub(crate) const PRINTABLE: &str = "check.std.Printable";
 pub(crate) const EQ: &str = "check.std.Eq";
 pub(crate) const ORDERING: &str = "check.std.Ordering";
+pub(crate) const DYN: &str = "check.std.Dyn";
+pub(crate) const PARSE_ERROR: &str = "check.std.ParseError";
+pub(crate) const SHAPE_ERROR: &str = "check.std.ShapeError";
 const COMPARABLE: &str = "check.std.Comparable";
 
 pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Vec<Diagnostic>) {
@@ -356,6 +364,7 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         body_writes: HashSet::new(),
         in_try: false,
         json: false,
+        unwrapped: HashMap::new(),
         try_points: 0,
         without_value: HashMap::new(),
         map_writes: HashSet::new(),
@@ -497,6 +506,7 @@ impl Checker<'_> {
             self.ensure_checked(&name, Span::default());
         }
         self.report_changes(interface_methods);
+        self.info.shapes = self.shapes();
         self.changed_copies(program);
         let consts: Vec<String> = self.consts.keys().cloned().collect();
         for key in consts {
@@ -1616,7 +1626,24 @@ impl Checker<'_> {
                 self.info.coercions.entry(id).or_default().maybe_to_float = true;
                 true
             }
+            (Ty::Maybe(x), Ty::Maybe(y))
+                if is_dyn(&self.subst.shallow(y))
+                    && !is_dyn(&self.subst.shallow(x))
+                    && self.converts_to_dyn(x, &mut HashSet::new()) =>
+            {
+                self.info.coercions.entry(id).or_default().to_dyn = true;
+                true
+            }
             (Ty::Maybe(_), Ty::Maybe(_)) => self.conforms(&a, &e),
+            (_, Ty::Named(n, _))
+                if n == DYN
+                    && a != e
+                    && !matches!(a, Ty::Maybe(_))
+                    && self.converts_to_dyn(&a, &mut HashSet::new()) =>
+            {
+                self.info.coercions.entry(id).or_default().to_dyn = true;
+                true
+            }
             (_, Ty::Maybe(inner)) => {
                 let inner = (**inner).clone();
                 if self.subsume(id, &a, &inner) {
@@ -2291,6 +2318,16 @@ impl Checker<'_> {
                     _ => (self.error(Code::invalid_operand_types, target.span), None),
                 }
             }
+            ExprKind::Opt(access) => {
+                let (ExprKind::Field(base, _)
+                | ExprKind::Method(base, ..)
+                | ExprKind::Index(base, _)) = &access.kind
+                else {
+                    unreachable!("the parser wraps only a field, method or index access")
+                };
+                self.place_path(base);
+                (Ty::Error, Some(Code::optional_assignment))
+            }
             _ => (self.expr(target, None), Some(Code::assign_to_let)),
         }
     }
@@ -2685,6 +2722,9 @@ impl Checker<'_> {
     }
 
     pub fn expr(&mut self, expr: &Expr, expected: Option<&Ty>) -> Ty {
+        if let Some(ty) = self.unwrapped.get(&expr.id) {
+            return ty.clone();
+        }
         let ty = self.expr_type(expr, expected);
         self.info.types.insert(expr.id, ty.clone());
         ty
@@ -2693,6 +2733,8 @@ impl Checker<'_> {
     fn expr_type(&mut self, expr: &Expr, expected: Option<&Ty>) -> Ty {
         match &expr.kind {
             ExprKind::SharedOf(x) => self.shared_of(x),
+            ExprKind::Opt(access) => self.optional_access(expr, access),
+            ExprKind::As(value, target, is_result) => self.cast(expr, value, target, *is_result),
             ExprKind::Int(_) => Ty::Int,
             ExprKind::Float(_) => Ty::Float,
             ExprKind::Bool(_) => Ty::Bool,
@@ -3110,6 +3152,117 @@ impl Checker<'_> {
         self.variant_call(expr.id, enum_name, name, &fields, expr.span, expected)
     }
 
+    fn cast(&mut self, expr: &Expr, value: &Expr, target: &TypeExpr, is_result: bool) -> Ty {
+        let t = self.expr(value, None);
+        let base = match self.subst.shallow(&t) {
+            Ty::Maybe(inner) => self.subst.shallow(&inner),
+            t => t,
+        };
+        if !matches!(&base, Ty::Error) && !matches!(&base, Ty::Named(n, _) if n == DYN) {
+            self.error(Code::type_mismatch, value.span);
+        }
+        let span = type_span(target);
+        let target = self.type_from(target);
+        if !decodable(&target) {
+            self.error(Code::type_mismatch, span);
+        }
+        self.info.casts.insert(expr.id, target.clone());
+        if is_result {
+            Ty::Named(
+                RESULT.to_string(),
+                vec![target, Ty::Named(SHAPE_ERROR.to_string(), Vec::new())],
+            )
+        } else {
+            Ty::maybe(target)
+        }
+    }
+
+    fn converts_to_dyn(&self, ty: &Ty, seen: &mut HashSet<String>) -> bool {
+        match self.subst.shallow(ty) {
+            Ty::Int | Ty::Float | Ty::Bool | Ty::Str => true,
+            Ty::List(e) => self.converts_to_dyn(&e, seen),
+            Ty::Maybe(e) => !matches!(*e, Ty::Maybe(_)) && self.converts_to_dyn(&e, seen),
+            Ty::Record(_, fields) => fields.iter().all(|f| self.converts_to_dyn(f, seen)),
+            Ty::Named(n, args) if n == MAP => {
+                self.subst.shallow(&args[0]) == Ty::Str && self.converts_to_dyn(&args[1], seen)
+            }
+            Ty::Named(n, args) if n == SET => self.converts_to_dyn(&args[0], seen),
+            Ty::Named(n, _) if n == DYN || !seen.insert(n.clone()) => true,
+            Ty::Named(n, args) => {
+                let map = self.args_map(&n, &args);
+                let fields: Vec<&ParamSig> = match self.types.get(&n) {
+                    Some(TypeDef::Class(c)) if !c.is_shared => c.fields.iter().collect(),
+                    Some(TypeDef::Enum(vs)) => vs.iter().flat_map(|v| &v.fields).collect(),
+                    _ => return false,
+                };
+                (fields.iter()).all(|f| self.converts_to_dyn(&f.ty.substitute(&map), seen))
+            }
+            _ => false,
+        }
+    }
+
+    fn shapes(&self) -> HashMap<String, Shape> {
+        let fields = |fields: &[ParamSig]| -> Vec<FieldShape> {
+            (fields.iter())
+                .map(|f| FieldShape {
+                    name: f.name.clone(),
+                    ty: f.ty.clone(),
+                    has_default: f.has_default,
+                })
+                .collect()
+        };
+        (self.types.iter())
+            .map(|(name, def)| {
+                let (is_enum, variants) = match def {
+                    TypeDef::Class(c) => (false, vec![(name.clone(), fields(&c.fields))]),
+                    TypeDef::Enum(vs) => (
+                        true,
+                        vs.iter()
+                            .map(|v| (v.name.clone(), fields(&v.fields)))
+                            .collect(),
+                    ),
+                };
+                let params = self.generics.get(name).cloned().unwrap_or_default();
+                let shape = Shape {
+                    params,
+                    is_enum,
+                    variants,
+                };
+                (name.clone(), shape)
+            })
+            .collect()
+    }
+
+    fn optional_access(&mut self, expr: &Expr, access: &Expr) -> Ty {
+        let (ExprKind::Field(base, _) | ExprKind::Method(base, ..) | ExprKind::Index(base, _)) =
+            &access.kind
+        else {
+            unreachable!("the parser wraps only a field, method or index access")
+        };
+        let t = self.expr(base, None);
+        let inner = match self.subst.shallow(&t) {
+            Ty::Maybe(inner) => self.subst.shallow(&inner),
+            Ty::Error => return Ty::Error,
+            Ty::Var(_) => return self.error(Code::type_needed, base.span),
+            _ => return self.error(Code::type_mismatch, base.span),
+        };
+        if let ExprKind::Method(_, name, _) = &access.kind
+            && (MUTATING.contains(&name.as_str()) || self.changing_method(&inner, name))
+        {
+            return self.error(Code::optional_changing_call, access.span);
+        }
+        self.unwrapped.insert(base.id, inner);
+        let t = self.expr(access, None);
+        self.unwrapped.remove(&base.id);
+        match self.subst.shallow(&t) {
+            Ty::Maybe(_) | Ty::Error => t,
+            _ => {
+                self.info.optional_wraps.insert(expr.id);
+                Ty::maybe(t)
+            }
+        }
+    }
+
     fn record_copy(&mut self, original: &Expr, changes: &[Arg]) -> Ty {
         let t = self.expr(original, None);
         let copyable = match self.subst.shallow(&t) {
@@ -3201,6 +3354,7 @@ impl Checker<'_> {
                     None => self.error(Code::unknown_field, span),
                 }
             }
+            Ty::Named(n, _) if n == DYN => Ty::maybe(Ty::Named(n, Vec::new())),
             Ty::Named(class, args) => match self.visible_field(&class, &args, name, span) {
                 Some(f) => {
                     if f.boxed {
@@ -3574,7 +3728,7 @@ impl Checker<'_> {
                 }
             }
             BinOp::Eq | BinOp::Ne => {
-                if self.lacks_eq(&a, &mut HashSet::new()) {
+                if is_dyn(&a) || is_dyn(&b) || self.lacks_eq(&a, &mut HashSet::new()) {
                     return self.error(Code::invalid_operand_types, span);
                 }
                 if numeric {
@@ -4101,6 +4255,13 @@ impl Checker<'_> {
     fn index(&mut self, id: NodeId, list: &Expr, index: &Expr, span: Span) -> Ty {
         let lt = self.expr(list, None);
         let lt = self.unref(&lt);
+        if matches!(&lt, Ty::Named(n, _) if n == DYN) {
+            let it = self.expr(index, None);
+            if !matches!(self.subst.shallow(&it), Ty::Int | Ty::Str | Ty::Error) {
+                self.error(Code::type_mismatch, index.span);
+            }
+            return Ty::maybe(lt);
+        }
         let key = match &lt {
             Ty::Named(n, a) if n == MAP => a[0].clone(),
             _ => Ty::Int,
@@ -5491,6 +5652,8 @@ fn find_expr<'a>(e: &'a Expr, hit: &mut dyn FnMut(&Expr, bool) -> bool) -> Optio
         | ExprKind::Loop(x)
         | ExprKind::Field(x, _)
         | ExprKind::Is(x, _)
+        | ExprKind::Opt(x)
+        | ExprKind::As(x, ..)
         | ExprKind::SharedOf(x)
         | ExprKind::Spread(x) => kids.push(x),
         ExprKind::Lambda(_, _, x) => kids.push(x),
@@ -5708,6 +5871,20 @@ fn index_exprs<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
             index_exprs(base, out);
         }
         _ => {}
+    }
+}
+
+fn is_dyn(ty: &Ty) -> bool {
+    matches!(ty, Ty::Named(n, _) if n == DYN)
+}
+
+fn decodable(ty: &Ty) -> bool {
+    match ty {
+        Ty::Int | Ty::Float | Ty::Bool | Ty::Str | Ty::Error => true,
+        Ty::List(e) | Ty::Maybe(e) => decodable(e),
+        Ty::Named(n, args) if n == MAP => args[0] == Ty::Str && decodable(&args[1]),
+        Ty::Named(_, args) | Ty::Record(_, args) => args.iter().all(decodable),
+        _ => false,
     }
 }
 

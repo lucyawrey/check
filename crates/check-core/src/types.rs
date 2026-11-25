@@ -56,6 +56,18 @@ impl Ty {
     }
 }
 
+pub struct Shape {
+    pub params: Vec<String>,
+    pub is_enum: bool,
+    pub variants: Vec<(String, Vec<FieldShape>)>,
+}
+
+pub struct FieldShape {
+    pub name: String,
+    pub ty: Ty,
+    pub has_default: bool,
+}
+
 #[derive(Default)]
 pub struct Subst {
     bindings: Vec<Option<Ty>>,

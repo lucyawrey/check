@@ -298,6 +298,8 @@ pub enum ExprKind {
     Method(Box<Expr>, String, Vec<Arg>),
     Field(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
+    Opt(Box<Expr>),
+    As(Box<Expr>, TypeExpr, bool),
     /// The body is shared, so a lambda value holds it without copying.
     Lambda(Vec<Param>, Option<TypeExpr>, Arc<Expr>),
     Block(Vec<Stmt>),

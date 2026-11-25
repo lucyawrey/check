@@ -55,6 +55,11 @@ const LIBRARY: &[(usize, &str, &str)] = &[
     ),
     (
         STD,
+        "lib/std/dyn.check",
+        include_str!("../../../lib/std/dyn.check"),
+    ),
+    (
+        STD,
         "lib/std/list.check",
         include_str!("../../../lib/std/list.check"),
     ),

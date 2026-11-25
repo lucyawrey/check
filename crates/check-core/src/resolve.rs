@@ -717,6 +717,7 @@ impl Resolver<'_> {
                 self.args(args);
             }
             ExprKind::Spread(x)
+            | ExprKind::Opt(x)
             | ExprKind::SharedOf(x)
             | ExprKind::Unary(_, x)
             | ExprKind::Loop(x) => self.expr(x),
@@ -762,6 +763,10 @@ impl Resolver<'_> {
                         r.expr(&mut arm.body);
                     });
                 }
+            }
+            ExprKind::As(x, ty, _) => {
+                self.expr(x);
+                self.type_expr(ty);
             }
             ExprKind::Is(x, pat) => {
                 self.expr(x);

@@ -1,6 +1,7 @@
 pub use check_syntax::{ast, copy, diag, lexer, parser};
 
 pub mod checker;
+mod dynamic;
 pub mod host;
 pub mod interp;
 pub mod ir;

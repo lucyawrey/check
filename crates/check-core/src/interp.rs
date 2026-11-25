@@ -5,11 +5,13 @@ use std::io::{BufRead, Write};
 use std::rc::Rc;
 
 use crate::ast::*;
-use crate::checker::{EQ, Info, PRINTABLE, RESULT, Resolved, SET};
+use crate::checker::{DYN, EQ, Info, MAP, PRINTABLE, RESULT, Resolved, SET};
 use crate::diag::{Code, Span};
+use crate::dynamic;
 use crate::host::{self, Io};
 use indexmap::{IndexMap, IndexSet};
 
+use crate::types::{Shape, Show, Ty};
 use crate::value::{Callable, Record, Value, write_items, write_map};
 
 pub struct Panic {
@@ -80,6 +82,7 @@ pub struct Interpreter<'a> {
     depth: usize,
     /// The `shared class` objects being printed, by address, to stop at a cycle.
     printing: Vec<usize>,
+    unwrapped: HashMap<NodeId, Value>,
     /// Steps left before evaluation stops with `out_of_steps`; `None` is no limit.
     budget: Option<u64>,
     input: &'a mut dyn BufRead,
@@ -184,6 +187,7 @@ fn start<'a>(
         frames: vec![Frame::default()],
         depth: 0,
         printing: Vec::new(),
+        unwrapped: HashMap::new(),
         budget: Some(DATA_BUDGET),
         input,
         output,
@@ -262,6 +266,14 @@ fn coerce(info: &Info, id: NodeId, mut value: Value) -> Value {
             && let Value::List(items) = value
         {
             value = Value::Record(Rc::new(Record::unnamed(None, items.to_vec())));
+        }
+        if c.to_dyn {
+            value = match value {
+                Value::Some(v) => Value::Some(Rc::new(
+                    dynamic::from_value(&v).unwrap_or_else(|| (*v).clone()),
+                )),
+                v => dynamic::from_value(&v).unwrap_or(v),
+            };
         }
         if c.to_float
             && let Value::Int(n) = value
@@ -400,6 +412,27 @@ fn deref(v: Value) -> Value {
 }
 
 /// A field's value, read through the box of a `shared` field.
+type Decoded = Result<Value, Mismatch>;
+
+enum Mismatch {
+    Shape(String, Ty),
+    Flow(Flow),
+}
+
+impl From<Flow> for Mismatch {
+    fn from(flow: Flow) -> Mismatch {
+        Mismatch::Flow(flow)
+    }
+}
+
+fn child(path: &str, name: &str) -> String {
+    if path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{path}.{name}")
+    }
+}
+
 fn field(v: &Value, name: &str, span: Span) -> Eval {
     raw_field(v, name, span).map(uncell)
 }
@@ -681,7 +714,205 @@ impl Interpreter<'_> {
 
     fn construct(&mut self, class_name: &str, args: &[Arg], span: Span) -> Eval {
         let class = self.classes[class_name].clone();
-        let (mut fields, _) = self.bind_args(&class.fields, args)?;
+        let (fields, _) = self.bind_args(&class.fields, args)?;
+        self.build_object(class_name, &class, fields, span)
+    }
+
+    fn decode(&mut self, given: Option<&Value>, ty: &Ty, path: &str, span: Span) -> Decoded {
+        let mismatch = || Mismatch::Shape(path.to_string(), ty.clone());
+        if let Ty::Maybe(inner) = ty {
+            return match given {
+                Some(v) => Ok(Value::Some(Rc::new(self.decode(
+                    Some(v),
+                    inner,
+                    path,
+                    span,
+                )?))),
+                None => Ok(Value::None),
+            };
+        }
+        let Some(Value::Variant(d)) = given else {
+            return Err(mismatch());
+        };
+        let inner = &d.fields[0];
+        Ok(match (ty, &*d.name, inner) {
+            (Ty::Named(n, _), ..) if n == DYN => Value::Variant(d.clone()),
+            (Ty::Int, "Int", _) | (Ty::Float, "Float", _) | (Ty::Bool, "Bool", _) => inner.clone(),
+            (Ty::Str, "String", _) => inner.clone(),
+            (Ty::Float, "Int", Value::Int(n)) => Value::Float(*n as f64),
+            (Ty::List(elem), "List", Value::List(items)) => {
+                Value::List(Rc::new(self.decode_items(items, |_| elem, path, span)?))
+            }
+            (Ty::Record(names, fields), "List", Value::List(items))
+                if names.is_empty() && items.len() == fields.len() =>
+            {
+                let values = self.decode_items(items, |i| &fields[i], path, span)?;
+                Value::Record(Rc::new(Record::unnamed(None, values)))
+            }
+            (Ty::Record(names, fields), "Object", Value::Map(m)) if !names.is_empty() => {
+                let mut values = Vec::with_capacity(names.len());
+                for (name, field) in names.iter().zip(fields) {
+                    let given = dynamic::entry(m, name);
+                    values.push(self.decode(given, field, &child(path, name), span)?);
+                }
+                let names = names.iter().map(|n| n.as_str().into()).collect();
+                Value::Record(Rc::new(Record::unnamed(Some(names), values)))
+            }
+            (Ty::Named(n, args), "Object", Value::Map(m)) if n == MAP && args[0] == Ty::Str => {
+                let mut entries = IndexMap::with_capacity(m.len());
+                for (k, v) in m.iter() {
+                    let Value::Str(key) = k else {
+                        return Err(mismatch());
+                    };
+                    let given = match v {
+                        Value::Some(v) => Some(&**v),
+                        _ => None,
+                    };
+                    let value = self.decode(given, &args[1], &child(path, key), span)?;
+                    entries.insert(k.clone(), value);
+                }
+                Value::Map(Rc::new(entries))
+            }
+            (Ty::Named(n, args), "List", Value::List(items)) if n == SET => {
+                let values = self.decode_items(items, |_| &args[0], path, span)?;
+                Value::Set(Rc::new(values.into_iter().collect()))
+            }
+            (Ty::Named(n, args), ..) => match self.info.shapes.get(n) {
+                Some(shape) if shape.is_enum => {
+                    self.decode_variant(n, shape, args, d, path, span)?
+                }
+                Some(shape) => {
+                    let Value::Map(m) = inner else {
+                        return Err(mismatch());
+                    };
+                    let map: HashMap<String, Ty> = shape
+                        .params
+                        .iter()
+                        .cloned()
+                        .zip(args.iter().cloned())
+                        .collect();
+                    let mut given = HashMap::new();
+                    for (i, f) in shape.variants[0].1.iter().enumerate() {
+                        let value = dynamic::entry(m, &i.to_string())
+                            .or_else(|| dynamic::entry(m, &f.name));
+                        if value.is_none() && f.has_default {
+                            continue;
+                        }
+                        let ty = f.ty.substitute(&map);
+                        given.insert(
+                            f.name.clone(),
+                            self.decode(value, &ty, &child(path, &f.name), span)?,
+                        );
+                    }
+                    self.construct_from(n, given, span)?
+                }
+                None => return Err(mismatch()),
+            },
+            _ => return Err(mismatch()),
+        })
+    }
+
+    fn decode_items<'t>(
+        &mut self,
+        items: &[Value],
+        ty: impl Fn(usize) -> &'t Ty,
+        path: &str,
+        span: Span,
+    ) -> Result<Vec<Value>, Mismatch> {
+        let mut values = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let item = dynamic::present(item);
+            values.push(self.decode(item, ty(i), &format!("{path}[{i}]"), span)?);
+        }
+        Ok(values)
+    }
+
+    fn decode_variant(
+        &mut self,
+        enum_name: &str,
+        shape: &Shape,
+        args: &[Ty],
+        d: &Record,
+        path: &str,
+        span: Span,
+    ) -> Decoded {
+        let mismatch = || {
+            Mismatch::Shape(
+                path.to_string(),
+                Ty::Named(enum_name.to_string(), args.to_vec()),
+            )
+        };
+        let (tag, fields) = match (&*d.name, &d.fields[0]) {
+            ("String", Value::Str(tag)) => (tag.clone(), None),
+            ("Object", Value::Map(m)) => match dynamic::entry(m, "type") {
+                Some(Value::Variant(t)) if &*t.name == "String" => match &t.fields[0] {
+                    Value::Str(tag) => (tag.clone(), Some(m)),
+                    _ => return Err(mismatch()),
+                },
+                _ => return Err(mismatch()),
+            },
+            _ => return Err(mismatch()),
+        };
+        let (qualifier, name) = match tag.rsplit_once('.') {
+            Some((q, n)) => (Some(q), n),
+            None => (None, &tag[..]),
+        };
+        let short = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
+        if qualifier.is_some_and(|q| short(q) != short(enum_name)) {
+            return Err(mismatch());
+        }
+        let Some((name, variant)) = shape.variants.iter().find(|(v, _)| v == name) else {
+            return Err(mismatch());
+        };
+        if fields.is_none() && !variant.is_empty() {
+            return Err(mismatch());
+        }
+        let map: HashMap<String, Ty> = shape
+            .params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        let named = variant.first().is_some_and(|f| !f.name.is_empty());
+        let mut values = Vec::with_capacity(variant.len());
+        for (i, f) in variant.iter().enumerate() {
+            let key = if named { f.name.clone() } else { i.to_string() };
+            let given = fields.and_then(|m| dynamic::entry(m, &key));
+            values.push(self.decode(given, &f.ty.substitute(&map), &child(path, &key), span)?);
+        }
+        Ok(Value::Variant(Rc::new(Record {
+            name: name.as_str().into(),
+            ty: enum_name.into(),
+            by_fields: false,
+            field_names: named.then(|| variant.iter().map(|f| f.name.as_str().into()).collect()),
+            fields: values,
+        })))
+    }
+
+    fn construct_from(
+        &mut self,
+        class_name: &str,
+        mut given: HashMap<String, Value>,
+        span: Span,
+    ) -> Eval {
+        let class = self.classes[class_name].clone();
+        let mut fields = Vec::with_capacity(class.fields.len());
+        for f in &class.fields {
+            fields.push(match given.remove(&f.name) {
+                Some(v) => v,
+                None => self.default_value(f)?,
+            });
+        }
+        self.build_object(class_name, &class, fields, span)
+    }
+
+    fn build_object(
+        &mut self,
+        class_name: &str,
+        class: &ClassDecl,
+        mut fields: Vec<Value>,
+        span: Span,
+    ) -> Eval {
         for (value, f) in fields.iter_mut().zip(&class.fields) {
             if f.is_shared {
                 *value = share(std::mem::replace(value, Value::Void));
@@ -1112,6 +1343,9 @@ impl Interpreter<'_> {
     }
 
     fn expr(&mut self, expr: &Expr) -> Eval {
+        if let Some(value) = self.unwrapped.remove(&expr.id) {
+            return Ok(value);
+        }
         let mut value = grow(|| self.raw(expr))?;
         if self.info.try_unwraps.contains_key(&expr.id) {
             value = self.unwrap_or_return(value, expr.span)?;
@@ -1168,11 +1402,54 @@ impl Interpreter<'_> {
                 None => internal(&format!("no variable `{name}`"), expr.span),
             },
             ExprKind::SharedOf(x) => self.shared_of(x),
+            ExprKind::As(value, _, is_result) => {
+                let given = match self.expr(value)? {
+                    Value::Some(d) => Some((*d).clone()),
+                    Value::None => None,
+                    d => Some(d),
+                };
+                let target = &self.info.casts[&expr.id];
+                Ok(
+                    match (
+                        self.decode(given.as_ref(), target, "", expr.span),
+                        is_result,
+                    ) {
+                        (Ok(v), false) => Value::Some(Rc::new(v)),
+                        (Ok(v), true) => dynamic::ok(v),
+                        (Err(Mismatch::Shape(_, _)), false) => Value::None,
+                        (Err(Mismatch::Shape(path, ty)), true) => {
+                            dynamic::err(dynamic::shape_error(path, Show(&ty).to_string()))
+                        }
+                        (Err(Mismatch::Flow(flow)), _) => return Err(flow),
+                    },
+                )
+            }
+            ExprKind::Opt(access) => {
+                let (ExprKind::Field(base, _)
+                | ExprKind::Method(base, ..)
+                | ExprKind::Index(base, _)) = &access.kind
+                else {
+                    unreachable!("the parser wraps only a field, method or index access")
+                };
+                let Value::Some(inner) = self.expr(base)? else {
+                    return Ok(Value::None);
+                };
+                self.unwrapped.insert(base.id, (*inner).clone());
+                let value = self.expr(access)?;
+                Ok(if self.info.optional_wraps.contains(&expr.id) {
+                    Value::Some(Rc::new(value))
+                } else {
+                    value
+                })
+            }
             ExprKind::This => match self.lookup("this") {
                 Some(v) => Ok(v),
                 None => internal("no `this`", expr.span),
             },
             ExprKind::Field(base, name) => match self.expr(base)? {
+                v @ Value::Variant(_) if v.is_dyn() => {
+                    Ok(dynamic::get(&v, &Value::Str(name.as_str().into())))
+                }
                 Value::SharedBox(v) if name == "value" => Ok(v.borrow().clone()),
                 Value::SharedBox(v) => field(&v.borrow(), name, expr.span),
                 v => field(&v, name, expr.span),
@@ -1259,6 +1536,9 @@ impl Interpreter<'_> {
             ExprKind::Index(list, index) => {
                 let l = deref(self.expr(list)?);
                 let i = self.expr(index)?;
+                if l.is_dyn() {
+                    return Ok(dynamic::get(&l, &i));
+                }
                 let is_map = matches!(l, Value::Map(_));
                 let found = match (l, i) {
                     (Value::List(items), Value::Int(i)) => {
@@ -1694,6 +1974,17 @@ impl Interpreter<'_> {
         self.enter_keeping(frame, body, span, keep)
     }
 
+    fn default_value(&mut self, p: &Param) -> Eval {
+        let Some(d) = &p.default else {
+            return Ok(Value::Void);
+        };
+        // A default sees the names where it's declared, not the caller's locals.
+        self.frames.push(Frame::default());
+        let v = self.expr(d);
+        self.frames.pop();
+        v
+    }
+
     fn bind_args(&mut self, params: &[Param], args: &[Arg]) -> Result<Bound, Flow> {
         let mut slots: Vec<Option<Value>> = vec![None; params.len()];
         let mut places: Vec<Option<Place>> = params.iter().map(|_| None).collect();
@@ -1728,16 +2019,7 @@ impl Interpreter<'_> {
             } else {
                 match slots[i].take() {
                     Some(v) => v,
-                    None => match &p.default {
-                        Some(d) => {
-                            // A default sees the names where it's declared, not the caller's locals.
-                            self.frames.push(Frame::default());
-                            let v = self.expr(d);
-                            self.frames.pop();
-                            v?
-                        }
-                        None => Value::Void,
-                    },
+                    None => self.default_value(p)?,
                 }
             };
             values.push(v);

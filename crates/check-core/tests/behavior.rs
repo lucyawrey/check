@@ -3784,3 +3784,236 @@ fn a_method_with_a_std_methods_name_replaces_it_with_a_warning() {
     assert_eq!(warnings(src), ["replaces_std_method"]);
     assert_eq!(output(src), "[1]");
 }
+
+#[test]
+fn optional_chaining_reads_through_some_and_stops_at_none() {
+    let src = "class Tag(name: String)\nclass Item(tag: Tag?)\nlet items = [Item(Some(Tag(\"a\"))), Item(None)]\nprint(items.first()?.tag?.name)\nprint(items.last()?.tag?.name)\nlet none: Item? = None\nprint(none?.tag?.name)\nlet words: String[]? = Some([\"x\", \"y\"])\nprint(words?[1])\nprint(words?.length())";
+    assert_eq!(output(src), "Some(\"a\")\nNone\nNone\nSome(\"y\")\nSome(2)");
+}
+
+#[test]
+fn optional_chaining_needs_a_maybe_and_cant_change_its_value() {
+    assert_eq!(
+        first_error("let n = 1\nprint(n?.toFloat())"),
+        "type_mismatch"
+    );
+    assert_eq!(
+        first_error("var xs: Int[]? = Some([])\nxs?.push(1)"),
+        "optional_changing_call"
+    );
+    assert_eq!(
+        first_error("class P(n: Int)\nvar p: P? = Some(P(1))\np?.n = 2"),
+        "optional_assignment"
+    );
+    assert_eq!(
+        first_error("var xs: Int[]? = Some([1])\nxs?[0] += 1"),
+        "optional_assignment"
+    );
+}
+
+#[test]
+fn optional_chaining_never_doubles_a_maybe() {
+    let src = "class Tag(name: String)\nclass Item(tag: Tag?)\nlet item: Item? = Some(Item(Some(Tag(\"a\"))))\nprint(item?.tag)";
+    assert_eq!(output(src), "Some(Tag(name = \"a\"))");
+}
+
+#[test]
+fn json_parses_into_dyn_keeping_nulls_as_none() {
+    let src = r#"let d = Json.parse(r"""
+  {"n": 1, "x": 1.5, "items": [1, null, "a", true], "gone": null}
+  """).orPanic()
+print(d.n)
+print(d.x)
+print(d.items)
+print(d.gone)
+print(d.hasKey("gone"))
+print(d.hasKey("other"))"#;
+    assert_eq!(
+        output(src),
+        "Some(Int(1))\nSome(Float(1.5))\nSome(List([Some(Int(1)), None, Some(String(\"a\")), Some(Bool(true))]))\nNone\ntrue\nfalse"
+    );
+}
+
+#[test]
+fn json_that_isnt_a_value_is_a_parse_error_at_its_position() {
+    let src = r#"print(Json.parse(r"""
+  {"a": }
+  """))
+print(Json.parse("null"))
+print(Json.parse(""))"#;
+    assert_eq!(
+        output(src),
+        "Err(check.std.ParseError(line = 1, column = 7))\nErr(check.std.ParseError(line = 1, column = 1))\nErr(check.std.ParseError(line = 1, column = 1))"
+    );
+}
+
+#[test]
+fn untyped_con_parses_any_names_into_the_json_shape() {
+    let src = r#"let d = Data.parse(r"""
+  kind = Kind.Game(maxPlayers = 8)
+  link = Link("x")
+  sky = Sky.None
+  place = place.Place(size = (4, -2))
+  mixed = [1, "a", None]
+  label = None
+  """).orPanic()
+print(d.kind)
+print(d.link)
+print(d.sky)
+print(d.place)
+print(d.mixed)
+print(d.hasKey("label"))"#;
+    assert_eq!(
+        output(src),
+        [
+            "Some(Object([\"type\" = Some(String(\"Kind.Game\")), \"maxPlayers\" = Some(Int(8))]))",
+            "Some(Object([\"type\" = Some(String(\"Link\")), \"0\" = Some(String(\"x\"))]))",
+            "Some(String(\"None\"))",
+            "Some(Object([\"type\" = Some(String(\"place.Place\")), \"size\" = Some(List([Some(Int(4)), Some(Int(-2))]))]))",
+            "Some(List([Some(Int(1)), Some(String(\"a\")), None]))",
+            "true",
+        ]
+        .join("\n")
+    );
+}
+
+#[test]
+fn untyped_con_refuses_code_and_a_type_argument() {
+    let src = r#"print(Data.parse("x = 1 + 2"))
+print(Data.parse("x = Game(type = 3)"))"#;
+    assert_eq!(
+        output(src),
+        "Err(check.std.ParseError(line = 1, column = 5))\nErr(check.std.ParseError(line = 1, column = 17))"
+    );
+}
+
+const DYN_TYPES: &str = "enum Shape {
+  Square
+  Circle(radius: Float)
+}
+enum Link {
+  Web(String)
+  None
+}
+class Item(name: String, size: (Int, Int), shape: Shape = Shape.Square, link: Link = Link.None)
+class Typed(type: String)
+class User {
+  let name: String
+  let age: Int = 0
+  let items: Item[] = []
+  var greeting = \"\"
+  init { this.greeting = \"Hi {this.name}\" }
+}
+";
+
+#[test]
+fn as_reads_a_dyn_as_any_type_with_defaults_and_init() {
+    let src = format!(
+        r#"{DYN_TYPES}let d = Json.parse(r"""
+  {{"user": {{"name": "Ana", "items": [{{"name": "a", "size": [1, 2], "shape": {{"type": "Circle", "radius": 2}}}}, {{"name": "b", "size": [3, 4], "shape": "Square"}}]}}}}
+  """).orPanic()
+print(d.user?.name as String ?? "anon")
+print(d.nobody?.name as String ?? "anon")
+print(d.user?.items?[1] as Item)
+print(d.user as? User)"#
+    );
+    assert_eq!(
+        output(&src),
+        [
+            "Ana",
+            "anon",
+            "Some(Item(name = \"b\", size = (3, 4), shape = Square, link = None))",
+            "Ok(User(name = \"Ana\", age = 0, items = [Item(name = \"a\", size = (1, 2), shape = Circle(radius = 2.0), link = None), Item(name = \"b\", size = (3, 4), shape = Square, link = None)], greeting = \"Hi Ana\"))",
+        ]
+        .join("\n")
+    );
+}
+
+#[test]
+fn as_result_names_the_path_and_type_that_didnt_fit() {
+    let src = format!(
+        r#"{DYN_TYPES}let d = Json.parse(r"""
+  {{"name": "Ana", "items": [{{"name": "a", "size": [1, 2]}}, {{"name": "b", "size": [1]}}]}}
+  """).orPanic()
+print(d as? User)"#
+    );
+    assert_eq!(
+        output(&src),
+        "Err(check.std.ShapeError(path = \"items[1].size\", expected = \"(Int, Int)\"))"
+    );
+}
+
+#[test]
+fn numbers_convert_only_from_int_to_float() {
+    let src = r#"print(Json.parse("2").orPanic() as Float)
+print(Json.parse("2.0").orPanic() as Int)
+print(Json.parse("9999999999999999999").orPanic() as Int)"#;
+    assert_eq!(output(src), "Some(2.0)\nNone\nNone");
+}
+
+#[test]
+fn a_type_key_is_a_field_for_a_class_and_a_tag_for_an_enum() {
+    let src = format!(
+        r#"{DYN_TYPES}let d = Json.parse(r"""
+  {{"type": "Circle", "radius": 1}}
+  """).orPanic()
+print(d as Typed)
+print(d as Shape)
+print(Data.parse("x = Web(\"u\")").orPanic().x as Link)
+print(Data.parse("x = Typed(\"t\")").orPanic().x as Typed)
+print(Json.parse(r"""{{"type": "Other.Circle", "radius": 1}}""").orPanic() as Shape)"#
+    );
+    assert_eq!(
+        output(&src),
+        "Some(Typed(type = \"Circle\"))\nSome(Circle(radius = 1.0))\nSome(Web(\"u\"))\nSome(Typed(type = \"t\"))\nNone"
+    );
+}
+
+#[test]
+fn a_typed_value_converts_to_dyn_and_back() {
+    let src = format!(
+        r#"{DYN_TYPES}let item = Item("a", (1, 2), shape = Shape.Circle(2.0), link = Link.Web("u"))
+let d: Dyn = item
+print(d as? Item)
+let r: Dyn = (name = "x", tags = ["a"])
+print(r.tags?[0])
+let scores: Dyn = ["ana" = 3]
+print(scores.ana as Int)
+let xs: Int?[] = [1, None]
+let l: Dyn = xs
+print(l as Int?[])
+let first: Dyn? = xs[0]
+print(first)"#
+    );
+    assert_eq!(
+        output(&src),
+        "Ok(Item(name = \"a\", size = (1, 2), shape = Circle(radius = 2.0), link = Web(\"u\")))\nSome(String(\"a\"))\nSome(3)\nSome([Some(1), None])\nSome(Int(1))"
+    );
+}
+
+#[test]
+fn dyn_needs_a_check_before_use() {
+    assert_eq!(
+        first_error("let d = Json.parse(\"1\").orPanic()\nprint(d + 1)"),
+        "invalid_operand_types"
+    );
+    assert_eq!(
+        first_error("shared class C(n: Int)\nlet d: Dyn = C(1)"),
+        "type_mismatch"
+    );
+    assert_eq!(first_error("let n = 1\nprint(n as Int)"), "type_mismatch");
+    assert_eq!(
+        first_error("let xs: Int[] = []\nlet d: Dyn = xs.first()"),
+        "unhandled_maybe"
+    );
+    assert_eq!(
+        first_error("let d = Json.parse(\"1\").orPanic()\nprint(d == d)"),
+        "invalid_operand_types"
+    );
+    assert_eq!(
+        first_error("let d = Json.parse(\"1\").orPanic()\nprint(d as? Map<Int, Int>)"),
+        "type_mismatch"
+    );
+    let src = "let d = Json.parse(\"3\").orPanic()\nmatch d {\n  Int(n) => print(n + 1)\n  _ => print(\"other\")\n}";
+    assert_eq!(output(src), "4");
+}

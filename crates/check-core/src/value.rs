@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::ast::{Expr, FuncDecl, Param};
-use crate::checker::{MAP, MAYBE, SET};
+use crate::checker::{DYN, MAP, MAYBE, SET};
 
 pub enum Callable {
     Named(Rc<FuncDecl>, String),
@@ -230,6 +230,10 @@ impl Value {
 }
 
 impl Value {
+    pub fn is_dyn(&self) -> bool {
+        matches!(self, Value::Variant(r) if &*r.ty == DYN)
+    }
+
     pub fn truthy(&self) -> bool {
         matches!(self, Value::Bool(true))
     }
