@@ -154,3 +154,20 @@ fn memory_stays_bounded_while_comparing_strings() {
         "var n = 0\nfor i in 0..200000 {\n  if \"k{i}\" == \"k5\" or \"a{i}\" < \"b\" { n += 1 }\n}\nprint(n)",
     );
 }
+
+#[test]
+fn dyn_and_optional_chaining_are_unsupported_for_now() {
+    for src in [
+        "print(Json.parse(\"1\"))",
+        "let n: Int? = Some(1)\nprint(n?.toFloat())",
+    ] {
+        let files = MemFiles(HashMap::from([("test.check".to_string(), src.to_string())]));
+        let report = run_program("test.check", &files, false, MemoryOutputPipe::new(1 << 20));
+        let codes: Vec<String> = report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.to_string())
+            .collect();
+        assert_eq!(codes, ["wasm_unsupported"], "{src}");
+    }
+}

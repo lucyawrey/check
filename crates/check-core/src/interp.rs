@@ -787,15 +787,15 @@ impl Interpreter<'_> {
                         .zip(args.iter().cloned())
                         .collect();
                     let mut given = HashMap::new();
-                    for (name, field, has_default) in &shape.variants[0].1 {
-                        let value = dynamic::entry(m, name);
-                        if value.is_none() && *has_default {
+                    for f in &shape.variants[0].1 {
+                        let value = dynamic::entry(m, &f.name);
+                        if value.is_none() && f.has_default {
                             continue;
                         }
-                        let field = field.substitute(&map);
+                        let ty = f.ty.substitute(&map);
                         given.insert(
-                            name.clone(),
-                            self.decode(value, &field, &child(path, name), span)?,
+                            f.name.clone(),
+                            self.decode(value, &ty, &child(path, &f.name), span)?,
                         );
                     }
                     self.construct_from(n, given, span)?
@@ -859,22 +859,18 @@ impl Interpreter<'_> {
             .cloned()
             .zip(args.iter().cloned())
             .collect();
-        let named = variant.first().is_some_and(|(n, ..)| !n.is_empty());
+        let named = variant.first().is_some_and(|f| !f.name.is_empty());
         let mut values = Vec::with_capacity(variant.len());
-        for (i, (field_name, field, _)) in variant.iter().enumerate() {
-            let key = if named {
-                field_name.clone()
-            } else {
-                i.to_string()
-            };
+        for (i, f) in variant.iter().enumerate() {
+            let key = if named { f.name.clone() } else { i.to_string() };
             let given = fields.and_then(|m| dynamic::entry(m, &key));
-            values.push(self.decode(given, &field.substitute(&map), &child(path, &key), span)?);
+            values.push(self.decode(given, &f.ty.substitute(&map), &child(path, &key), span)?);
         }
         Ok(Value::Variant(Rc::new(Record {
             name: name.as_str().into(),
             ty: enum_name.into(),
             by_fields: false,
-            field_names: named.then(|| variant.iter().map(|(n, ..)| n.as_str().into()).collect()),
+            field_names: named.then(|| variant.iter().map(|f| f.name.as_str().into()).collect()),
             fields: values,
         })))
     }

@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::ast::*;
 use crate::copy::Text;
 use crate::diag::{Code, Diagnostic, Edit, Severity, Sources, Span};
-use crate::types::{Shape, Show, Subst, Ty};
+use crate::types::{FieldShape, Shape, Show, Subst, Ty};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Coercion {
@@ -3181,9 +3181,13 @@ impl Checker<'_> {
     }
 
     fn shapes(&self) -> HashMap<String, Shape> {
-        let fields = |fields: &[ParamSig]| -> Vec<(String, Ty, bool)> {
+        let fields = |fields: &[ParamSig]| -> Vec<FieldShape> {
             (fields.iter())
-                .map(|f| (f.name.clone(), f.ty.clone(), f.has_default))
+                .map(|f| FieldShape {
+                    name: f.name.clone(),
+                    ty: f.ty.clone(),
+                    has_default: f.has_default,
+                })
                 .collect()
         };
         (self.types.iter())
