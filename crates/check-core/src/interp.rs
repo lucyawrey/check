@@ -2253,6 +2253,7 @@ pub fn panic_code(p: check_runtime::Panic) -> Code {
         check_runtime::Panic::ShiftOutOfRange => Code::shift_out_of_range,
         check_runtime::Panic::IndexOutOfRange => Code::index_out_of_range,
         check_runtime::Panic::OrPanicOnNone => Code::or_panic_on_none,
+        check_runtime::Panic::PanicCalled => Code::panic_called,
     }
 }
 

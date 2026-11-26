@@ -747,6 +747,15 @@ impl<'a> Lowerer<'a> {
                 _ => unsupported(callee.span),
             };
         };
+        if decl.name == "check.std.panic" {
+            let Some(Arg::Value(reason)) = self
+                .args(&decl.params, args, &HashMap::new(), e.span)?
+                .pop()
+            else {
+                return unsupported(e.span);
+            };
+            return Ok(ExprKind::Panic(Box::new(reason)));
+        }
         if decl.body.is_none() {
             return Ok(ExprKind::External(name.clone(), self.values(args, e.span)?));
         }
@@ -782,11 +791,15 @@ impl<'a> Lowerer<'a> {
         let Some(decl) = decl.filter(|d| d.body.is_some()) else {
             return self.builtin(e, recv, &recv_ty, name, args, decl);
         };
-        let (id, type_args) = self.func_id(decl, e.id, Some(recv_ty), e.span)?;
-        let this = match self.info.changes_this.contains(&decl.name) {
-            true => Arg::Ref(self.place(recv)?),
-            false => Arg::Value(self.expr(recv)?),
+        let (this, this_ty) = match self.info.changes_this.contains(&decl.name) {
+            true => {
+                let place = self.place(recv)?;
+                let ty = place.ty().clone();
+                (Arg::Ref(place), ty)
+            }
+            false => (Arg::Value(self.expr(recv)?), recv_ty),
         };
+        let (id, type_args) = self.func_id(decl, e.id, Some(this_ty), e.span)?;
         let mut lowered = vec![this];
         lowered.extend(self.args(&decl.params, args, &type_args, e.span)?);
         Ok(ExprKind::Call(id, lowered))

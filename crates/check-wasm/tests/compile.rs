@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use check_core::diag::Severity;
 use check_core::modules::MemFiles;
 use check_core::{Outcome, Report, check_source, lower::lower, run_source};
 use check_wasm::{MemoryOutputPipe, RUNTIME, compile, execute, run_program};
@@ -118,6 +119,8 @@ fn stays_bounded(src: &str) {
     let mut interpreted = Vec::new();
     run_source("test.check", src, &mut std::io::empty(), &mut interpreted);
     let checked = check_source("test.check", src);
+    let errors = (checked.diagnostics.iter()).filter(|d| d.severity == Severity::Error);
+    assert_eq!(errors.count(), 0, "{src} has errors");
     let program = lower(&checked.program, &checked.library, &checked.info).unwrap();
     let stdout = MemoryOutputPipe::new(1 << 10);
     let run = execute(&compile(&program, RUNTIME).unwrap(), stdout.clone()).unwrap();
@@ -222,6 +225,8 @@ fn maybe_panics_match_the_interpreter() {
         "let n: String? = None\nprint(n.orPanic(\"needs a name\"))",
         "let xs = [1, 2]\nfor i in xs.indices() { print(xs[i]) }\nvar ys = xs\nys[2] = 5",
         "var xs = [1]\nxs.insert(3, 2)",
+        "print(1)\npanic()",
+        "func check(n: Int) { if n > 1 { panic(\"too big: {n}\") } }\ncheck(1)\ncheck(2)",
     ] {
         same(src);
     }
@@ -399,5 +404,32 @@ print(maybe)
 let nested = [Some([1]), None]
 print(nested)
 print([(1, "a")] == [(1, "a")])"#,
+    );
+}
+
+#[test]
+fn memory_stays_bounded_through_text_equality_and_changes() {
+    stays_bounded(
+        r#"class Tag {
+  var name: String
+  var seen: String[] = []
+  init { this.seen.push(this.name) }
+  func rename(to: String) { this.name = to }
+}
+func addTo(ref tags: Tag[], name: String) { tags.push(Tag(name = name)) }
+var same = 0
+for i in 0..5000 {
+  var tags: Tag[] = []
+  addTo(tags, "a{i}")
+  addTo(tags, "b")
+  tags[0].rename("c{i}")
+  let text = "{tags} {tags.first()} {(n = i, m = tags.first() == None)}"
+  if tags == tags and text != "" { same += 1 }
+  let popped = tags.pop() ?? Tag(name = "none")
+  let removed = tags.removeAt(0).orPanic()
+  let nested: String?? = Some(Some("x{i}"))
+  let flat = nested ?? None ?? "y"
+}
+print(same)"#,
     );
 }

@@ -994,6 +994,12 @@ impl Gen<'_> {
                 )?;
                 self.free.push(t);
             }
+            ExprKind::Panic(reason) => {
+                self.f().i32_const(Panic::PanicCalled as i32);
+                self.at(e.span);
+                self.expr(reason)?;
+                self.call_rt("check_panic");
+            }
             ExprKind::OrPanic(x, reason) => {
                 self.expr(x)?;
                 let t = self.set_temp(&x.ty);

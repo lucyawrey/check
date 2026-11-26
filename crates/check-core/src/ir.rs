@@ -111,6 +111,7 @@ pub enum ExprKind {
     None,
     Coalesce(Box<Expr>, Box<Expr>),
     OrPanic(Box<Expr>, Box<Expr>),
+    Panic(Box<Expr>),
     Record(Vec<Expr>),
     Field(Box<Expr>, usize),
     List(Vec<Expr>),

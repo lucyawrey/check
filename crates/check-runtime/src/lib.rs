@@ -9,16 +9,18 @@ pub enum Panic {
     ShiftOutOfRange,
     IndexOutOfRange,
     OrPanicOnNone,
+    PanicCalled,
 }
 
 impl Panic {
-    pub const ALL: [Panic; 6] = [
+    pub const ALL: [Panic; 7] = [
         Panic::IntegerOverflow,
         Panic::DivisionByZero,
         Panic::NegativeExponent,
         Panic::ShiftOutOfRange,
         Panic::IndexOutOfRange,
         Panic::OrPanicOnNone,
+        Panic::PanicCalled,
     ];
 }
 
