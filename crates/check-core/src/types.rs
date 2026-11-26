@@ -34,6 +34,15 @@ impl Ty {
         Ty::Named(name.to_string(), Vec::new())
     }
 
+    pub fn has_range(&self) -> bool {
+        match self {
+            Ty::Range => true,
+            Ty::List(e) | Ty::Maybe(e) => e.has_range(),
+            Ty::Record(_, fields) => fields.iter().any(Ty::has_range),
+            _ => false,
+        }
+    }
+
     pub fn is_numeric(&self) -> bool {
         matches!(self, Ty::Int | Ty::Float)
     }

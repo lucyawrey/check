@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-run = ["dep:check-runtime", "dep:wasmtime", "dep:wasmtime-wasi"]
+run = ["dep:wasmtime", "dep:wasmtime-wasi"]
 
 [dependencies]
 check-core = { path = "../check-core" }
-check-runtime = { path = "../check-runtime", optional = true }
+check-runtime = { path = "../check-runtime" }
 wasm-encoder = { version = "0.263.0", features = ["wasmparser"] }
 wasmparser = "0.263.0"
 wasmtime = { version = "51.0.0", optional = true }
