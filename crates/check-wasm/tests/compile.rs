@@ -433,3 +433,34 @@ for i in 0..5000 {
 print(same)"#,
     );
 }
+
+#[test]
+fn side_effects_run_in_source_order() {
+    same(
+        r#"class C(var n: Int)
+var cs = [C(1)]
+var xs = [[1]]
+func i() -> Int {
+  print("i")
+  0
+}
+func v() -> Int {
+  print("v")
+  5
+}
+func f(x: Int, y: Int) -> Int { x + y }
+cs[i()].n += 1
+cs[i()].n = v()
+xs[i()].push(v())
+print(f(y = v(), x = i()))
+let nan: Float? = 0.0 / 0.0
+print(nan == nan)
+let a = [0.0 / 0.0]
+print(a == a)
+let b = a
+print(a == b)
+print([0.0 / 0.0] == [0.0 / 0.0])
+class P(x: Int, y: Int)
+print(P(y = v(), x = i()))"#,
+    );
+}

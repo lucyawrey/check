@@ -141,6 +141,15 @@ fn binary(op: BinOp, l: Expr, r: Expr) -> ExprKind {
     ExprKind::Binary(op, Box::new(l), Box::new(r))
 }
 
+fn sequenced(prelude: Vec<Expr>, last: Expr) -> ExprKind {
+    if prelude.is_empty() {
+        return last.kind;
+    }
+    let mut items = prelude;
+    items.push(last);
+    ExprKind::Block(items)
+}
+
 fn list_elem(ty: &Ty) -> Option<&Ty> {
     match ty {
         Ty::List(elem) => Some(elem),
@@ -429,18 +438,17 @@ impl<'a> Lowerer<'a> {
                 value,
                 span,
             } => {
+                let (prelude, place) = self.hoisted_place(target)?;
                 let mut value = self.expr(value)?;
-                let place = self.place(target)?;
                 if let Some(op) = op {
-                    let current = self.place(target)?;
-                    let current = self.read_place(current, target.span);
+                    let current = self.read_place(place.clone(), target.span);
                     value = expr(current.ty.clone(), *span, binary(*op, current, value));
                 }
                 if place.steps.is_empty() {
                     return Ok(Self::write(place.root, value, *span));
                 }
-                let kind = ExprKind::Write(place, Box::new(value));
-                Ok(expr(Ty::Void, *span, kind))
+                let write = expr(Ty::Void, *span, ExprKind::Write(place, Box::new(value)));
+                Ok(expr(Ty::Void, *span, sequenced(prelude, write)))
             }
             Stmt::Expr(e) => self.expr(e),
             Stmt::Let { span, .. } | Stmt::RefLet { span, .. } | Stmt::LetPattern { span, .. } => {
@@ -473,6 +481,24 @@ impl<'a> Lowerer<'a> {
             read = expr(ty, span, kind);
         }
         read
+    }
+
+    fn hoisted_place(&mut self, e: &'a ast::Expr) -> Lowered<(Vec<Expr>, Place)> {
+        let mut place = self.place(e)?;
+        let mut prelude = Vec::new();
+        for (step, _) in &mut place.steps {
+            if let Step::Index(index) = step {
+                let at = self.local(Ty::Int);
+                let read = expr(Ty::Int, index.span, ExprKind::Local(at));
+                let index = std::mem::replace(index, read);
+                prelude.push(expr(
+                    Ty::Void,
+                    index.span,
+                    ExprKind::Let(at, Box::new(index)),
+                ));
+            }
+        }
+        Ok((prelude, place))
     }
 
     fn place(&mut self, e: &'a ast::Expr) -> Lowered<Place> {
@@ -748,10 +774,8 @@ impl<'a> Lowerer<'a> {
             };
         };
         if decl.name == "check.std.panic" {
-            let Some(Arg::Value(reason)) = self
-                .args(&decl.params, args, &HashMap::new(), e.span)?
-                .pop()
-            else {
+            let (_, mut reason) = self.args(&decl.params, args, &HashMap::new(), e.span)?;
+            let Some(Arg::Value(reason)) = reason.pop() else {
                 return unsupported(e.span);
             };
             return Ok(ExprKind::Panic(Box::new(reason)));
@@ -760,8 +784,21 @@ impl<'a> Lowerer<'a> {
             return Ok(ExprKind::External(name.clone(), self.values(args, e.span)?));
         }
         let (id, type_args) = self.func_id(decl, e.id, None, callee.span)?;
-        let args = self.args(&decl.params, args, &type_args, e.span)?;
-        Ok(ExprKind::Call(id, args))
+        let (prelude, args) = self.args(&decl.params, args, &type_args, e.span)?;
+        Ok(self.sequenced_call(e, prelude, id, args))
+    }
+
+    fn sequenced_call(
+        &self,
+        e: &ast::Expr,
+        prelude: Vec<Expr>,
+        id: FuncId,
+        args: Vec<Arg>,
+    ) -> ExprKind {
+        sequenced(
+            prelude,
+            expr(self.ty(e.id), e.span, ExprKind::Call(id, args)),
+        )
     }
 
     fn method(
@@ -775,8 +812,8 @@ impl<'a> Lowerer<'a> {
             Some(Resolved::Static(key)) => {
                 let decl = self.decls[key.as_str()];
                 let (id, type_args) = self.func_id(decl, e.id, None, e.span)?;
-                let args = self.args(&decl.params, args, &type_args, e.span)?;
-                return Ok(ExprKind::Call(id, args));
+                let (prelude, args) = self.args(&decl.params, args, &type_args, e.span)?;
+                return Ok(self.sequenced_call(e, prelude, id, args));
             }
             Some(Resolved::Method(key)) => Some(key),
             Some(_) => return unsupported(e.span),
@@ -800,9 +837,10 @@ impl<'a> Lowerer<'a> {
             false => (Arg::Value(self.expr(recv)?), recv_ty),
         };
         let (id, type_args) = self.func_id(decl, e.id, Some(this_ty), e.span)?;
+        let (prelude, rest) = self.args(&decl.params, args, &type_args, e.span)?;
         let mut lowered = vec![this];
-        lowered.extend(self.args(&decl.params, args, &type_args, e.span)?);
-        Ok(ExprKind::Call(id, lowered))
+        lowered.extend(rest);
+        Ok(self.sequenced_call(e, prelude, id, lowered))
     }
 
     fn builtin(
@@ -819,8 +857,13 @@ impl<'a> Lowerer<'a> {
                 ExprKind::Length(Box::new(self.expr(recv)?))
             }
             (Ty::List(_), _, Some(op)) => {
-                let place = self.place(recv)?;
-                ExprKind::ListOp(op, place, self.values(args, e.span)?)
+                let (prelude, place) = self.hoisted_place(recv)?;
+                let values = self.values(args, e.span)?;
+                let ty = self.ty(e.id);
+                sequenced(
+                    prelude,
+                    expr(ty, e.span, ExprKind::ListOp(op, place, values)),
+                )
             }
             (Ty::Maybe(inner), "orPanic", _) => {
                 let Some(decl) = decl else {
@@ -828,7 +871,7 @@ impl<'a> Lowerer<'a> {
                 };
                 let map = HashMap::from([("T".to_string(), (**inner).clone())]);
                 let recv = self.expr(recv)?;
-                let Some(Arg::Value(reason)) = self.args(&decl.params, args, &map, e.span)?.pop()
+                let Some(Arg::Value(reason)) = self.args(&decl.params, args, &map, e.span)?.1.pop()
                 else {
                     return unsupported(e.span);
                 };
@@ -851,7 +894,8 @@ impl<'a> Lowerer<'a> {
         let decl = self.class_decls[class];
         let map = type_map(&self.classes[class].params, type_args);
         let mut fields = Vec::new();
-        for arg in self.args(&decl.fields, args, &map, e.span)? {
+        let (prelude, args) = self.args(&decl.fields, args, &map, e.span)?;
+        for arg in args {
             match arg {
                 Arg::Value(v) => fields.push(v),
                 Arg::Ref(_) => return unsupported(e.span),
@@ -859,7 +903,7 @@ impl<'a> Lowerer<'a> {
         }
         let record = expr(ty.clone(), e.span, ExprKind::Record(fields));
         let Some(init) = &decl.init else {
-            return Ok(record.kind);
+            return Ok(sequenced(prelude, record));
         };
         if !init.params.is_empty() {
             return unsupported(init.span);
@@ -867,11 +911,13 @@ impl<'a> Lowerer<'a> {
         let (id, _) = self.func_id(init, e.id, Some(ty.clone()), e.span)?;
         let this = self.local(ty.clone());
         let place = self.root_place(Root::Local(this));
-        Ok(ExprKind::Block(vec![
+        let mut items = prelude;
+        items.extend([
             expr(Ty::Void, e.span, ExprKind::Let(this, Box::new(record))),
             expr(Ty::Void, e.span, ExprKind::Call(id, vec![Arg::Ref(place)])),
             expr(ty, e.span, ExprKind::Local(this)),
-        ]))
+        ]);
+        Ok(ExprKind::Block(items))
     }
 
     fn args(
@@ -880,8 +926,9 @@ impl<'a> Lowerer<'a> {
         args: &'a [ast::Arg],
         type_args: &HashMap<String, Ty>,
         span: Span,
-    ) -> Lowered<Vec<Arg>> {
+    ) -> Lowered<(Vec<Expr>, Vec<Arg>)> {
         let mut given: Vec<Option<&'a ast::Expr>> = vec![None; params.len()];
+        let mut order = Vec::new();
         let mut positional = (0..params.len()).filter(|&i| !params[i].is_private);
         for arg in args {
             let i = match &arg.name {
@@ -890,25 +937,45 @@ impl<'a> Lowerer<'a> {
             };
             match i {
                 Some(i) if !params[i].is_rest && !params[i].is_shared => {
-                    given[i] = Some(&arg.value)
+                    given[i] = Some(&arg.value);
+                    order.push(i);
                 }
                 _ => return unsupported(span),
             }
         }
+        let mut prelude = Vec::new();
+        let mut early: Vec<Option<Expr>> = vec![None; params.len()];
+        if order.windows(2).any(|w| w[0] > w[1]) {
+            for i in order {
+                let value = given[i].expect("a given argument");
+                if self.info.ref_args.contains_key(&value.id) {
+                    continue;
+                }
+                let value = self.expr(value)?;
+                let at = self.local(value.ty.clone());
+                early[i] = Some(expr(value.ty.clone(), value.span, ExprKind::Local(at)));
+                prelude.push(expr(
+                    Ty::Void,
+                    value.span,
+                    ExprKind::Let(at, Box::new(value)),
+                ));
+            }
+        }
         let mut lowered = Vec::new();
-        for (param, value) in params.iter().zip(given) {
-            lowered.push(match value {
-                Some(value) if self.info.ref_args.contains_key(&value.id) => {
+        for ((param, value), early) in params.iter().zip(given).zip(early) {
+            lowered.push(match (value, early) {
+                (_, Some(early)) => Arg::Value(early),
+                (Some(value), None) if self.info.ref_args.contains_key(&value.id) => {
                     Arg::Ref(self.place(value)?)
                 }
-                Some(value) => Arg::Value(self.expr(value)?),
-                None => match &param.default {
+                (Some(value), None) => Arg::Value(self.expr(value)?),
+                (None, _) => match &param.default {
                     Some(default) => Arg::Value(self.default(default, type_args)?),
                     None => return unsupported(span),
                 },
             });
         }
-        Ok(lowered)
+        Ok((prelude, lowered))
     }
 
     fn default(&mut self, e: &'a ast::Expr, type_args: &HashMap<String, Ty>) -> Lowered<Expr> {

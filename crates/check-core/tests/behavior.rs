@@ -4063,3 +4063,14 @@ fn dyn_needs_a_check_before_use() {
     let src = "let d = Json.parse(\"3\").orPanic()\nmatch d {\n  Int(n) => print(n + 1)\n  _ => print(\"other\")\n}";
     assert_eq!(output(src), "4");
 }
+
+#[test]
+fn as_reads_a_field_whose_type_comes_from_its_default() {
+    let src = r#"class Note(title: String, var tags = [""])
+let d = Json.parse(r"""{"title": "a", "tags": ["x", "y"]}""").orPanic()
+print(d as Note)"#;
+    assert_eq!(
+        output(src),
+        "Some(Note(title = \"a\", tags = [\"x\", \"y\"]))"
+    );
+}

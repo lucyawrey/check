@@ -462,6 +462,9 @@ impl Gen<'_> {
                 .return_()
                 .end();
         };
+        let mut f = self.f();
+        f.local_get(0).local_get(1).i32_eq();
+        f.if_(BlockType::Empty).i32_const(1).return_().end();
         match ty {
             Ty::Maybe(inner) => {
                 let mut f = self.f();

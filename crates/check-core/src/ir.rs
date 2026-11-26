@@ -35,13 +35,13 @@ pub enum Root {
     Global(GlobalId),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Step {
     Field(usize),
     Index(Expr),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Place {
     pub root: Root,
     pub root_ty: Ty,
@@ -54,7 +54,7 @@ impl Place {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Arg {
     Value(Expr),
     Ref(Place),
@@ -68,14 +68,14 @@ pub enum ListOp {
     RemoveAt,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Expr {
     pub ty: Ty,
     pub span: Span,
     pub kind: ExprKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ExprKind {
     Int(i64),
     Float(f64),
