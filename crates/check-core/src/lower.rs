@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use crate::ast::{self, BinOp, ExprKind as Ast, FuncDecl, PatternKind, Stmt, StrSeg};
+use crate::ast::{self, BinOp, ExprKind as Ast, FuncDecl, NodeId, PatternKind, Stmt, StrSeg};
 use crate::checker::Info;
 use crate::diag::{Code, Diagnostic, Span};
 use crate::ir::{Expr, ExprKind, Func, FuncId, GlobalId, LocalId, Program};
-use crate::types::Ty;
+use crate::types::{Show, Ty};
 
 type Lowered<T> = Result<T, Diagnostic>;
 
@@ -17,8 +17,9 @@ enum Var {
 struct Lowerer<'a> {
     info: &'a Info,
     decls: HashMap<&'a str, &'a FuncDecl>,
-    ids: HashMap<&'a str, FuncId>,
-    pending: Vec<(FuncId, &'a FuncDecl)>,
+    ids: HashMap<String, FuncId>,
+    pending: Vec<(FuncId, String, &'a FuncDecl, HashMap<String, Ty>)>,
+    type_args: HashMap<String, Ty>,
     globals: Vec<Ty>,
     scopes: Vec<HashMap<&'a str, Var>>,
     locals: Vec<Ty>,
@@ -37,6 +38,7 @@ pub fn lower(program: &[Stmt], library: &[Stmt], info: &Info) -> Lowered<Program
         decls,
         ids: HashMap::new(),
         pending: Vec::new(),
+        type_args: HashMap::new(),
         globals: Vec::new(),
         scopes: vec![HashMap::new()],
         locals: Vec::new(),
@@ -62,10 +64,11 @@ pub fn lower(program: &[Stmt], library: &[Stmt], info: &Info) -> Lowered<Program
     lowerer.in_main = false;
     let globals = lowerer.scopes.pop().expect("the top-level scope");
     let mut funcs = vec![Some(main)];
-    while let Some((id, decl)) = lowerer.pending.pop() {
+    while let Some((id, name, decl, type_args)) = lowerer.pending.pop() {
         lowerer.scopes = vec![globals.clone()];
+        lowerer.type_args = type_args;
         funcs.resize_with(lowerer.ids.len() + 1, || None);
-        funcs[id] = Some(lowerer.func(decl)?);
+        funcs[id] = Some(lowerer.func(name, decl)?);
     }
     Ok(Program {
         funcs: funcs
@@ -129,23 +132,20 @@ fn binary(op: BinOp, l: Expr, r: Expr) -> ExprKind {
 }
 
 impl<'a> Lowerer<'a> {
-    fn func(&mut self, decl: &'a FuncDecl) -> Lowered<Func> {
-        let Ty::Func(params, ret) = &self.info.types[&decl.id] else {
+    fn func(&mut self, name: String, decl: &'a FuncDecl) -> Lowered<Func> {
+        let Ty::Func(params, ret) = self.ty(decl.id) else {
             unreachable!("a function's type is a function type");
         };
-        let ret = supported(ret, decl.span)?;
-        if !decl.type_params.is_empty() {
-            return unsupported(decl.span);
-        }
+        let ret = supported(&ret, decl.span)?;
         let mut scope = HashMap::new();
-        for (param, ty) in decl.params.iter().zip(params) {
+        for (param, ty) in decl.params.iter().zip(&params) {
             self.locals.push(supported(ty, param.span)?);
             scope.insert(param.name.as_str(), Var::Local(self.locals.len() - 1));
         }
         self.scopes.push(scope);
         let body = self.expr(decl.body.as_ref().expect("a function with a body"))?;
         Ok(Func {
-            name: decl.name.clone(),
+            name,
             params: params.len(),
             locals: std::mem::take(&mut self.locals),
             ret,
@@ -153,14 +153,37 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    fn func_id(&mut self, decl: &'a FuncDecl) -> FuncId {
-        if let Some(&id) = self.ids.get(decl.name.as_str()) {
-            return id;
+    fn ty(&self, id: NodeId) -> Ty {
+        self.info.types[&id].substitute(&self.type_args)
+    }
+
+    fn func_id(&mut self, decl: &'a FuncDecl, call: NodeId, span: Span) -> Lowered<FuncId> {
+        let mut type_args = HashMap::new();
+        let mut shown = Vec::new();
+        for param in &decl.type_params {
+            let Some(ty) = self
+                .info
+                .type_args
+                .get(&call)
+                .and_then(|m| m.get(&param.name))
+            else {
+                return unsupported(span);
+            };
+            let ty = supported(&ty.substitute(&self.type_args), span)?;
+            shown.push(Show(&ty).to_string());
+            type_args.insert(param.name.clone(), ty);
+        }
+        let name = match shown.is_empty() {
+            true => decl.name.clone(),
+            false => format!("{}<{}>", decl.name, shown.join(", ")),
+        };
+        if let Some(&id) = self.ids.get(&name) {
+            return Ok(id);
         }
         let id = self.ids.len() + 1;
-        self.ids.insert(&decl.name, id);
-        self.pending.push((id, decl));
-        id
+        self.ids.insert(name.clone(), id);
+        self.pending.push((id, name, decl, type_args));
+        Ok(id)
     }
 
     fn lookup(&self, name: &str) -> Option<Var> {
@@ -278,7 +301,7 @@ impl<'a> Lowerer<'a> {
     }
 
     fn expr(&mut self, e: &'a ast::Expr) -> Lowered<Expr> {
-        let ty = supported(&self.info.types[&e.id], e.span)?;
+        let ty = supported(&self.ty(e.id), e.span)?;
         let kind = self.kind(e)?;
         let mut lowered = Expr {
             ty,
@@ -326,7 +349,7 @@ impl<'a> Lowerer<'a> {
                 let (l, r) = (self.expr(l)?, self.expr(r)?);
                 binary(*op, l, r)
             }
-            Ast::Call(callee, args) => self.call(callee, args)?,
+            Ast::Call(callee, args) => self.call(e.id, callee, args)?,
             Ast::Block(stmts) => ExprKind::Block(self.block(stmts)?),
             Ast::If(cond, then, otherwise) => ExprKind::If(
                 Box::new(self.expr(cond)?),
@@ -372,7 +395,12 @@ impl<'a> Lowerer<'a> {
         })
     }
 
-    fn call(&mut self, callee: &'a ast::Expr, args: &'a [ast::Arg]) -> Lowered<ExprKind> {
+    fn call(
+        &mut self,
+        id: NodeId,
+        callee: &'a ast::Expr,
+        args: &'a [ast::Arg],
+    ) -> Lowered<ExprKind> {
         let Ast::Name(name) = &callee.kind else {
             return unsupported(callee.span);
         };
@@ -401,7 +429,7 @@ impl<'a> Lowerer<'a> {
             };
         };
         Ok(match decl.body {
-            Some(_) => ExprKind::Call(self.func_id(decl), lowered),
+            Some(_) => ExprKind::Call(self.func_id(decl, id, callee.span)?, lowered),
             None => ExprKind::External(name.clone(), lowered),
         })
     }

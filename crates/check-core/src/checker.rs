@@ -59,6 +59,7 @@ pub struct Info {
     pub shapes: HashMap<String, Shape>,
     /// Markup field tags filling a field that isn't a list, so they hold their one element.
     pub single_field_tags: HashSet<NodeId>,
+    pub type_args: HashMap<NodeId, HashMap<String, Ty>>,
 }
 
 #[derive(Clone)]
@@ -409,6 +410,14 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
         (checker.info.types).insert(entry.decl.id, Ty::Func(params, Box::new(ret)));
     }
     for ty in checker.info.types.values_mut() {
+        *ty = checker.subst.resolve(ty);
+    }
+    for ty in checker
+        .info
+        .type_args
+        .values_mut()
+        .flat_map(|m| m.values_mut())
+    {
         *ty = checker.subst.resolve(ty);
     }
     (checker.info, checker.diags)
@@ -3917,7 +3926,7 @@ impl Checker<'_> {
             && self.lookup(name).is_none()
         {
             if self.funcs.contains_key(name) {
-                return self.call_named(name, args, span);
+                return self.call_named(id, name, args, span);
             }
             match name.as_str() {
                 "print" => {
@@ -4013,8 +4022,8 @@ impl Checker<'_> {
         }
     }
 
-    fn call_named(&mut self, name: &str, args: &[Arg], span: Span) -> Ty {
-        self.call_entry(name, None, args, span)
+    fn call_named(&mut self, id: NodeId, name: &str, args: &[Arg], span: Span) -> Ty {
+        self.call_entry(id, name, None, args, span)
     }
 
     /// Fresh type variables for a function's type parameters, whose bounds are checked later.
@@ -4035,10 +4044,20 @@ impl Checker<'_> {
     }
 
     /// Calls function `name`, a method of `recv` when given.
-    fn call_entry(&mut self, name: &str, recv: Option<&Ty>, args: &[Arg], span: Span) -> Ty {
+    fn call_entry(
+        &mut self,
+        id: NodeId,
+        name: &str,
+        recv: Option<&Ty>,
+        args: &[Arg],
+        span: Span,
+    ) -> Ty {
         // Checking the body first lets it add key bounds to the type parameters.
         let sig = self.ensure_checked(name, span);
         let map = self.instantiate(name, span);
+        if !map.is_empty() {
+            self.info.type_args.insert(id, map.clone());
+        }
         if let Some(recv) = recv
             && let Some((this, _)) = self.funcs[name].this.clone()
             && !self.conforms(recv, &this.substitute(&map))
@@ -4182,7 +4201,7 @@ impl Checker<'_> {
             if self.funcs.get(&key).is_some_and(|f| f.this.is_none()) {
                 self.check_private_method(&key, &t, span);
                 self.info.resolved.insert(id, Resolved::Static(key.clone()));
-                return self.call_named(&key, args, span);
+                return self.call_named(id, &key, args, span);
             }
             return self.unknown_method(args, span);
         }
@@ -4233,7 +4252,7 @@ impl Checker<'_> {
                 if self.funcs[&key].decl.body.is_some() || !MUTATING.contains(&name) {
                     self.info.resolved.insert(id, Resolved::Method(key.clone()));
                 }
-                let ret = self.call_entry(&key, Some(&recv_ty), args, span);
+                let ret = self.call_entry(id, &key, Some(&recv_ty), args, span);
                 let f = &self.funcs[&key];
                 if f.changes_this {
                     if !boxed {

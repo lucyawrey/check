@@ -171,3 +171,19 @@ fn dyn_and_optional_chaining_are_unsupported_for_now() {
         assert_eq!(codes, ["wasm_unsupported"], "{src}");
     }
 }
+
+#[test]
+fn generic_functions_run_the_same_at_each_type() {
+    same(
+        "func same<T>(x: T) -> T { x }\n\
+         func twice<T>(x: T) -> String { \"{same(x)} {same(x)}\" }\n\
+         func pick<A, B>(useFirst: Bool, a: A, b: B) -> String { if useFirst { \"{a}\" } else { \"{b}\" } }\n\
+         print(same(3) + 1)\nprint(same(\"hi\"))\nprint(same(2.5))\nprint(twice(true))\nprint(twice(\"ho\"))\n\
+         print(pick(true, 1, \"one\"))\nprint(pick(false, 1, \"one\"))",
+    );
+}
+
+#[test]
+fn memory_stays_bounded_through_generic_functions() {
+    stays_bounded("func same<T>(x: T) -> T { x }\nfor i in 0..100000 { let s = same(\"x{i}\") }");
+}
