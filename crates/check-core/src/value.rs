@@ -290,7 +290,7 @@ impl Value {
             Value::Int(n) => out.push_str(&n.to_string()),
             Value::Float(f) => out.push_str(&check_runtime::float_text(*f)),
             Value::Bool(b) => out.push_str(&b.to_string()),
-            Value::Str(s) => out.push_str(&quote(s)),
+            Value::Str(s) => out.push_str(&check_runtime::quote(s)),
             Value::List(items) => done(write_items(out, "[", items.iter(), "]", field)),
             Value::Map(entries) => done(write_map(out, entries.iter(), field)),
             Value::Set(items) => done(write_items(out, "Set([", items.iter(), "])", field)),
@@ -366,23 +366,4 @@ pub fn write_map<'v, E>(
     }
     out.push(']');
     Ok(())
-}
-
-fn quote(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            '\0' => out.push_str("\\0"),
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '{' => out.push_str("\\{"),
-            c if c.is_control() => out.push_str(&format!("\\u{{{:X}}}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }

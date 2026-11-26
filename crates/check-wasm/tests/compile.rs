@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use check_core::diag::Severity;
 use check_core::modules::MemFiles;
 use check_core::{Outcome, Report, check_source, lower::lower, run_source};
 use check_wasm::{MemoryOutputPipe, RUNTIME, compile, execute, run_program};
@@ -118,6 +119,8 @@ fn stays_bounded(src: &str) {
     let mut interpreted = Vec::new();
     run_source("test.check", src, &mut std::io::empty(), &mut interpreted);
     let checked = check_source("test.check", src);
+    let errors = (checked.diagnostics.iter()).filter(|d| d.severity == Severity::Error);
+    assert_eq!(errors.count(), 0, "{src} has errors");
     let program = lower(&checked.program, &checked.library, &checked.info).unwrap();
     let stdout = MemoryOutputPipe::new(1 << 10);
     let run = execute(&compile(&program, RUNTIME).unwrap(), stdout.clone()).unwrap();
@@ -170,4 +173,294 @@ fn dyn_and_optional_chaining_are_unsupported_for_now() {
             .collect();
         assert_eq!(codes, ["wasm_unsupported"], "{src}");
     }
+}
+
+#[test]
+fn generic_functions_run_the_same_at_each_type() {
+    same(
+        "func same<T>(x: T) -> T { x }\n\
+         func twice<T>(x: T) -> String { \"{same(x)} {same(x)}\" }\n\
+         func pick<A, B>(useFirst: Bool, a: A, b: B) -> String { if useFirst { \"{a}\" } else { \"{b}\" } }\n\
+         print(same(3) + 1)\nprint(same(\"hi\"))\nprint(same(2.5))\nprint(twice(true))\nprint(twice(\"ho\"))\n\
+         print(pick(true, 1, \"one\"))\nprint(pick(false, 1, \"one\"))",
+    );
+}
+
+#[test]
+fn memory_stays_bounded_through_generic_functions() {
+    stays_bounded("func same<T>(x: T) -> T { x }\nfor i in 0..100000 { let s = same(\"x{i}\") }");
+}
+
+#[test]
+fn maybes_unwrap_default_and_print_the_same() {
+    same(
+        r#"let some: String? = "hi"
+let none: Int? = None
+print(some)
+print(none)
+print("{some} and {none}")
+print(none ?? 5)
+print(some ?? "fallback")
+print(none ?? None ?? 7)
+print(some == "hi")
+print(none == None)
+print(none == 3)
+let nested: Int?? = Some(None)
+print(nested)
+print(nested ?? 1)
+print(if none == None { 3 })
+print(some.orPanic())
+var xs: Int?[] = [None, Some(1)]
+print(xs.first())
+print(xs.pop())
+print(xs.pop())
+print(xs.pop())"#,
+    );
+}
+
+#[test]
+fn maybe_panics_match_the_interpreter() {
+    for src in [
+        "let n: Int? = None\nprint(n.orPanic())",
+        "let n: String? = None\nprint(n.orPanic(\"needs a name\"))",
+        "let xs = [1, 2]\nfor i in xs.indices() { print(xs[i]) }\nvar ys = xs\nys[2] = 5",
+        "var xs = [1]\nxs.insert(3, 2)",
+        "print(1)\npanic()",
+        "func check(n: Int) { if n > 1 { panic(\"too big: {n}\") } }\ncheck(1)\ncheck(2)",
+    ] {
+        same(src);
+    }
+}
+
+#[test]
+fn records_and_classes_build_change_and_print_the_same() {
+    same(
+        r#"class Point(var x: Int, var y: Int = 0)
+class Task {
+  let title: String
+  var done = false
+  var tags: String[] = []
+  private var log = ""
+  init { this.log = "made {this.title}" }
+  func describe() -> String { "{this.title}: {this.done} {this.log}" }
+  func finish() {
+    this.done = true
+    this.tags.push("finished")
+  }
+}
+class Pair<T>(first: T, second: T)
+func swap<T>(p: Pair<T>) -> Pair<T> { Pair(first = p.second, second = p.first) }
+var p = Point(x = 1)
+p.y += 2
+print(p)
+let r = (name = "a", size = 2)
+print(r)
+print(r.name)
+let t = (1, "two", 3.5)
+print(t)
+var task = Task(title = "write")
+print(task.describe())
+task.finish()
+print(task)
+print(swap(Pair(first = 1, second = 2)))
+print(swap(Pair(first = "a", second = "b")))
+print(Point(x = 1, y = 2) == Point(x = 1, y = 2))
+print(r == (name = "a", size = 3))"#,
+    );
+}
+
+#[test]
+fn copies_stay_unchanged_when_the_original_changes() {
+    same(
+        r#"class Task(title: String, var done: Bool = false)
+class Board(var tasks: Task[] = [], var name: String = "board")
+func finishAll(ref tasks: Task[]) {
+  for i in tasks.indices() { tasks[i].done = true }
+}
+var board = Board()
+board.tasks.push(Task(title = "a"))
+board.tasks.push(Task(title = "b"))
+let before = board
+board.tasks[0].done = true
+print(board)
+print(before)
+var copy = board.tasks
+finishAll(copy)
+print(copy)
+print(board.tasks)
+finishAll(board.tasks)
+print(board)
+print(before)"#,
+    );
+}
+
+#[test]
+fn lists_index_change_and_loop_the_same() {
+    same(
+        r#"var xs = [3, 1, 4]
+print(xs.length())
+print(xs[0])
+print(xs[3])
+xs.push(1)
+xs.insert(0, 9)
+print(xs)
+print(xs.removeAt(1))
+print(xs.removeAt(10))
+print(xs.isEmpty())
+print(xs.last())
+for x in xs { print(x * 2) }
+var words: String[] = []
+for i in 0..20 { words.push("w{i}") }
+print(words.length())
+print(words[19])
+while words.length() > 2 { words.pop() }
+print(words)
+let grid = [[1, 2], [3]]
+print(grid)
+print(grid == [[1, 2], [3]])
+let floats = [1.5, 2.0]
+print(floats)
+let empty: Int[] = []
+print(empty.first())
+for x in empty { print(x) }
+for w in words {
+  if w == "w0" { continue }
+  print(w)
+  break
+}"#,
+    );
+}
+
+#[test]
+fn memory_stays_bounded_while_values_come_and_go() {
+    stays_bounded(
+        r#"class Task(title: String, var tags: String[] = [])
+var keep: Task[] = []
+for i in 0..20000 {
+  var tasks: Task[] = []
+  for j in 0..5 { tasks.push(Task(title = "t{j}", tags = ["x{i}"])) }
+  let copy = tasks
+  tasks[0].tags.push("more")
+  let n: Int? = Some(i)
+  let m = n ?? 0
+  let pair = (a = "a{i}", b = Some("b"))
+  keep = copy
+}
+print(keep.length())"#,
+    );
+}
+
+#[test]
+fn methods_refs_and_recursive_classes_run_the_same() {
+    same(
+        r#"class Node(value: Int, next: Node? = None)
+class Counter {
+  var n = 0
+  func bump() { this.n += 1 }
+  func twice() -> Int {
+    this.bump()
+    this.bump()
+    this.n
+  }
+}
+class Box<T> {
+  var item: T
+  func get() -> T { this.item }
+  func put(item: T) { this.item = item }
+}
+func find(xs: String[], want: String) -> Int? {
+  var i = 0
+  for x in xs {
+    if x == want { return Some(i) }
+    i += 1
+  }
+  None
+}
+func grow(ref xs: Int[], n: Int) -> Int {
+  for i in 0..n { xs.push(i) }
+  xs.length()
+}
+var list = Node(1, Some(Node(2, Some(Node(3)))))
+print(list)
+var cs = [Counter(), Counter()]
+for i in cs.indices() { cs[i].bump() }
+print(cs)
+var c = Counter()
+print(c.twice())
+print(c)
+var b = Box(item = "x")
+b.put("y")
+print(b.get())
+var bi = Box(item = 1)
+bi.put(bi.get() + 1)
+print(bi)
+print(find(["a", "b", "c"], "b"))
+print(find(["a"], "z"))
+var nums: Int[] = []
+print(grow(nums, 3))
+print(nums)
+let maybe = if nums.length() > 2 { "long" }
+print(maybe)
+let nested = [Some([1]), None]
+print(nested)
+print([(1, "a")] == [(1, "a")])"#,
+    );
+}
+
+#[test]
+fn memory_stays_bounded_through_text_equality_and_changes() {
+    stays_bounded(
+        r#"class Tag {
+  var name: String
+  var seen: String[] = []
+  init { this.seen.push(this.name) }
+  func rename(to: String) { this.name = to }
+}
+func addTo(ref tags: Tag[], name: String) { tags.push(Tag(name = name)) }
+var same = 0
+for i in 0..5000 {
+  var tags: Tag[] = []
+  addTo(tags, "a{i}")
+  addTo(tags, "b")
+  tags[0].rename("c{i}")
+  let text = "{tags} {tags.first()} {(n = i, m = tags.first() == None)}"
+  if tags == tags and text != "" { same += 1 }
+  let popped = tags.pop() ?? Tag(name = "none")
+  let removed = tags.removeAt(0).orPanic()
+  let nested: String?? = Some(Some("x{i}"))
+  let flat = nested ?? None ?? "y"
+}
+print(same)"#,
+    );
+}
+
+#[test]
+fn side_effects_run_in_source_order() {
+    same(
+        r#"class C(var n: Int)
+var cs = [C(1)]
+var xs = [[1]]
+func i() -> Int {
+  print("i")
+  0
+}
+func v() -> Int {
+  print("v")
+  5
+}
+func f(x: Int, y: Int) -> Int { x + y }
+cs[i()].n += 1
+cs[i()].n = v()
+xs[i()].push(v())
+print(f(y = v(), x = i()))
+let nan: Float? = 0.0 / 0.0
+print(nan == nan)
+let a = [0.0 / 0.0]
+print(a == a)
+let b = a
+print(a == b)
+print([0.0 / 0.0] == [0.0 / 0.0])
+class P(x: Int, y: Int)
+print(P(y = v(), x = i()))"#,
+    );
 }

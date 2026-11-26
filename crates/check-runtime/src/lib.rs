@@ -7,14 +7,20 @@ pub enum Panic {
     DivisionByZero,
     NegativeExponent,
     ShiftOutOfRange,
+    IndexOutOfRange,
+    OrPanicOnNone,
+    PanicCalled,
 }
 
 impl Panic {
-    pub const ALL: [Panic; 4] = [
+    pub const ALL: [Panic; 7] = [
         Panic::IntegerOverflow,
         Panic::DivisionByZero,
         Panic::NegativeExponent,
         Panic::ShiftOutOfRange,
+        Panic::IndexOutOfRange,
+        Panic::OrPanicOnNone,
+        Panic::PanicCalled,
     ];
 }
 
@@ -116,4 +122,23 @@ pub fn float_text(f: f64) -> String {
     } else {
         format!("{text}.0")
     }
+}
+
+pub fn quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '{' => out.push_str("\\{"),
+            c if c.is_control() => out.push_str(&format!("\\u{{{:X}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

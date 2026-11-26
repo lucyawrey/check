@@ -29,11 +29,11 @@ fn lowers_only_the_functions_the_program_reaches() {
 
 #[test]
 fn points_at_the_first_unsupported_expression() {
-    assert_eq!(unsupported_text("let x = 1\nprint([x, 2])"), "[x, 2]");
-    assert_eq!(unsupported_text("let xs = [1]\nprint(1)"), "[1]");
+    assert_eq!(unsupported_text("let x = 1\nprint([x = 2])"), "[x = 2]");
+    assert_eq!(unsupported_text("let m = [1 = 2]\nprint(1)"), "[1 = 2]");
     assert_eq!(
-        unsupported_text("func f(ref n: Int) { n += 1 }\nvar a = 1\nf(a)"),
-        "f"
+        unsupported_text("enum Color { Red }\nfunc f(c: Color) {}\nf(Color.Red)"),
+        "Color.Red"
     );
     assert_eq!(unsupported_text("let v = print(\"hi\")"), "print(\"hi\")");
     assert_eq!(
