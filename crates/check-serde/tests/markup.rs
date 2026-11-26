@@ -210,12 +210,21 @@ fn several_top_level_elements_make_a_list() {
 #[test]
 fn text_collapses_whitespace_and_takes_backslash_escapes() {
     let el: El = same(
-        "<Text>\n   a  \\< b\n\n  c \\{ \\\\  </Text>",
+        "<Text>\n   a  \\< b\n\n  c \\{ \\\\  \n</Text>",
         "Text(text = \"a < b c { \\\\\")",
         "ui.Text",
     );
     assert_eq!(el, text("a < b c { \\"));
     check_error("page.cml", "<Text>\\q</Text>", "unknown_escape");
+}
+
+#[test]
+fn text_keeps_a_space_at_its_edge_unless_the_edge_breaks_the_line() {
+    same::<El>(
+        "<Panel><Text> a </Text><Text>\n  b  \n</Text></Panel>",
+        "Panel(children = [Text(text = \" a \"), Text(text = \"b\")])",
+        "ui.Panel",
+    );
 }
 
 #[test]

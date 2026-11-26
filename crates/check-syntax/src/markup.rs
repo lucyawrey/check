@@ -433,6 +433,8 @@ impl Markup<'_> {
 
 /// Collapses runs of whitespace to one space and trims the text's two ends, as HTML does.
 fn collapse(segs: Vec<StrSeg>) -> Vec<StrSeg> {
+    let trim_start = matches!(segs.first(), Some(StrSeg::Text(t)) if line_break(t.chars()));
+    let trim_end = matches!(segs.last(), Some(StrSeg::Text(t)) if line_break(t.chars().rev()));
     let mut out: Vec<StrSeg> = segs
         .into_iter()
         .map(|seg| match seg {
@@ -455,12 +457,17 @@ fn collapse(segs: Vec<StrSeg>) -> Vec<StrSeg> {
             e => e,
         })
         .collect();
-    if let Some(StrSeg::Text(t)) = out.first_mut() {
+    if let Some(StrSeg::Text(t)) = out.first_mut().filter(|_| trim_start) {
         *t = t.trim_start().to_string();
     }
-    if let Some(StrSeg::Text(t)) = out.last_mut() {
+    if let Some(StrSeg::Text(t)) = out.last_mut().filter(|_| trim_end) {
         *t = t.trim_end().to_string();
     }
     out.retain(|s| !matches!(s, StrSeg::Text(t) if t.is_empty()));
     out
+}
+
+fn line_break(edge: impl Iterator<Item = char>) -> bool {
+    edge.take_while(char::is_ascii_whitespace)
+        .any(|c| c == '\n')
 }
