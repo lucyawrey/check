@@ -420,6 +420,10 @@ pub fn check(program: &[Stmt], library: &[Stmt], sources: &Sources) -> (Info, Ve
     {
         *ty = checker.subst.resolve(ty);
     }
+    let shapes = checker.info.shapes.values_mut();
+    for field in shapes.flat_map(|s| &mut s.variants).flat_map(|(_, f)| f) {
+        field.ty = checker.subst.resolve(&field.ty);
+    }
     (checker.info, checker.diags)
 }
 

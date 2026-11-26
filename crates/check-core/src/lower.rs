@@ -261,10 +261,11 @@ impl<'a> Lowerer<'a> {
         true
     }
 
-    fn printable_inside(&self, ty: &Ty, seen: &mut HashSet<String>) -> bool {
+    fn unprintable_inside(&self, ty: &Ty, seen: &mut HashSet<String>) -> bool {
         match ty {
-            Ty::Maybe(inner) | Ty::List(inner) => self.printable_inside(inner, seen),
-            Ty::Record(_, fields) => fields.iter().any(|f| self.printable_inside(f, seen)),
+            Ty::Range => true,
+            Ty::Maybe(inner) | Ty::List(inner) => self.unprintable_inside(inner, seen),
+            Ty::Record(_, fields) => fields.iter().any(|f| self.unprintable_inside(f, seen)),
             Ty::Named(name, args) => {
                 if !seen.insert(Show(ty).to_string()) {
                     return false;
@@ -273,7 +274,7 @@ impl<'a> Lowerer<'a> {
                 let map = type_map(&class.params, args);
                 (self.info.implements.get(name)).is_some_and(|i| i.contains(PRINTABLE))
                     || (class.fields.iter())
-                        .any(|(_, f)| self.printable_inside(&f.substitute(&map), seen))
+                        .any(|(_, f)| self.unprintable_inside(&f.substitute(&map), seen))
             }
             _ => false,
         }
@@ -283,7 +284,7 @@ impl<'a> Lowerer<'a> {
         if e.ty == Ty::Str {
             return Ok(e);
         }
-        if e.ty.has_range() || self.printable_inside(&e.ty, &mut HashSet::new()) {
+        if self.unprintable_inside(&e.ty, &mut HashSet::new()) {
             return unsupported(e.span);
         }
         Ok(expr(Ty::Str, e.span, ExprKind::Text(Box::new(e))))
@@ -779,7 +780,7 @@ impl<'a> Lowerer<'a> {
         };
         let recv_ty = self.supported(&recv_ty, recv.span)?;
         let Some(decl) = decl.filter(|d| d.body.is_some()) else {
-            return self.builtin(e, recv, &recv_ty, name, args);
+            return self.builtin(e, recv, &recv_ty, name, args, decl);
         };
         let (id, type_args) = self.func_id(decl, e.id, Some(recv_ty), e.span)?;
         let this = match self.info.changes_this.contains(&decl.name) {
@@ -798,6 +799,7 @@ impl<'a> Lowerer<'a> {
         recv_ty: &Ty,
         name: &str,
         args: &'a [ast::Arg],
+        decl: Option<&'a FuncDecl>,
     ) -> Lowered<ExprKind> {
         Ok(match (recv_ty, name, list_op(name)) {
             (Ty::List(_), "length", _) if args.is_empty() => {
@@ -808,7 +810,9 @@ impl<'a> Lowerer<'a> {
                 ExprKind::ListOp(op, place, self.values(args, e.span)?)
             }
             (Ty::Maybe(inner), "orPanic", _) => {
-                let decl = self.decls["Maybe.orPanic"];
+                let Some(decl) = decl else {
+                    return unsupported(e.span);
+                };
                 let map = HashMap::from([("T".to_string(), (**inner).clone())]);
                 let recv = self.expr(recv)?;
                 let Some(Arg::Value(reason)) = self.args(&decl.params, args, &map, e.span)?.pop()

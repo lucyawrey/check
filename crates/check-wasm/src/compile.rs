@@ -559,9 +559,9 @@ impl Gen<'_> {
 
     fn leave_scopes(&mut self, from: usize) {
         let held: Vec<(u32, Ty)> = self.scopes[from..].iter().flatten().cloned().collect();
-        for (l, ty) in held {
-            self.release_local(l, &ty);
-            self.f().i32_const(0).local_set(l);
+        for (l, ty) in held.iter().filter(|(_, ty)| is_ptr(ty)) {
+            self.release_local(*l, ty);
+            self.f().i32_const(0).local_set(*l);
         }
     }
 
@@ -1097,30 +1097,42 @@ impl Gen<'_> {
     }
 
     fn call(&mut self, id: usize, args: &[Arg]) -> Compiled<()> {
+        let mut evaluated = Vec::new();
+        for arg in args {
+            evaluated.push(match arg {
+                Arg::Value(value) => {
+                    self.expr(value)?;
+                    vec![self.set_temp(&value.ty)]
+                }
+                Arg::Ref(place) => self.indices(place)?,
+            });
+        }
         let mut written = Vec::new();
-        for (i, arg) in args.iter().enumerate() {
+        for (arg, temps) in args.iter().zip(evaluated) {
             match arg {
-                Arg::Value(value) => self.expr(value)?,
+                Arg::Value(_) => {
+                    self.f().local_get(temps[0]);
+                    self.free.extend(temps);
+                }
                 Arg::Ref(place) => {
-                    let indices = self.indices(place)?;
-                    let target = self.walk(place, &indices);
+                    let target = self.walk(place, &temps);
                     self.load_slot(target, place.ty());
                     if is_ptr(place.ty()) {
                         self.f().i32_const(0);
                         self.store_raw_from_stack(target, place.ty());
                     }
-                    written.push((i, place, indices));
+                    written.push((place, temps));
                 }
             }
         }
         let func = self.base + id as u32;
         self.f().call(func);
         let mut saved = Vec::new();
-        for (_, place, _) in written.iter().rev() {
+        for (place, _) in written.iter().rev() {
             saved.push(self.set_temp(place.ty()));
         }
         saved.reverse();
-        for ((_, place, indices), t) in written.into_iter().zip(saved) {
+        for ((place, indices), t) in written.into_iter().zip(saved) {
             let target = self.walk(place, &indices);
             self.f().local_get(t);
             self.store_slot(target, place.ty());
